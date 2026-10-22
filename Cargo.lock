@@ -1785,6 +1785,8 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",

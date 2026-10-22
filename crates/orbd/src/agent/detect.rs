@@ -3,9 +3,13 @@
 //! Detection probes function, not file existence: usable KVM and QEMU select QEMU,
 //! otherwise a Docker daemon that answers selects Docker. The first choice is recorded
 //! in `<state_dir>/runtime`; later starts use it or fail, so an agent never abandons its
-//! orbs because detection changed.
+//! orbs because detection changed. A QEMU agent also runs Firecracker orbs when
+//! `firecracker` works (it does in orbd's image); an agent whose orbs need a runtime it
+//! no longer has refuses to start (see `executor::recover`).
 
-use crate::config::agent::{AgentConfig, DockerRuntimeConfig, QemuRuntimeConfig};
+use crate::config::agent::{
+    AgentConfig, DockerRuntimeConfig, FirecrackerRuntimeConfig, QemuRuntimeConfig,
+};
 use crate::model::{GIB, MIB, Resources, RuntimeKind};
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -20,6 +24,17 @@ fn qemu_usable() -> Result<(), String> {
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
     if !out.status.success() {
         return Err(format!("qemu-system-x86_64 --version: {}", out.status));
+    }
+    Ok(())
+}
+
+fn firecracker_usable() -> Result<(), String> {
+    let out = std::process::Command::new("firecracker")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("firecracker: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("firecracker --version: {}", out.status));
     }
     Ok(())
 }
@@ -48,7 +63,7 @@ async fn usable(kind: RuntimeKind) -> Result<(), String> {
 /// Fills in a runtime when the config names none, and the agent's DNS servers.
 pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     let r = &mut config.runtime;
-    if r.fake.is_none() && r.docker.is_none() && r.qemu.is_none() {
+    if r.fake.is_none() && r.docker.is_none() && r.qemu.is_none() && r.firecracker.is_none() {
         let record = config.agent.state_dir.join("runtime");
         let kind = match std::fs::read_to_string(&record) {
             Ok(s) => {
@@ -77,6 +92,10 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
             }
             RuntimeKind::Qemu => {
                 r.qemu = Some(QemuRuntimeConfig::default());
+                match firecracker_usable() {
+                    Ok(()) => r.firecracker = Some(FirecrackerRuntimeConfig::default()),
+                    Err(why) => tracing::info!("firecracker runtime off: {why}"),
+                }
             }
             other => bail!("the {} runtime is never detected", other.as_str()),
         }
@@ -87,6 +106,9 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     }
     if let Some(q) = &mut r.qemu {
         q.dns_servers = config.agent.dns_servers.clone();
+    }
+    if let Some(f) = &mut r.firecracker {
+        f.dns_servers = config.agent.dns_servers.clone();
     }
     Ok(())
 }

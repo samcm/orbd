@@ -1,17 +1,19 @@
-//! Opt-in QEMU/KVM gate tests: real VMs through a real coordinator, agent and
-//! `orbd dispatch`. Ignored by default (CI has no KVM). Run on a host with `/dev/kvm`,
-//! QEMU 9.0 or newer and nested virtualization, one at a time:
+//! Opt-in KVM gate tests for the VM runtimes: real VMs through a real coordinator, agent
+//! and `orbd dispatch`. Ignored by default. Run as root on a host with `/dev/kvm` and
+//! nested virtualization, one at a time, for `ORBD_KVM_RUNTIME=qemu` (the default; QEMU
+//! 9.0 or newer) or `firecracker` (needs `firecracker`, `ip` and `nft`):
 //!
 //! ```sh
 //! guest/kernel/build.sh /tmp/k        # or any kernel with orbd's config
 //! crates/orbd/tests/kvm-guest/build-rootfs.sh <orbd-guest> /tmp/k/bzImage /tmp/rootfs.ext4
-//! ORBD_KVM_KERNEL=/tmp/k/bzImage ORBD_KVM_ROOTFS=/tmp/rootfs.ext4 \
-//!   cargo test -p orbd --features failpoints --test qemu_kvm -- --ignored --test-threads=1
+//! ORBD_KVM_KERNEL=/tmp/k/bzImage ORBD_KVM_ROOTFS=/tmp/rootfs.ext4 ORBD_KVM_RUNTIME=qemu \
+//!   cargo test -p orbd --features failpoints --test kvm -- --ignored --test-threads=1
 //! ```
 //!
 //! The guest prints a process counter and a nested KVM guest's counter to its serial
 //! console. A memory restore must continue both sequences: a counter that restarts means
 //! processes were lost, one that repeats or goes back means stale RAM was replayed.
+//! Firecracker orbs have no `/dev/kvm`, so there the nested guest must not run at all.
 #![cfg(feature = "failpoints")]
 
 mod common;
@@ -22,33 +24,45 @@ use std::time::{Duration, Instant};
 const IMAGE: &str = "example.invalid/amp-orb:latest";
 const MEMORY_MIB: u64 = 2048;
 
+/// The runtime under test: `qemu` or `firecracker`.
+fn runtime() -> String {
+    std::env::var("ORBD_KVM_RUNTIME").unwrap_or_else(|_| "qemu".into())
+}
+
+/// A crash or fault point of the runtime under test, e.g. `save::after_stop`.
+fn point(name: &str) -> String {
+    format!("{}::{name}", runtime())
+}
+
 fn cluster(orbs: u64) -> Cluster {
     let kernel = std::env::var("ORBD_KVM_KERNEL").expect("set ORBD_KVM_KERNEL");
     let rootfs = std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS");
-    if !nested() {
+    let rt = runtime();
+    if rt == "qemu" && !nested() {
         eprintln!("NOTICE: ORBD_KVM_NESTED=0: the nested KVM guest assertions are SKIPPED");
     }
     Cluster::with_runtime(
         &["agent-a"],
         orbs,
-        "qemu",
+        &rt,
         &format!(
             r#"runtime:
-  qemu:
+  {rt}:
     kernel: {kernel}
-    static_images:
-      - {{ image_ref: "{IMAGE}", rootfs: {rootfs} }}
+images:
+  static_images:
+    - {{ image_ref: "{IMAGE}", rootfs: {rootfs} }}
 "#
         ),
     )
 }
 
-/// Kills every QEMU started under this cluster, even when a test fails.
+/// Kills every VMM started under this cluster, even when a test fails.
 struct Vms(PathBuf);
 
 impl Drop for Vms {
     fn drop(&mut self) {
-        for pid in qemu_pids(&self.0) {
+        for pid in vmm_pids(&self.0) {
             let _ = std::process::Command::new("kill")
                 .args(["-9", &pid.to_string()])
                 .status();
@@ -60,8 +74,8 @@ fn state(c: &Cluster) -> PathBuf {
     c.root().join("agents/agent-a/state")
 }
 
-/// QEMU processes whose arguments point into `root`.
-fn qemu_pids(root: &std::path::Path) -> Vec<i32> {
+/// VMM processes (QEMU, Firecracker) whose arguments point into `root`.
+fn vmm_pids(root: &std::path::Path) -> Vec<i32> {
     let needle = root.display().to_string();
     let mut pids = Vec::new();
     for e in std::fs::read_dir("/proc").unwrap().flatten() {
@@ -72,7 +86,9 @@ fn qemu_pids(root: &std::path::Path) -> Vec<i32> {
             continue;
         };
         let cmd = String::from_utf8_lossy(&cmd);
-        if cmd.starts_with("/usr/bin/qemu-system") && cmd.contains(&needle) {
+        let program = cmd.split('\0').next().unwrap_or_default();
+        let vmm = program.ends_with("qemu-system-x86_64") || program.ends_with("firecracker");
+        if vmm && cmd.contains(&needle) {
             pids.push(pid);
         }
     }
@@ -123,10 +139,10 @@ fn samples(console: &str) -> (Vec<(u32, u64)>, Vec<u64>) {
     (counter, l2)
 }
 
-/// Whether the host's KVM nests, so the orb's nested guest runs. `ORBD_KVM_NESTED=0`
-/// (CI on a runner without nested virtualization) skips only the nested-guest checks.
+/// Whether the orb's nested guest runs: on QEMU when the host's KVM nests
+/// (`ORBD_KVM_NESTED=0` skips only the nested-guest checks), never on Firecracker.
 fn nested() -> bool {
-    std::env::var("ORBD_KVM_NESTED").map_or(true, |v| v != "0")
+    runtime() == "qemu" && std::env::var("ORBD_KVM_NESTED").map_or(true, |v| v != "0")
 }
 
 /// Waits until both counters advanced by at least two since `after`.
@@ -145,6 +161,16 @@ fn wait_progress(orb: &Path, after: (usize, usize)) -> ((u32, u64), u64) {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Starts the (stopped) agent once the coordinator has seen its last session end, so no
+/// job is sent to a session that is already dead.
+fn start_again(c: &mut Cluster, failpoints: &str) {
+    wait_until(Duration::from_secs(20), "agent session ended", || {
+        c.connected_agents() == Some(0)
+    });
+    c.start_agent("agent-a", failpoints);
+    c.wait_connected(1);
 }
 
 fn counts(orb: &Path) -> (usize, usize) {
@@ -191,8 +217,9 @@ fn checkpoint_files(orb: &Path) -> Vec<(String, u64, u64)> {
     out
 }
 
-/// Sleep → wake keeps a running process and a nested KVM guest, sleeping orbs hold no
-/// QEMU process, and a restarted agent adopts the running VM instead of booting another.
+/// Sleep → wake keeps a running process and a nested KVM guest (QEMU; a Firecracker orb
+/// has no `/dev/kvm`), sleeping orbs hold no VMM process, and a restarted agent adopts
+/// the running VM instead of booting another.
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn sleep_preserves_processes_and_nested_guest() {
@@ -204,6 +231,13 @@ fn sleep_preserves_processes_and_nested_guest() {
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
     eprintln!("cold spawn (create, boot, Wake ack): {:?}", t.elapsed());
     wait_progress(&orb_dir(&c), (0, 0));
+    if runtime() == "firecracker" {
+        let console = console(&orb_dir(&c));
+        assert!(
+            console.contains("/dev/kvm is missing") && !console.contains("l2counter"),
+            "a Firecracker orb must have no /dev/kvm"
+        );
+    }
 
     for round in 1..=3 {
         let before = counts(&orb_dir(&c));
@@ -211,8 +245,8 @@ fn sleep_preserves_processes_and_nested_guest() {
         assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
         let sleep_time = t.elapsed();
         assert!(
-            qemu_pids(c.root()).is_empty(),
-            "a sleeping orb must not hold a QEMU process"
+            vmm_pids(c.root()).is_empty(),
+            "a sleeping orb must not hold a VMM process"
         );
         let files = checkpoint_files(&orb_dir(&c));
         assert_eq!(
@@ -250,20 +284,19 @@ fn sleep_preserves_processes_and_nested_guest() {
     // Agent crash with the VM running: the restarted agent adopts it.
     let before = counts(&orb_dir(&c));
     c.kill_agent("agent-a");
-    let vms = qemu_pids(c.root());
-    assert_eq!(vms.len(), 1, "QEMU must outlive the agent");
-    c.start_agent("agent-a", "");
-    c.wait_connected(1);
+    let vms = vmm_pids(c.root());
+    assert_eq!(vms.len(), 1, "the VMM must outlive the agent");
+    start_again(&mut c, "");
     assert_ok(
         &c.dispatch("spawn", "amp-1", &[]),
         "spawn after agent restart",
     );
-    assert_eq!(qemu_pids(c.root()), vms, "the running VM was adopted");
+    assert_eq!(vmm_pids(c.root()), vms, "the running VM was adopted");
     wait_progress(&orb_dir(&c), before);
     assert_continuous(&orb_dir(&c));
 
     assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
-    assert!(qemu_pids(c.root()).is_empty());
+    assert!(vmm_pids(c.root()).is_empty());
     assert!(
         std::fs::read_dir(state(&c).join("orbs"))
             .unwrap()
@@ -286,7 +319,18 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
     wait_progress(&orb_dir(&c), (0, 0));
 
     let agent_log = |c: &Cluster| {
-        std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap_or_default()
+        let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap_or_default();
+        // Without colours (`\x1b[...m`).
+        let mut plain = String::with_capacity(log.len());
+        let mut chars = log.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                chars.by_ref().find(|c| c.is_ascii_alphabetic());
+            } else {
+                plain.push(ch);
+            }
+        }
+        plain
     };
     // Every boundary below runs against a VM that was itself restored.
     let before = counts(&orb_dir(&c));
@@ -299,20 +343,20 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
         let mark = agent_log(c).len();
         c.kill_agent("agent-a");
         // QEMU writes the memory file itself: slowed down, it is still writing when the
-        // agent dies right after starting the save.
+        // agent dies right after starting the save. (Firecracker's crash point waits until
+        // Firecracker is writing.)
         let throttle = if point == "qemu::save::after_migrate" {
             ";qemu::save::throttle=return(32)"
         } else {
             ""
         };
-        c.start_agent("agent-a", &format!("{point}=return{throttle}"));
-        c.wait_connected(1);
+        start_again(c, &format!("{point}=return{throttle}"));
         let job = c.dispatch_bg(op, "amp-1", &[]);
         c.wait_agent_crash("agent-a", Duration::from_secs(120));
         c.start_agent("agent-a", "");
         let job = job.join().unwrap();
         assert_ok(&job, &format!("{op} interrupted at {point}"));
-        let vms = qemu_pids(c.root()).len();
+        let vms = vmm_pids(c.root()).len();
         match op {
             "pause" => {
                 assert_eq!(vms, 0, "{point}: a paused orb must not run");
@@ -331,50 +375,55 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
         let recovery: Vec<&str> = logs[mark..]
             .lines()
             .filter(|l| {
-                l.contains("orbd::runtime::qemu") && (l.contains(" WARN ") || l.contains("ERROR"))
+                l.contains("orbd::runtime::") && (l.contains(" WARN ") || l.contains("ERROR"))
             })
-            .filter_map(|l| l.split("orbd::runtime::qemu: ").nth(1))
+            .filter_map(|l| l.split_once("orbd::runtime::").map(|(_, r)| r))
             .collect();
         eprintln!("{op} crash at {point}: converged; runtime recovery: {recovery:?}");
     };
 
-    for point in [
-        "qemu::save::after_stop",
-        "qemu::save::after_migrate",
-        "qemu::save::after_manifest",
-        "qemu::save::after_quit",
-        "qemu::save::after_publish",
-        "agent::pause::after_stop",
+    for p in [
+        point("save::after_stop"),
+        point("save::after_migrate"),
+        point("save::after_manifest"),
+        point("save::after_quit"),
+        point("save::after_publish"),
+        "agent::pause::after_stop".into(),
     ] {
-        crash(&mut c, "pause", point);
+        crash(&mut c, "pause", &p);
         let before = counts(&orb_dir(&c));
         assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake");
         wait_progress(&orb_dir(&c), before);
         assert_continuous(&orb_dir(&c));
     }
-    for point in [
-        "qemu::restore::after_load",
-        "qemu::restore::after_consume",
-        "agent::spawn::after_start",
+    for p in [
+        // Before the launch record has the VMM's pid: adopted, not duplicated.
+        "vm::launch::after_exec".into(),
+        point("restore::after_load"),
+        point("restore::after_consume"),
+        "agent::spawn::after_start".into(),
     ] {
         assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
-        crash(&mut c, "spawn", point);
+        crash(&mut c, "spawn", &p);
         assert_continuous(&orb_dir(&c));
     }
 
     // Disk full mid-save under the cold-stop policy: the pause fails with processes
     // lost, the VM is shut down, and the next spawn cold-boots without replaying RAM.
     c.kill_agent("agent-a");
-    // QEMU fails a save that fills the disk; injected while it is still writing.
-    c.start_agent(
-        "agent-a",
-        "qemu::save::throttle=return(32);qemu::save::write=3*off->return",
+    // A save that fills the disk fails; injected while it is still in progress.
+    start_again(
+        &mut c,
+        &format!(
+            "{};{}",
+            point("save::throttle=return(32)"),
+            point("save::write=3*off->return")
+        ),
     );
-    c.wait_connected(1);
     let job = c.dispatch("pause", "amp-1", &[]);
     assert_ne!(job.code, 0, "an injected ENOSPC must fail the pause");
     assert!(
-        qemu_pids(c.root()).is_empty(),
+        vmm_pids(c.root()).is_empty(),
         "cold-stop policy stops the VM"
     );
     assert!(
@@ -436,14 +485,13 @@ fn graceful_agent_restart_keeps_running_orbs() {
     let status = c.terminate_agent("agent-a", Duration::from_secs(300));
     eprintln!("drain took {:?}, agent exit {status:?}", t.elapsed());
     assert!(status.success());
-    assert!(qemu_pids(c.root()).is_empty(), "drained orbs hold no VMM");
+    assert!(vmm_pids(c.root()).is_empty(), "drained orbs hold no VMM");
     for o in &orbs {
         assert_eq!(checkpoint_files(o).len(), 1, "one checkpoint per orb");
     }
 
     let t = Instant::now();
-    c.start_agent("agent-a", "");
-    c.wait_connected(1);
+    start_again(&mut c, "");
     eprintln!("agent ready with restored orbs after {:?}", t.elapsed());
     let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap();
     for l in log.lines().filter(|l| {
@@ -451,7 +499,7 @@ fn graceful_agent_restart_keeps_running_orbs() {
     }) {
         eprintln!("  {}", l.split_once("Z ").map_or(l, |(_, r)| r));
     }
-    assert_eq!(qemu_pids(c.root()).len(), 2, "both orbs run again");
+    assert_eq!(vmm_pids(c.root()).len(), 2, "both orbs run again");
     for (i, o) in orbs.iter().enumerate() {
         wait_progress(o, before[i]);
         assert_continuous(o);
@@ -473,13 +521,12 @@ fn graceful_agent_restart_keeps_running_orbs() {
     // Drain cut short: the first save is slowed down, the agent is killed mid-save and
     // every VMM dies with it.
     c.terminate_agent("agent-a", Duration::from_secs(300));
-    c.start_agent("agent-a", "qemu::save::throttle=return(8)");
-    c.wait_connected(1);
-    assert_eq!(qemu_pids(c.root()).len(), 2);
+    start_again(&mut c, &point("save::throttle=return(8)"));
+    assert_eq!(vmm_pids(c.root()).len(), 2);
     c.signal_agent("agent-a", "TERM");
     std::thread::sleep(Duration::from_secs(5));
     c.kill_agent("agent-a");
-    for pid in qemu_pids(c.root()) {
+    for pid in vmm_pids(c.root()) {
         let _ = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .status();
@@ -495,9 +542,8 @@ fn graceful_agent_restart_keeps_running_orbs() {
                 .unwrap()
         })
         .collect();
-    c.start_agent("agent-a", "");
-    c.wait_connected(1);
-    assert!(qemu_pids(c.root()).is_empty(), "nothing unsaved is resumed");
+    start_again(&mut c, "");
+    assert!(vmm_pids(c.root()).is_empty(), "nothing unsaved is resumed");
     let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap();
     let honest: Vec<&str> = log
         .lines()
@@ -583,11 +629,7 @@ fn spawn_boots_from_project_snapshot() {
 
     // Known from the agent's Hello after a restart.
     c.kill_agent("agent-a");
-    wait_until(Duration::from_secs(20), "agent session ended", || {
-        c.connected_agents() == Some(0)
-    });
-    c.start_agent("agent-a", "");
-    c.wait_connected(1);
+    start_again(&mut c, "");
     let before = orb_dirs(&c);
     assert_ok(
         &c.dispatch("spawn", "amp-3", &snap),

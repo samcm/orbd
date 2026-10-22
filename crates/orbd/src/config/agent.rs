@@ -39,6 +39,7 @@ fn default_images() -> Option<ImagesConfig> {
         mkfs_ext4: default_mkfs_ext4(),
         prewarm: default_prewarm(),
         refresh_interval_secs: default_refresh_secs(),
+        static_images: Vec::new(),
     })
 }
 
@@ -75,6 +76,10 @@ pub struct ImagesConfig {
     /// image keeps serving until the new digest is ready.
     #[serde(default = "default_refresh_secs")]
     pub refresh_interval_secs: u64,
+    /// Prebuilt raw ext4 root disks by image reference, used instead of preparing
+    /// images (development and KVM tests).
+    #[serde(default)]
+    pub static_images: Vec<StaticImage>,
 }
 
 fn default_guest_helper() -> PathBuf {
@@ -138,6 +143,7 @@ pub struct RuntimesConfig {
     pub fake: Option<FakeRuntimeConfig>,
     pub docker: Option<DockerRuntimeConfig>,
     pub qemu: Option<QemuRuntimeConfig>,
+    pub firecracker: Option<FirecrackerRuntimeConfig>,
 }
 
 /// QEMU q35 VMs with nested KVM and memory-preserving sleep. Every field has a default
@@ -157,10 +163,6 @@ pub struct QemuRuntimeConfig {
     /// Delegated cgroup v2 directory; each QEMU runs in `<cgroup_parent>/orbd-<orb>`,
     /// outside the agent's cgroup, so stopping the agent service leaves VMs running.
     pub cgroup_parent: Option<PathBuf>,
-    /// Prebuilt raw ext4 root disks by image reference, used instead of the image
-    /// pipeline (development and KVM tests).
-    #[serde(default)]
-    pub static_images: Vec<QemuStaticImage>,
     /// DNS servers delivered to guests (from `agent.dns_servers`).
     #[serde(skip)]
     pub dns_servers: Vec<String>,
@@ -173,7 +175,6 @@ impl Default for QemuRuntimeConfig {
             qemu_img: default_qemu_img(),
             kernel: default_kernel(),
             cgroup_parent: None,
-            static_images: Vec::new(),
             dns_servers: Vec::new(),
         }
     }
@@ -181,9 +182,42 @@ impl Default for QemuRuntimeConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct QemuStaticImage {
+pub struct StaticImage {
     pub image_ref: String,
     pub rootfs: PathBuf,
+}
+
+/// Firecracker microVMs: fast wake from lazily loaded memory, no `/dev/kvm` inside.
+/// Every field has a default matching orbd's container image.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirecrackerRuntimeConfig {
+    /// `firecracker`; a bare name is looked up on PATH.
+    #[serde(default = "default_firecracker")]
+    pub firecracker: PathBuf,
+    /// Guest kernel, the same one QEMU boots. Only cold boots read it.
+    #[serde(default = "default_kernel")]
+    pub kernel: PathBuf,
+    /// As for QEMU: each VMM runs in `<cgroup_parent>/orbd-<orb>`.
+    pub cgroup_parent: Option<PathBuf>,
+    /// DNS servers delivered to guests (from `agent.dns_servers`).
+    #[serde(skip)]
+    pub dns_servers: Vec<String>,
+}
+
+impl Default for FirecrackerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            firecracker: default_firecracker(),
+            kernel: default_kernel(),
+            cgroup_parent: None,
+            dns_servers: Vec::new(),
+        }
+    }
+}
+
+fn default_firecracker() -> PathBuf {
+    "firecracker".into()
 }
 
 fn default_qemu() -> PathBuf {

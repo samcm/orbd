@@ -1,4 +1,4 @@
-//! Where the QEMU runtime gets base root disks from.
+//! Where the VM runtimes get base root disks from.
 //!
 //! Normally the image pipeline ([`ImageStore`]); [`StaticImages`] serves
 //! operator-provided raw ext4 files from config (development and KVM tests).
@@ -7,7 +7,7 @@
 //! the prepared image's key, digest and file identity, and the orb keeps that exact
 //! image for life: a tag that later resolves to a newer digest never rebases it.
 
-use crate::config::agent::QemuStaticImage;
+use crate::config::agent::StaticImage;
 use crate::image::{ImageError, ImageStore, PreparedImage};
 use async_trait::async_trait;
 
@@ -26,7 +26,7 @@ impl ImageProvider for ImageStore {
 }
 
 /// Fixed `image_ref → rootfs` table (development and tests).
-pub struct StaticImages(pub Vec<QemuStaticImage>);
+pub struct StaticImages(pub Vec<StaticImage>);
 
 #[async_trait]
 impl ImageProvider for StaticImages {

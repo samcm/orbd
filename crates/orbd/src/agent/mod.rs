@@ -153,26 +153,41 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("docker runtime: {e}"))?;
         runtimes.insert(RuntimeKind::Docker, Arc::new(rt));
     }
+    // One image source for every VM runtime (one build lock, one cache).
+    let vm_images = if config.runtime.qemu.is_some() || config.runtime.firecracker.is_some() {
+        let images: Arc<dyn crate::runtime::vm::images::ImageProvider> = match &config.images {
+            Some(i) if !i.static_images.is_empty() => Arc::new(
+                crate::runtime::vm::images::StaticImages(i.static_images.clone()),
+            ),
+            Some(i) => Arc::new(
+                crate::image::ImageStore::open(i, &config.agent.state_dir)
+                    .map_err(|e| anyhow::anyhow!("image store: {e}"))?,
+            ),
+            None => anyhow::bail!("VM runtimes need `images`"),
+        };
+        Some(images)
+    } else {
+        None
+    };
     if let Some(q) = &config.runtime.qemu {
-        let images: Arc<dyn crate::runtime::qemu::images::ImageProvider> =
-            match (&config.images, q.static_images.is_empty()) {
-                (_, false) => Arc::new(crate::runtime::qemu::images::StaticImages(
-                    q.static_images.clone(),
-                )),
-                (Some(i), true) => Arc::new(
-                    crate::image::ImageStore::open(i, &config.agent.state_dir)
-                        .map_err(|e| anyhow::anyhow!("image store: {e}"))?,
-                ),
-                (None, true) => anyhow::bail!("the qemu runtime needs `images` or static_images"),
-            };
         let rt = crate::runtime::qemu::QemuRuntime::new(
             q.clone(),
             &config.agent.state_dir,
             &config.agent.run_dir,
-            images,
+            vm_images.clone().expect("VM runtime configured"),
         )
         .map_err(|e| anyhow::anyhow!("qemu runtime: {e}"))?;
         runtimes.insert(RuntimeKind::Qemu, Arc::new(rt));
+    }
+    if let Some(f) = &config.runtime.firecracker {
+        let rt = crate::runtime::firecracker::FirecrackerRuntime::new(
+            f.clone(),
+            &config.agent.state_dir,
+            &config.agent.run_dir,
+            vm_images.clone().expect("VM runtime configured"),
+        )
+        .map_err(|e| anyhow::anyhow!("firecracker runtime: {e}"))?;
+        runtimes.insert(RuntimeKind::Firecracker, Arc::new(rt));
     }
 
     if let Some(addr) = config.agent.metrics_listen

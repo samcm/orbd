@@ -64,7 +64,7 @@ jobs:
           docker run --rm orbd:smoke --version
           docker run --rm --entrypoint amp orbd:smoke --version
           docker run --rm --user root --entrypoint sh orbd:smoke -c \
-            'qemu-system-x86_64 --version && qemu-img --version && umoci --version && mkfs.ext4 -V'
+            'qemu-system-x86_64 --version && qemu-img --version && firecracker --version && umoci --version && mkfs.ext4 -V && ip -V && nft --version'
       - if: inputs.artifact
         run: docker save orbd:smoke | zstd -T0 -q -o image-amd64.tar.zst
       - if: inputs.artifact

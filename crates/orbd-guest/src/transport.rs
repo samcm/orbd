@@ -1,10 +1,10 @@
-//! Byte-stream transports to the host agent, behind [`Connector`] so Firecracker's vsock
-//! (guest listens; the host connects with `CONNECT <port>`) can slot in next to QEMU's
-//! virtio-serial port.
+//! Byte-stream transports to the host agent, behind [`Connector`]: QEMU's virtio-serial
+//! port and Firecracker's vsock (the guest listens; the host connects through
+//! Firecracker's unix socket with `CONNECT <port>`).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -167,6 +167,164 @@ impl Session for VirtioSession {
 
     fn close(&self) {
         self.file.write().unwrap().take();
+    }
+}
+
+/// An AF_VSOCK listener (Firecracker). The listening socket survives a snapshot
+/// restore; connections open at the snapshot are reset, so the host reconnects.
+pub struct Vsock {
+    port: u32,
+    listener: std::sync::Mutex<Option<OwnedFd>>,
+}
+
+impl Vsock {
+    pub fn new(port: u32) -> Self {
+        Self {
+            port,
+            listener: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn listen(&self) -> io::Result<OwnedFd> {
+        // SAFETY: plain socket calls; the fd is owned right after creation.
+        unsafe {
+            let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = OwnedFd::from_raw_fd(fd);
+            let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+            addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+            addr.svm_cid = libc::VMADDR_CID_ANY;
+            addr.svm_port = self.port;
+            if libc::bind(
+                fd.as_raw_fd(),
+                (&addr as *const libc::sockaddr_vm).cast(),
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            ) < 0
+                || libc::listen(fd.as_raw_fd(), 4) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(fd)
+        }
+    }
+}
+
+impl Connector for Vsock {
+    fn accept(&self) -> io::Result<Arc<dyn Session>> {
+        let mut backoff = BACKOFF_MIN;
+        let mut reported = false;
+        loop {
+            let mut guard = self.listener.lock().unwrap();
+            if guard.is_none() {
+                match self.listen() {
+                    Ok(fd) => *guard = Some(fd),
+                    Err(e) => {
+                        drop(guard);
+                        if !reported {
+                            eprintln!("orbd-guest: waiting for vsock port {}: {e}", self.port);
+                            reported = true;
+                        }
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                        continue;
+                    }
+                }
+            }
+            let listener = guard.as_ref().unwrap().as_raw_fd();
+            // SAFETY: accept on our listening socket; the new fd is owned at once.
+            let fd = unsafe {
+                libc::accept4(
+                    listener,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            // SAFETY: `fd` is a new socket nothing else owns.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let timeout = libc::timeval {
+                tv_sec: WRITE_TIMEOUT.as_secs() as _,
+                tv_usec: 0,
+            };
+            // SAFETY: valid fd and option struct.
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    (&timeout as *const libc::timeval).cast(),
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                );
+            }
+            return Ok(Arc::new(VsockSession { fd }));
+        }
+    }
+}
+
+struct VsockSession {
+    fd: OwnedFd,
+}
+
+impl Session for VsockSession {
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            // SAFETY: reads into a valid buffer of the given length.
+            let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => {}
+                // A reset connection (snapshot taken, host gone) ends the session.
+                io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected => return Ok(0),
+                _ => return Err(e),
+            }
+        }
+    }
+
+    fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            // SAFETY: writes from a valid buffer; MSG_NOSIGNAL avoids SIGPIPE.
+            let n = unsafe {
+                libc::send(
+                    self.fd.as_raw_fd(),
+                    buf.as_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            if n > 0 {
+                buf = &buf[n as usize..];
+                continue;
+            }
+            if n == 0 {
+                return Err(closed());
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out"));
+                }
+                _ => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&self) {
+        // SAFETY: shutdown on our socket; the fd itself closes when the session drops.
+        unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
     }
 }
 

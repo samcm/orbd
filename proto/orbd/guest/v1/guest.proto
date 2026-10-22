@@ -1,8 +1,8 @@
 // orbd guest protocol, version 1: host agent <-> `orbd-guest` inside a VM.
 //
 // Transport is a byte stream behind a connector: a virtio-serial port named
-// `org.orbd.control` for QEMU, Firecracker's vsock (unix socket + `CONNECT <port>`)
-// later. Messages are u32 big-endian length-prefixed protobuf frames, max 64 KiB.
+// `org.orbd.control` for QEMU, vsock for Firecracker (host side: Firecracker's unix
+// socket + `CONNECT <port>`). Messages are u32 big-endian length-prefixed protobuf frames, max 64 KiB.
 // Deliberately narrow: there is no shell or exec RPC.
 //
 // Every connection starts with Hello. Either side may see EOF/HUP at any time (e.g.

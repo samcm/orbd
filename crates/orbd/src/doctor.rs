@@ -1,4 +1,4 @@
-//! `orbd doctor`: reports whether this host has what the VM runtime and image
+//! `orbd doctor`: reports whether this host has what the VM runtimes and image
 //! preparation need. Prints one line per check; fails if a required check fails.
 
 use crate::config::agent::{DEFAULT_GUEST_HELPER, DEFAULT_GUEST_KERNEL};
@@ -154,6 +154,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     let mut kernel_path = opts.kernel.clone();
     let mut qemu = PathBuf::from("qemu-system-x86_64");
     let mut qemu_img = PathBuf::from("qemu-img");
+    let mut firecracker = PathBuf::from("firecracker");
     if let Some(config) = &opts.config {
         let text = std::fs::read_to_string(config)?;
         let v: serde_json::Value = serde_saphyr::from_str(&text)?;
@@ -170,6 +171,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         kernel_path = kernel_path.or_else(|| get(&["runtime", "qemu"], "kernel"));
         qemu = get(&["runtime", "qemu"], "qemu").unwrap_or(qemu);
         qemu_img = get(&["runtime", "qemu"], "qemu_img").unwrap_or(qemu_img);
+        firecracker = get(&["runtime", "firecracker"], "firecracker").unwrap_or(firecracker);
     }
     let kernel_path = kernel_path.unwrap_or_else(|| DEFAULT_GUEST_KERNEL.into());
     if !nix::unistd::geteuid().is_root() && Path::new(&mkfs).components().count() == 1 {
@@ -187,6 +189,14 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         .and_then(|l| crate::runtime::qemu::check_qemu_version(&l).map(|()| l));
     r.line(qemu_check, "qemu-system-x86_64", true);
     r.line(first_line(&qemu_img, &["--version"]), "qemu-img", true);
+    // Firecracker orbs only (and their networking).
+    r.line(
+        first_line(&firecracker, &["--version"]),
+        "firecracker",
+        false,
+    );
+    r.line(first_line(Path::new("ip"), &["-V"]), "ip", false);
+    r.line(first_line(Path::new("nft"), &["--version"]), "nft", false);
     r.line(kvm(), "/dev/kvm", true);
     r.line(kernel(&kernel_path), "guest kernel", true);
     let umoci_check = first_line(&umoci, &["--version"]).and_then(|l| {

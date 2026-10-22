@@ -71,6 +71,18 @@ pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
     let defs = sh.db.call(|c| db::list_orb_definitions(c)).await?;
     for d in defs {
         let Some(rt) = runtime_for(sh, &d) else {
+            // Running without the runtime would leave the orb's VMM unrecovered.
+            let id = d.id;
+            let row = sh.db.call(move |c| db::get_orb(c, id)).await?;
+            if let ExecutionTarget::Fleet { runtime } = &d.spec.template.target
+                && row.is_some_and(|r| !r.is_deleted())
+            {
+                anyhow::bail!(
+                    "orb {id} runs on {}, which this agent does not enable; enable that runtime \
+                     again (or delete the orb from an agent that has it)",
+                    runtime.as_str()
+                );
+            }
             continue;
         };
         let observed = rt.inspect(d.id).await;
