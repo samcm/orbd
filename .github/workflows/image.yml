@@ -9,6 +9,10 @@ on:
       push:
         type: boolean
         required: true
+      artifact:
+        description: Upload the amd64 image (docker save) as artifact image-amd64.
+        type: boolean
+        default: false
 
 # Permissions come from the caller; only publish.yml and release.yml grant packages: write.
 
@@ -61,6 +65,16 @@ jobs:
           docker run --rm --entrypoint amp orbd:smoke --version
           docker run --rm --user root --entrypoint sh orbd:smoke -c \
             'qemu-system-x86_64 --version && qemu-img --version && umoci --version && mkfs.ext4 -V'
+      - if: inputs.artifact
+        run: docker save orbd:smoke | zstd -T0 -q -o image-amd64.tar.zst
+      - if: inputs.artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-amd64
+          path: image-amd64.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
       - if: inputs.push
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:

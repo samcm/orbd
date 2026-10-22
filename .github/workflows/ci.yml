@@ -1,7 +1,7 @@
 name: ci
 
 # Pull requests (including forks) run with a read-only token on GitHub-hosted
-# runners only. Nothing here is privileged; see the disabled kvm job below.
+# runners only. Nothing here is privileged.
 on:
   push:
     branches: [main]
@@ -89,36 +89,112 @@ jobs:
     uses: ./.github/workflows/image.yml
     with:
       push: false
+      artifact: true
 
-  # Privileged QEMU/KVM tests on a self-hosted runner. Disabled until such a
-  # runner exists. Before enabling:
-  # - Move this job to its own workflow triggered only by `push` to main and
-  #   `workflow_dispatch`. A pull request can edit workflow files, so an `if:`
-  #   guard in a workflow that runs on `pull_request` does not protect the host.
-  # - Register the runner so it only accepts that workflow (an org runner group
-  #   limited to selected workflows), make it ephemeral, and keep fork PR
-  #   approval required in the repository settings.
-  #
-  # kvm:
-  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-  #   needs: [test]
-  #   runs-on: [self-hosted, linux, x64, kvm]
-  #   timeout-minutes: 60
-  #   steps:
-  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-  #       with:
-  #         persist-credentials: false
-  #     - run: test -w /dev/kvm
-  #     - run: cargo test --workspace --locked --features orbd/failpoints -- --ignored kvm
+  # Real VMs on GitHub-hosted runners: ephemeral VMs with /dev/kvm and no secrets, so
+  # pull requests run here too. Both suites run inside the image built above, so they
+  # test the shipped QEMU and guest kernel.
+  # - gates: tests/qemu_kvm.rs (ignored by default) through a real coordinator and agent.
+  # - container: tests/container-e2e.sh, the coordinator and agent containers as deployed.
+  kvm:
+    name: kvm (${{ matrix.suite }})
+    needs: [build, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [gates, container]
+    env:
+      ROOTFS: target/kvm-guest/rootfs.ext4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # trigger is asynchronous; without settle the check below can race it.
+          sudo udevadm settle
+          ls -l /dev/kvm || { echo "::error::This runner has no /dev/kvm"; exit 1; }
+          test -w /dev/kvm || { echo "::error::/dev/kvm is not writable after the udev rule"; exit 1; }
+      # Orbs get /dev/kvm only if the runner's KVM nests. Without it the gates still run
+      # but skip their nested-guest assertions (ORBD_KVM_NESTED=0).
+      - name: Nested virtualization
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          nested=$(cat /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested 2>/dev/null || true)
+          echo "kvm nested parameter: ${nested:-absent}"
+          case "$nested" in
+            Y|1) echo ORBD_KVM_NESTED=1 >>"$GITHUB_ENV" ;;
+            *)
+              echo "::warning title=No nested virtualization::This runner's KVM does not nest; nested-guest assertions are SKIPPED."
+              echo ORBD_KVM_NESTED=0 >>"$GITHUB_ENV" ;;
+          esac
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{image-amd64,guest-kernel,orbd-guest-*}"
+          path: artifacts
+      - run: zstd -dc artifacts/image-amd64/image-amd64.tar.zst | docker load
+      - id: rootfs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ROOTFS }}
+          key: kvm-rootfs-${{ hashFiles('crates/orbd/tests/kvm-guest/**', 'guest/rootfs/**', 'guest/kernel/build.sh', 'guest/kernel/orbd.config', 'crates/orbd-guest/**', 'proto/**', 'Cargo.lock') }}
+      - if: steps.rootfs.outputs.cache-hit != 'true'
+        name: Build the test root disk
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mmdebstrap debian-archive-keyring busybox-static
+          # mmdebstrap's unshare mode needs unprivileged user namespaces, and its
+          # namespace root (a subordinate uid) reads the inputs from this checkout.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo chmod o+x "$HOME"
+          mkdir -p "$(dirname "$ROOTFS")"
+          crates/orbd/tests/kvm-guest/build-rootfs.sh \
+            artifacts/orbd-guest-x86_64-unknown-linux-musl/orbd-guest artifacts/guest-kernel/bzImage "$ROOTFS"
+
+      # Static musl test binaries run in the image whatever its libc.
+      - if: matrix.suite == 'gates'
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
+          sudo apt-get install -y -qq musl-tools
+      - if: matrix.suite == 'gates'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: kvm-musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: matrix.suite == 'gates'
+        name: Build the gates
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          cargo test --locked -p orbd --features failpoints --test qemu_kvm \
+            --target x86_64-unknown-linux-musl --no-run --message-format=json |
+            jq -r 'select(.profile.test == true and .target.name == "qemu_kvm") | .executable' >gates.txt
+          cat gates.txt
+      - if: matrix.suite == 'gates'
+        name: Run the gates in the image
+        # procps provides the `kill` the test harness runs; QEMU is the image's own.
+        run: |
+          docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD/crates/orbd" \
+            -e ORBD_KVM_KERNEL=/usr/share/orbd/bzImage -e "ORBD_KVM_ROOTFS=$PWD/$ROOTFS" -e ORBD_KVM_NESTED \
+            --entrypoint sh orbd:smoke -c \
+            'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture' \
+            "$(cat gates.txt)"
+
+      - if: matrix.suite == 'container'
+        run: crates/orbd/tests/container-e2e.sh orbd:smoke "$ROOTFS"
 
   # Single required status check for branch rules and auto-merge.
   ci-ok:
     if: always()
-    needs: [fmt, deny, clippy, test, build, image]
+    needs: [fmt, deny, clippy, test, build, image, kvm]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All CI jobs succeeded
         run: test "$RESULTS" = "success"
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success' && 'success' || 'failure' }}
+          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success' && 'success' || 'failure' }}
