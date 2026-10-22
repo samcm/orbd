@@ -12,6 +12,42 @@ pub struct AgentConfig {
     pub agent: AgentSection,
     #[serde(default)]
     pub runtime: RuntimesConfig,
+    /// Image preparation for VM runtimes (OCI image → ext4 root disk).
+    pub images: Option<ImagesConfig>,
+}
+
+/// `[images]`: turns Amp's OCI image into a bootable root disk with orbd's guest
+/// integration. Prepared images live under `<state_dir>/images/`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// Static `orbd-guest` binary (x86_64 musl) installed into every prepared image.
+    pub guest_helper: PathBuf,
+    /// `umoci` binary; must be the pinned version (see `orbd doctor`).
+    #[serde(default = "default_umoci")]
+    pub umoci: PathBuf,
+    #[serde(default = "default_mkfs_ext4")]
+    pub mkfs_ext4: PathBuf,
+    /// Images prepared in the background at startup, so the first spawn does not fail
+    /// with ImageNotReady while a multi-GB image is pulled and converted.
+    #[serde(default)]
+    pub prewarm: Vec<String>,
+    /// How often a tag (e.g. `:latest`) is resolved again; the previously prepared
+    /// image keeps serving until the new digest is ready.
+    #[serde(default = "default_refresh_secs")]
+    pub refresh_interval_secs: u64,
+}
+
+fn default_umoci() -> PathBuf {
+    "umoci".into()
+}
+
+fn default_mkfs_ext4() -> PathBuf {
+    "mkfs.ext4".into()
+}
+
+fn default_refresh_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Deserialize)]

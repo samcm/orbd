@@ -33,8 +33,10 @@ jobs:
         run: |
           mkdir dist
           for dir in artifacts/orbd-*; do
-            target=${dir#artifacts/orbd-}
-            install -m 0755 "$dir/orbd" "dist/orbd-$GITHUB_REF_NAME-$target"
+            name=$(basename "$dir")
+            bin=orbd; case "$name" in orbd-guest-*) bin=orbd-guest ;; esac
+            target=${name#"$bin"-}
+            install -m 0755 "$dir/$bin" "dist/$bin-$GITHUB_REF_NAME-$target"
           done
           cd dist && sha256sum orbd-* > SHA256SUMS && cat SHA256SUMS
       - name: Publish

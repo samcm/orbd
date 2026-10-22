@@ -3,8 +3,10 @@
 - `kernel/`: `build.sh` builds the pinned 6.1 LTS guest kernel (`bzImage`, final
   `config`, `bzImage.sha256`, `manifest.txt`) from `orbd.config`. Everything is built in:
   no modules, no initrd.
-- `rootfs/`: files the image pipeline (`crates/orbd/src/image/`) adds to Amp's image,
-  next to the static `orbd-guest` binary (`/usr/local/sbin/orbd-guest`).
+- `rootfs/`: files the image pipeline (`crates/orbd/src/image/`) adds to Amp's image as
+  one extra layer, next to the static `orbd-guest` binary (`/usr/local/sbin/orbd-guest`),
+  an empty `/etc/machine-id` and a mask for `serial-getty@ttyS0.service` (without udev it
+  would hold boot for 90 s).
 
 ## Host contract
 
@@ -20,7 +22,8 @@ depend on udev's `/dev/virtio-ports` links. The host connects, sends `Hello`, th
 that has gone is dropped: reconnect, send `Hello` and read `last_generation`.
 
 At boot `orbd-guest init` grows `/` to the disk size, gives `/dev/kvm` to group `kvm`
-(0660, `user` is a member), adds `/etc/hosts` entries, and resets SSH host keys and the
-D-Bus machine id when the disk boots as a new orb (first boot, or a new MAC).
+(0660, `user` is a member), adds `/etc/hosts` entries, and regenerates SSH host keys when
+the disk boots as a new orb (first boot, or a new MAC). The image ships an empty `/etc/machine-id` (systemd
+generates one on first boot) with `/var/lib/dbus/machine-id` linked to it.
 `amp-headless.service` and `amp-headless-bootstrap.service` have a drop-in that keeps
 them down until `Wake` has delivered credentials (`/run/orbd-guest/credentials-ready`).

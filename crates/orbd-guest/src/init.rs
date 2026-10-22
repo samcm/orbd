@@ -173,7 +173,7 @@ fn primary_mac() -> Option<String> {
 }
 
 /// Resets per-machine identity when this disk first boots as a new orb (from the shared
-/// image, or as a clone of another orb's disk): SSH host keys and the D-Bus machine id
+/// image, or as a clone of another orb's disk): SSH host keys and the systemd random seed
 /// follow the current machine id instead of the image's or the source orb's.
 ///
 /// The machine id itself is set before this runs: the image ships an empty
@@ -203,14 +203,6 @@ fn identity() -> Result<(), String> {
         log!(
             "init: warning: this disk moved to a new orb but kept its machine id; pass \
              systemd.machine_id= on the kernel command line to give clones their own"
-        );
-    }
-    if !machine_id.is_empty() && Path::new("/var/lib/dbus").is_dir() {
-        let _ = write_atomic(
-            Path::new("/var/lib/dbus/machine-id"),
-            format!("{machine_id}\n").as_bytes(),
-            0o444,
-            None,
         );
     }
     let _ = std::fs::remove_file("/var/lib/systemd/random-seed");
