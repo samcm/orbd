@@ -119,6 +119,23 @@ or aarch64) and one or more agent hosts with the runtime you want (Docker for no
 Threads you create on that provider in Amp then run on your hosts. Prometheus metrics
 are on `metrics_listen`; `orbd doctor` checks a host's prerequisites.
 
+## Run with Docker
+
+`ghcr.io/samcm/orbd` (amd64, arm64) has the Amp CLI and, on amd64, everything the QEMU
+runtime needs. Configs go in `/etc/orbd/`, state in `/var/lib/orbd`. The coordinator
+runs as uid 10001, which must be able to read its files. The agent needs root, and a
+long stop timeout so it can checkpoint its orbs on `docker stop`.
+
+```sh
+docker run -d --name orbd-coordinator -p 7443:7443 \
+  -v /etc/orbd:/etc/orbd:ro -v orbd-coordinator:/var/lib/orbd \
+  ghcr.io/samcm/orbd coordinator --config /etc/orbd/coordinator.yaml
+
+docker run -d --name orbd-agent --privileged --user root --stop-timeout 300 \
+  -v /etc/orbd:/etc/orbd:ro -v orbd-agent:/var/lib/orbd \
+  ghcr.io/samcm/orbd agent --config /etc/orbd/agent.yaml
+```
+
 ## License
 
 [MIT](LICENSE)
