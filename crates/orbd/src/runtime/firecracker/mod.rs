@@ -10,7 +10,7 @@
 //!                   /disk.raw                standalone raw disk (reflink or sparse copy)
 //!                   /checkpoints/<gen>/      published: memory, vmstate, manifest.json[, consumed]
 //!                   /checkpoints/<gen>.tmp/  save in progress (complete once manifest.json exists)
-//!                   /logs/{firecracker.log,console.log}
+//!                   /logs/{firecracker.log (latest launch),console.log}
 //! <state>/net/<index>                        network index claimed by an orb
 //! <run>/firecracker/<orb>/{launch.json,api.sock,vsock.sock}
 //! ```
@@ -503,6 +503,8 @@ impl FirecrackerRuntime {
         // Firecracker binds the API and vsock sockets itself (a stale one fails it).
         self.clear_run(orb);
         create_private_dir(&rp.dir).map_err(io_err)?;
+        // Firecracker writes its log from the start of the file: one launch per log.
+        let _ = std::fs::remove_file(&op.vmm_log);
         let record = LaunchRecord::new(kind, machine);
         let id = marker(&record);
         let args = vec![
