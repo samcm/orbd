@@ -788,9 +788,10 @@ impl Core {
                     })
                     .expect("non-empty");
                 let initial_disk = match &snap_key {
-                    Some(k) if chosen.has_project_snapshot => {
-                        InitialDiskSource::ProjectSnapshot(ProjectSnapshotRef { key: k.clone() })
-                    }
+                    Some(k) if chosen.has_project_snapshot => InitialDiskSource::ProjectSnapshot {
+                        snapshot: ProjectSnapshotRef { key: k.clone() },
+                        image_ref: image_ref.clone(),
+                    },
                     _ => InitialDiskSource::Image {
                         image_ref: image_ref.clone(),
                     },

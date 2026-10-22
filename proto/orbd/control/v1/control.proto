@@ -96,6 +96,8 @@ message InitialDiskSource {
     // Opaque key of a project snapshot held by the recorded location.
     string project_snapshot_key = 2;
   }
+  // With project_snapshot_key: the spawn's image, used if the snapshot is missing.
+  string fallback_image_ref = 3;
 }
 
 enum PauseMode {
@@ -392,6 +394,7 @@ message Hello {
   repeated RuntimeInfo runtimes = 4;
   Resources capacity = 5;           // configured ceiling for orbs on this host
   uint64 last_controller_epoch = 6; // highest epoch this agent has accepted
+  repeated string project_snapshot_keys = 7; // project snapshots published on this host
 }
 
 message Heartbeat {

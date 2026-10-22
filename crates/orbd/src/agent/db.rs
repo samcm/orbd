@@ -57,7 +57,7 @@ impl Db {
 }
 
 /// Bump on any schema change; there is no upgrade path (greenfield).
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "CREATE TABLE meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -89,7 +89,10 @@ const SCHEMA: &str = "CREATE TABLE meta (
             created INTEGER NOT NULL DEFAULT 0,
             last_state_json TEXT,
             next_checkpoint_generation INTEGER NOT NULL DEFAULT 1,
-            restore_json TEXT);";
+            restore_json TEXT);
+         CREATE TABLE project_snapshots (
+            key TEXT PRIMARY KEY,
+            published_at_unix_ms INTEGER NOT NULL);";
 
 fn init(conn: &mut Connection) -> anyhow::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -511,6 +514,24 @@ pub fn record_maintenance(
         params![orb.to_string(), json(state), intent.map(json)],
     )?;
     Ok(())
+}
+
+/// Records a project snapshot published on this host (idempotent).
+pub fn record_project_snapshot(
+    conn: &Connection,
+    key: &crate::model::ProjectSnapshotKey,
+    now: u64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO project_snapshots(key, published_at_unix_ms) VALUES (?1, ?2)",
+        params![key.as_str(), now as i64],
+    )?;
+    Ok(())
+}
+
+pub fn list_project_snapshots(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut st = conn.prepare("SELECT key FROM project_snapshots ORDER BY key")?;
+    st.query_map([], |r| r.get(0))?.collect()
 }
 
 pub fn set_last_state(conn: &Connection, orb: OrbId, state: &OrbState) -> rusqlite::Result<()> {

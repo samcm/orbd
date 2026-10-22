@@ -41,7 +41,7 @@ use futures::StreamExt;
 use futures::stream::{PollNext, select_with_strategy};
 use orbd_proto::control::v1 as pb;
 use secrecy::ExposeSecret;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -92,6 +92,8 @@ struct AgentSlot {
     hello: Option<pb::Hello>,
     heartbeat: Option<(pb::Heartbeat, Instant)>,
     unavailable_reason: String,
+    /// Project snapshot keys the agent holds: from its Hello, plus later publications.
+    snapshots: HashSet<String>,
 }
 
 struct Session {
@@ -114,6 +116,7 @@ impl AgentSlot {
             hello: None,
             heartbeat: None,
             unavailable_reason: String::new(),
+            snapshots: HashSet::new(),
         }
     }
 }
@@ -242,6 +245,7 @@ impl Inner {
             metrics::counter!("orbd_fleet_sessions_replaced_total").increment(1);
         }
         drop(replaced);
+        slot.snapshots = hello.project_snapshot_keys.iter().cloned().collect();
         slot.hello = Some(hello);
         slot.unavailable_reason.clear();
         let _ = tx.send(pb::CoordinatorEvent {
@@ -429,11 +433,16 @@ impl Inner {
             }
             E::Completed(c) => {
                 let key = key_of(&c.key)?;
-                let outcome = c
+                let outcome: crate::model::CommandOutcome = c
                     .outcome
                     .as_ref()
                     .ok_or_else(|| wire::WireError("completion without outcome".into()))?
                     .try_into()?;
+                if let crate::model::SnapshotDisposition::Published { snapshot } = &outcome.snapshot
+                    && let Some(slot) = st.agents.get_mut(agent)
+                {
+                    slot.snapshots.insert(snapshot.key.0.clone());
+                }
                 st.op_keys.insert(key.operation_id, key);
                 self.emit(BackendEvent::Completed { key, outcome });
             }
@@ -567,7 +576,10 @@ impl ComputeBackend for FleetBackend {
                 capacity_pool: agent.to_string(),
                 capacity_ceiling: ceiling,
                 demand: request.resources,
-                has_project_snapshot: false,
+                has_project_snapshot: request
+                    .project_snapshot
+                    .as_ref()
+                    .is_some_and(|k| slot.snapshots.contains(k.as_str())),
             });
         }
         Ok(out)

@@ -140,10 +140,13 @@ pub struct Offering {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum InitialDiskSource {
     /// Image reference as given by Amp; the location must have it prepared.
-    Image {
+    Image { image_ref: String },
+    /// A project snapshot the location holds. `image_ref` is the spawn's image, used
+    /// instead when the snapshot turns out to be missing on the host.
+    ProjectSnapshot {
+        snapshot: ProjectSnapshotRef,
         image_ref: String,
     },
-    ProjectSnapshot(ProjectSnapshotRef),
 }
 
 /// Immutable spec recorded for an orb. Later spawns never change it.

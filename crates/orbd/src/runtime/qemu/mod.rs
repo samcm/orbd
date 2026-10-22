@@ -835,7 +835,7 @@ impl QemuRuntime {
                     },
                 )
             }
-            InitialDiskSource::ProjectSnapshot(r) => {
+            InitialDiskSource::ProjectSnapshot { snapshot: r, .. } => {
                 let disk = self.project_dir(&r.key).join("disk.raw");
                 if !disk.is_file() {
                     return Err(RuntimeError::NotFound(format!(
