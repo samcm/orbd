@@ -24,7 +24,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 prost = "0.14"
 prost-types = "0.14"
-rand = "0.8"
+rand = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
