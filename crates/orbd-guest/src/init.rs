@@ -77,8 +77,10 @@ fn grow_root() -> Result<(), String> {
     Ok(())
 }
 
-/// `/dev/kvm` as root:kvm 0660 with `user` in the kvm group (images without udev get the
-/// kernel's root-only node).
+/// `/dev/kvm` as root:kvm 0666, as on Amp-hosted orbs: Amp's agent sets its own
+/// supplementary groups (not kvm), so group access alone does not reach its shell. The
+/// VM is single-tenant. `user` stays in the kvm group for tools that check it. Images
+/// without udev get the kernel's root-only node, so this runs on every boot.
 fn kvm_access() -> Result<(), String> {
     let has_group = std::fs::read_to_string("/etc/group")
         .map_err(|e| e.to_string())?
@@ -106,7 +108,7 @@ fn kvm_access() -> Result<(), String> {
     }
     // SAFETY: valid path.
     unsafe {
-        if libc::chown(path.as_ptr(), 0, gid) < 0 || libc::chmod(path.as_ptr(), 0o660) < 0 {
+        if libc::chown(path.as_ptr(), 0, gid) < 0 || libc::chmod(path.as_ptr(), 0o666) < 0 {
             return Err(format!("/dev/kvm: {}", std::io::Error::last_os_error()));
         }
     }
@@ -139,12 +141,51 @@ fn hosts() -> Result<(), String> {
         body.push_str("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
     }
     if !hostname.is_empty() && !known(&hostname) {
+        // Replace the image's (or the snapshot source's) name rather than adding one.
+        body = body
+            .lines()
+            .filter(|l| !l.starts_with("127.0.1.1"))
+            .map(|l| format!("{l}\n"))
+            .collect();
         body.push_str(&format!("127.0.1.1\t{hostname}\n"));
     }
     if body != current {
         write_atomic(Path::new("/etc/hosts"), body.as_bytes(), 0o644, None)
             .map_err(|e| e.to_string())?;
         log!("init: updated /etc/hosts");
+    }
+    Ok(())
+}
+
+/// Names the guest after its orb: /etc/hostname, the live hostname and /etc/hosts.
+pub fn set_hostname(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !valid {
+        return Err(format!("invalid hostname {name:?}"));
+    }
+    let current = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    if current.trim() != name {
+        write_atomic(
+            Path::new("/etc/hostname"),
+            format!("{name}\n").as_bytes(),
+            0o644,
+            None,
+        )
+        .map_err(|e| format!("/etc/hostname: {e}"))?;
+    }
+    // SAFETY: valid buffer and length.
+    if unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) } < 0 {
+        return Err(format!("sethostname: {}", std::io::Error::last_os_error()));
+    }
+    hosts()?;
+    if current.trim() != name {
+        log!("hostname: {name}");
     }
     Ok(())
 }

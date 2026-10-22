@@ -39,6 +39,9 @@ pub fn wake(w: &Wake) -> Result<(), String> {
     if let Some(net) = &w.network {
         crate::net::apply(net)?;
     }
+    if !w.hostname.is_empty() {
+        crate::init::set_hostname(&w.hostname)?;
+    }
     let body = env_file(&w.permitted_env)?;
     let redact = |s: &str| redact(s, &w.permitted_env);
 

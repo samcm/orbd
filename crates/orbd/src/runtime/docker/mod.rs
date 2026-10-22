@@ -146,7 +146,7 @@ impl DockerRuntime {
         ]);
         let body = ContainerCreateBody {
             image: Some(image.to_owned()),
-            hostname: Some(hostname(orb)),
+            hostname: Some(super::orb_hostname(orb)),
             labels: Some(labels),
             // Boot the image's systemd, which runs the orb's services like an Amp-hosted
             // orb. `container=docker` tells systemd it is in a container.
@@ -517,26 +517,6 @@ impl Pulls {
 
 pub(crate) fn container_name(orb: OrbId) -> String {
     format!("orbd-{orb}")
-}
-
-/// RFC 1123 label from Amp's orb id (`[A-Za-z0-9._-]`), for prompts and logs.
-fn hostname(orb: &OrbDefinition) -> String {
-    let h: String = orb
-        .identity
-        .amp_orb_id
-        .0
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .take(63)
-        .collect();
-    let h = h.trim_matches('-');
-    if h.is_empty() { "orb".into() } else { h.into() }
 }
 
 fn label<'a>(c: &'a ContainerInspectResponse, key: &str) -> Option<&'a str> {

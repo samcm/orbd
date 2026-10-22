@@ -320,23 +320,32 @@ impl GuestControl for QemuRuntime {
             _ = ctx.cancel.cancelled() => return Err(GuestError::Cancelled),
             r = open(&connector, ready_by) => r,
         };
-        // Close the probe's connection: QEMU serves one client per chardev socket.
-        if let Err(e) = ready.map(drop) {
-            if Instant::now() >= deadline {
-                return Err(GuestError::DeadlineExceeded);
+        // The first attempt reuses this connection. Reconnecting right after a Hello races
+        // the guest: it can answer the new Hello on its old session, then notice the
+        // disconnect and reopen, so the Wake lands on an ungreeted session.
+        let mut greeted = match ready {
+            Ok(ch) => Some(ch),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(GuestError::DeadlineExceeded);
+                }
+                let msg = format!(
+                    "guest helper did not answer within {}s ({e}); console: {}",
+                    GUEST_CONNECT_TIMEOUT.as_secs(),
+                    super::log_tail(&self.orb_paths(orb.id).console_log)
+                );
+                log(ctx, &msg);
+                return Err(GuestError::Unreachable(msg));
             }
-            let msg = format!(
-                "guest helper did not answer within {}s ({e}); console: {}",
-                GUEST_CONNECT_TIMEOUT.as_secs(),
-                super::log_tail(&self.orb_paths(orb.id).console_log)
-            );
-            log(ctx, &msg);
-            return Err(GuestError::Unreachable(msg));
-        }
+        };
         let mut announced = false;
         loop {
+            let reuse = greeted.take();
             let attempt = async {
-                let (mut ch, hello) = open(&connector, deadline).await?;
+                let (mut ch, hello) = match reuse {
+                    Some(c) => c,
+                    None => open(&connector, deadline).await?,
+                };
                 if !announced {
                     log(
                         ctx,
@@ -364,6 +373,7 @@ impl GuestControl for QemuRuntime {
                         .collect(),
                     network: Some(recipe.net.guest_config(&self.config.dns_servers)),
                     cold_boot: request.cold_boot,
+                    hostname: crate::runtime::orb_hostname(orb),
                 };
                 match ch
                     .request(gpb::host_message::Body::Wake(wake), deadline)
