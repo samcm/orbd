@@ -1,0 +1,27 @@
+# Pushes ghcr.io/samcm/orbd:main and :sha-<short> for every push to main.
+name: publish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The newest main commit wins; a push in progress is not cancelled.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  image:
+    needs: [build]
+    uses: ./.github/workflows/image.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      push: true

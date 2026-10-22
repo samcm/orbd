@@ -17,3 +17,11 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  # Dockerfile base image digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
