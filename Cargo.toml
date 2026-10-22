@@ -8,6 +8,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/samcm/orbd"
 rust-version = "1.90"
+publish = false
 
 [workspace.dependencies]
 orbd-proto = { path = "crates/orbd-proto" }
