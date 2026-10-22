@@ -91,3 +91,15 @@ jobs:
   #         persist-credentials: false
   #     - run: test -w /dev/kvm
   #     - run: cargo test --workspace --locked --features orbd/failpoints -- --ignored kvm
+
+  # Single required status check for branch rules and auto-merge.
+  ci-ok:
+    if: always()
+    needs: [fmt, clippy, test, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: All CI jobs succeeded
+        run: test "$RESULTS" = "success"
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success' && 'success' || 'failure' }}

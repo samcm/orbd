@@ -68,7 +68,7 @@ impl SecretKey {
     /// Generates a fresh key file body (64 hex chars + newline).
     pub fn generate_hex() -> String {
         let mut b = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(&mut b[..]);
+        rand::rng().fill_bytes(&mut b[..]);
         format!("{}\n", hex::encode(&b[..]))
     }
 
@@ -77,10 +77,10 @@ impl SecretKey {
     pub fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         let cipher = XChaCha20Poly1305::new(self.seal.expose_secret().into());
         let mut nonce = [0u8; 24];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let ct = cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 chacha20poly1305::aead::Payload {
                     msg: plaintext,
                     aad,
@@ -97,19 +97,17 @@ impl SecretKey {
             return Err(SecretError::Malformed("too short".into()));
         }
         let (nonce, ct) = sealed.split_at(24);
+        let nonce = XNonce::try_from(nonce).map_err(|_| SecretError::Malformed("nonce".into()))?;
         let cipher = XChaCha20Poly1305::new(self.seal.expose_secret().into());
         cipher
-            .decrypt(
-                XNonce::from_slice(nonce),
-                chacha20poly1305::aead::Payload { msg: ct, aad },
-            )
+            .decrypt(&nonce, chacha20poly1305::aead::Payload { msg: ct, aad })
             .map(Zeroizing::new)
             .map_err(|_| SecretError::Open)
     }
 
     /// Keyed fingerprint (hex HMAC-SHA256) over length-prefixed parts.
     pub fn fingerprint(&self, parts: &[&[u8]]) -> String {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.fingerprint.expose_secret())
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.fingerprint.expose_secret())
             .expect("hmac accepts any key length");
         for p in parts {
             mac.update(&(p.len() as u64).to_be_bytes());

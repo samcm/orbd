@@ -1,3 +1,6 @@
+# Routine bumps arrive as one grouped PR per ecosystem each week and auto-merge once CI
+# passes (see workflows/dependabot-auto-merge.yml). Major updates (including 0.x minor
+# bumps, which are breaking in Cargo) come as individual PRs for a maintainer.
 version: 2
 updates:
   - package-ecosystem: cargo
