@@ -25,3 +25,17 @@ macro_rules! crash_point {
         fail::fail_point!($name, |_| std::process::abort())
     };
 }
+
+/// Applies `FAILPOINTS="name=actions;name2=actions"` (feature `failpoints` only).
+pub fn configure_failpoints() {
+    #[cfg(feature = "failpoints")]
+    if let Ok(spec) = std::env::var("FAILPOINTS") {
+        for part in spec.split(';').filter(|p| !p.is_empty()) {
+            if let Some((name, actions)) = part.split_once('=')
+                && let Err(e) = fail::cfg(name.trim(), actions.trim())
+            {
+                tracing::warn!(failpoint = name, error = %e, "bad failpoint");
+            }
+        }
+    }
+}

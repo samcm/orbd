@@ -32,6 +32,7 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    orbd::configure_failpoints();
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
         Command::Dispatch => {
