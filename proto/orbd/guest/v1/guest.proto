@@ -1,0 +1,64 @@
+// orbd guest protocol, version 1: host agent <-> `orbd-guest` inside a VM, over vsock.
+//
+// Deliberately narrow: there is no shell or exec RPC. Messages are length-prefixed
+// protobuf frames with a bounded maximum size.
+syntax = "proto3";
+
+package orbd.guest.v1;
+
+message EnvVar {
+  string name = 1;
+  string value = 2;
+}
+
+message NetworkConfig {
+  repeated string dns_servers = 1;
+  repeated string search_domains = 2;
+}
+
+message HostMessage {
+  uint64 request_id = 1;
+  oneof body {
+    Hello hello = 10;
+    PrepareSleep prepare_sleep = 11;
+    Wake wake = 12;
+    Shutdown shutdown = 13;
+  }
+}
+
+message Hello {}
+
+message PrepareSleep {}
+
+// Delivered on cold boot and on every warm restore.
+message Wake {
+  uint64 generation = 1;
+  int64 current_time_unix_ns = 2;
+  repeated EnvVar permitted_env = 3;
+  NetworkConfig network = 4;
+  bool cold_boot = 5;
+}
+
+message Shutdown {}
+
+message GuestMessage {
+  uint64 request_id = 1;
+  oneof body {
+    HelloReply hello = 10;
+    Ack ack = 11;
+    Error error = 12;
+  }
+}
+
+message HelloReply {
+  string guest_version = 1;
+  uint64 last_generation = 2;
+}
+
+message Ack {
+  uint64 generation = 1;
+}
+
+message Error {
+  string message = 1;
+}

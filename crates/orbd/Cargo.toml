@@ -1,0 +1,51 @@
+[package]
+name = "orbd"
+description = "Self-hosted Amp orb backend: coordinator, agents and runtimes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+orbd-proto.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+prost.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+fail.workspace = true
+nix.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen.workspace = true
+
+[features]
+# Enables `fail` failpoints (FAILPOINTS env var) for crash-recovery tests. Never in releases.
+failpoints = ["fail/failpoints"]

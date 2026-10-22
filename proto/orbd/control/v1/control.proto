@@ -1,0 +1,503 @@
+// orbd control protocol, version 1.
+//
+// Two services live here:
+//
+// * `Dispatch` is served by the coordinator on a local unix socket. `orbd dispatch`
+//   (run by `amp orb provider` once per job) calls it. No TLS; the socket is protected
+//   by file permissions and peer credentials.
+// * `AgentControl` is served by the coordinator over mTLS. Agents dial out and keep one
+//   bidirectional stream open. It is the private transport of the agent-fleet compute
+//   backend, not the coordinator's core abstraction.
+//
+// Evolution rules: additive changes only; never reuse field numbers; receivers reject
+// unknown `oneof` action variants instead of guessing.
+syntax = "proto3";
+
+package orbd.control.v1;
+
+// ---------------------------------------------------------------------------
+// Shared value types
+// ---------------------------------------------------------------------------
+
+enum RuntimeKind {
+  RUNTIME_KIND_UNSPECIFIED = 0;
+  RUNTIME_KIND_FAKE = 1;
+  RUNTIME_KIND_DOCKER = 2;
+  RUNTIME_KIND_QEMU = 3;
+  RUNTIME_KIND_FIRECRACKER = 4;
+}
+
+// Exact integer quantities. Never floating point.
+message Resources {
+  uint32 vcpus = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+}
+
+message EnvVar {
+  string name = 1;
+  string value = 2;
+}
+
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  LOG_STREAM_STDOUT = 1;
+  LOG_STREAM_STDERR = 2;
+}
+
+// A bounded chunk of operation output. `seq` increases by one per chunk within an
+// operation. `dropped_before` counts chunks discarded before this one (bounded buffers).
+message LogChunk {
+  string operation_id = 1;
+  uint64 seq = 2;
+  LogStream stream = 3;
+  bytes data = 4;
+  uint64 dropped_before = 5;
+}
+
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0;
+  FAILURE_CODE_BACKEND_UNAVAILABLE = 1;
+  FAILURE_CODE_INSUFFICIENT_MEMORY = 2;
+  FAILURE_CODE_INSUFFICIENT_DISK = 3;
+  FAILURE_CODE_QUOTA_EXCEEDED = 4;
+  FAILURE_CODE_IMAGE_NOT_READY = 5;
+  FAILURE_CODE_UNSUPPORTED_CAPABILITY = 6;
+  FAILURE_CODE_CHECKPOINT_INCOMPATIBLE = 7;
+  FAILURE_CODE_CHECKPOINT_FAILED = 8;
+  FAILURE_CODE_SNAPSHOT_FAILED = 9;
+  FAILURE_CODE_GUEST_BOOTSTRAP_FAILED = 10;
+  FAILURE_CODE_SECRET_UNAVAILABLE = 11;
+  FAILURE_CODE_SPEC_MISMATCH = 12;
+  FAILURE_CODE_OPERATION_CONFLICT = 13;
+  FAILURE_CODE_STALE_GENERATION = 14;
+  FAILURE_CODE_STALE_CONTROLLER = 15;
+  FAILURE_CODE_DEADLINE_EXCEEDED = 16;
+  FAILURE_CODE_CANCELLED = 17;
+  FAILURE_CODE_BACKEND_FAILURE = 18;
+  FAILURE_CODE_ORB_DELETED = 19;
+  FAILURE_CODE_INVALID_REQUEST = 20;
+}
+
+message CommandFailure {
+  FailureCode code = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Orb definition, commands and outcomes
+// ---------------------------------------------------------------------------
+
+message InitialDiskSource {
+  oneof source {
+    // Image reference as given by Amp (e.g. ORB_IMAGE). The agent resolves it to a
+    // prepared image; a cache miss fails with IMAGE_NOT_READY.
+    string image_ref = 1;
+    // Opaque key of a project snapshot held by the recorded location.
+    string project_snapshot_key = 2;
+  }
+}
+
+enum PauseMode {
+  PAUSE_MODE_UNSPECIFIED = 0;
+  PAUSE_MODE_DISK_ONLY = 1;
+  PAUSE_MODE_MEMORY_PRESERVING = 2;
+}
+
+enum CheckpointFailurePolicy {
+  CHECKPOINT_FAILURE_POLICY_UNSPECIFIED = 0;
+  CHECKPOINT_FAILURE_POLICY_KEEP_RUNNING = 1;
+  CHECKPOINT_FAILURE_POLICY_COLD_STOP = 2;
+}
+
+enum NestedKvm {
+  NESTED_KVM_UNSPECIFIED = 0;
+  NESTED_KVM_NOT_REQUIRED = 1;
+  NESTED_KVM_GUEST_DEVICE = 2;
+  NESTED_KVM_GUEST_DEVICE_AND_PRESERVED_STATE = 3;
+}
+
+// Immutable, resolved spec recorded for an orb when it is first placed.
+message OrbSpec {
+  RuntimeKind runtime = 1;
+  Resources resources = 2;
+  PauseMode pause_mode = 3;
+  CheckpointFailurePolicy on_checkpoint_failure = 4;
+  NestedKvm nested_kvm = 5;
+  InitialDiskSource initial_disk = 6;
+  bool release_compute_when_paused = 7;
+  SnapshotScope required_snapshot_scope = 8;  // UNSPECIFIED = not required
+}
+
+enum SnapshotScope {
+  SNAPSHOT_SCOPE_UNSPECIFIED = 0;
+  SNAPSHOT_SCOPE_RECORDED_LOCATION = 1;
+  SNAPSHOT_SCOPE_BACKEND = 2;
+}
+
+message OrbDefinition {
+  string orb_id = 1;        // internal UUID; safe as a storage identifier
+  string amp_endpoint = 2;  // configured endpoint id
+  string amp_orb_id = 3;    // ORB_ID, e.g. amp-<thread uuid>
+  string offering_id = 4;
+  OrbSpec spec = 5;
+  string spec_digest = 6;   // hex sha256 of the canonical spec
+}
+
+message SpawnAction {}
+
+message PauseAction {
+  // When set, publish an immutable project snapshot with this key after stopping.
+  optional string project_snapshot_key = 1;
+}
+
+message DeleteAction {}
+
+message Command {
+  string operation_id = 1;
+  string orb_id = 2;
+  uint64 generation = 3;
+  string spec_digest = 4;
+  // Hex digest over the canonical immutable command contents, including the identity
+  // of any secret payload. Same operation_id with a different digest is a conflict.
+  string command_digest = 5;
+  oneof action {
+    SpawnAction spawn = 10;
+    PauseAction pause = 11;
+    DeleteAction delete = 12;
+  }
+}
+
+message CommandKey {
+  string operation_id = 1;
+  string orb_id = 2;
+  uint64 generation = 3;
+}
+
+// Secret-bearing execution inputs. Never logged.
+message CommandSecrets {
+  // Guest environment for bootstrap (names listed in ORB_ENVS, validated).
+  repeated EnvVar guest_env = 1;
+}
+
+enum ProcessDisposition {
+  PROCESS_DISPOSITION_UNSPECIFIED = 0;
+  PROCESS_DISPOSITION_NOT_APPLICABLE = 1;
+  PROCESS_DISPOSITION_PRESERVED = 2;
+  PROCESS_DISPOSITION_LOST = 3;
+  PROCESS_DISPOSITION_UNKNOWN = 4;
+}
+
+enum StartKind {
+  START_KIND_UNSPECIFIED = 0;
+  START_KIND_NEW_DISK = 1;
+  START_KIND_MEMORY_RESTORE = 2;
+  START_KIND_EXISTING_DISK_COLD_BOOT = 3;
+  START_KIND_ALREADY_RUNNING = 4;
+}
+
+message OrbState {
+  enum Stable {
+    STABLE_UNSPECIFIED = 0;
+    STABLE_UNCREATED = 1;
+    STABLE_RUNNING = 2;
+    STABLE_SLEEPING = 3;
+    STABLE_DISK_ONLY_STOPPED = 4;
+    STABLE_DELETED = 5;
+  }
+  Stable stable = 1;
+  // Set for SLEEPING.
+  uint64 checkpoint_generation = 2;
+  // Set for DISK_ONLY_STOPPED.
+  string disk_only_reason = 3;
+  // When set, the orb is faulted and `stable` is the last known state.
+  optional string fault = 4;
+}
+
+message SpawnResult {
+  StartKind start = 1;
+  uint64 bootstrap_generation = 2;
+}
+
+message PauseResult {
+  optional uint64 checkpoint_generation = 1;
+}
+
+message DeleteResult {}
+
+message SnapshotDisposition {
+  oneof disposition {
+    bool not_requested = 1;
+    string published_snapshot_key = 2;
+    string not_published_reason = 3;
+  }
+}
+
+message CommandOutcome {
+  oneof result {
+    SpawnResult spawned = 1;
+    PauseResult paused = 2;
+    DeleteResult deleted = 3;
+    CommandFailure failure = 4;
+  }
+  OrbState observed = 10;
+  ProcessDisposition processes = 11;
+  SnapshotDisposition snapshot = 12;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch (local unix socket)
+// ---------------------------------------------------------------------------
+
+service Dispatch {
+  rpc Execute(DispatchRequest) returns (stream DispatchEvent);
+}
+
+message SpawnRequest {
+  string image_ref = 1;                     // ORB_IMAGE
+  optional string project_snapshot_id = 2;  // ORB_SNAPSHOT_ID
+  repeated EnvVar guest_env = 3;            // vars named by ORB_ENVS, validated
+}
+
+message PauseRequest {
+  optional string project_snapshot_id = 1;  // ORB_SNAPSHOT_ID
+}
+
+message DeleteRequest {}
+
+message DispatchRequest {
+  // UUID chosen by the `orbd dispatch` process; reused when it reconnects.
+  string invocation_id = 1;
+  // Trusted offering id from ORBD_OFFERING_ID (set by the coordinator for its child).
+  string offering_id = 2;
+  string amp_orb_id = 3;          // ORB_ID
+  uint64 remaining_budget_ms = 4; // remaining dispatch budget when sent
+  // On reconnect: resume logs after this sequence number (0 = from the start).
+  uint64 resume_after_log_seq = 5;
+  // Informational Amp fields, validated against configuration where applicable.
+  string amp_url = 6;
+  string amp_thread_id = 7;
+  string amp_sandbox_id = 8;
+  string orb_sandbox_id = 9;
+
+  oneof action {
+    SpawnRequest spawn = 10;
+    PauseRequest pause = 11;
+    DeleteRequest delete = 12;
+  }
+}
+
+enum DispatchStatus {
+  DISPATCH_STATUS_UNSPECIFIED = 0;
+  // Definitive success, including state-based no-ops.
+  DISPATCH_STATUS_SUCCEEDED = 1;
+  // Definitive failure of the command; `outcome.failure` says why.
+  DISPATCH_STATUS_FAILED = 2;
+  // The request itself was invalid (bad offering, malformed env, ...).
+  DISPATCH_STATUS_INVALID = 3;
+  // The backend could not be reached and nothing was submitted.
+  DISPATCH_STATUS_UNAVAILABLE = 4;
+  // Work may still be running or may have happened; reconciliation continues.
+  DISPATCH_STATUS_OUTCOME_UNKNOWN = 5;
+  // The invocation ran out of budget; see `outcome_known`.
+  DISPATCH_STATUS_DEADLINE_EXCEEDED = 6;
+}
+
+message DispatchQueued {
+  // Number of requests ahead of this one for the same orb.
+  uint32 position = 1;
+}
+
+message DispatchAccepted {
+  string operation_id = 1;
+  uint64 generation = 2;
+  // True when this invocation attached to an already-running identical operation.
+  bool attached = 3;
+}
+
+message DispatchProgress {
+  string operation_id = 1;
+  string phase = 2;
+  string message = 3;
+}
+
+message DispatchResult {
+  DispatchStatus status = 1;
+  string operation_id = 2;
+  optional CommandOutcome outcome = 3;
+  bool outcome_known = 4;
+  // Human-readable summary, safe to print (never contains secrets).
+  string message = 5;
+}
+
+message DispatchEvent {
+  oneof event {
+    DispatchQueued queued = 1;
+    DispatchAccepted accepted = 2;
+    DispatchProgress progress = 3;
+    LogChunk log = 4;
+    DispatchResult result = 5;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AgentControl (agent dials the coordinator, mTLS)
+// ---------------------------------------------------------------------------
+
+service AgentControl {
+  // One long-lived session per agent process. (Named Session, not Connect, to avoid
+  // clashing with the generated client constructor.)
+  rpc Session(stream AgentEvent) returns (stream CoordinatorEvent);
+}
+
+message RuntimeInfo {
+  RuntimeKind kind = 1;
+  string version = 2;
+  bool memory_preserving_sleep = 3;
+  bool nested_kvm = 4;
+  bool nested_state_qualified = 5;
+  bool project_snapshots = 6;
+}
+
+message Hello {
+  string agent_id = 1;
+  string boot_id = 2;               // changes every agent process start
+  repeated uint32 protocol_versions = 3;
+  repeated RuntimeInfo runtimes = 4;
+  Resources capacity = 5;           // configured ceiling for orbs on this host
+  uint64 last_controller_epoch = 6; // highest epoch this agent has accepted
+}
+
+message Heartbeat {
+  Resources capacity = 1;
+  Resources reserved = 2;           // agent-local reservations (running/starting orbs)
+  uint64 disk_free_bytes = 3;
+  uint32 memory_pressure_permille = 4;
+}
+
+message CommandAccepted {
+  CommandKey key = 1;
+}
+
+// The agent refused a delivery without executing anything (authoritative NotAccepted).
+message CommandRejected {
+  CommandKey key = 1;
+  CommandFailure failure = 2;
+}
+
+message CommandProgress {
+  CommandKey key = 1;
+  string phase = 2;
+  string message = 3;
+}
+
+message CommandCompleted {
+  CommandKey key = 1;
+  CommandOutcome outcome = 2;
+}
+
+enum CancelStatus {
+  CANCEL_STATUS_UNSPECIFIED = 0;
+  // No such command had been accepted; a cancel tombstone now prevents it ever running.
+  CANCEL_STATUS_RECORDED_BEFORE_ACCEPT = 1;
+  // The command is running; cancellation was requested. Completion follows separately.
+  CANCEL_STATUS_CANCELLING = 2;
+  // The command already reached a terminal result (replayed via CommandCompleted).
+  CANCEL_STATUS_ALREADY_TERMINAL = 3;
+}
+
+message CancelResult {
+  CommandKey key = 1;
+  CancelStatus status = 2;
+}
+
+enum OperationStatus {
+  OPERATION_STATUS_UNSPECIFIED = 0;
+  // Authoritative: the agent has no acceptance receipt (and none can appear later
+  // without a new delivery).
+  OPERATION_STATUS_NOT_ACCEPTED = 1;
+  OPERATION_STATUS_RUNNING = 2;
+  OPERATION_STATUS_COMPLETED = 3;
+  OPERATION_STATUS_UNKNOWN = 4;
+  // A cancel tombstone exists and the command never ran.
+  OPERATION_STATUS_CANCELLED_BEFORE_ACCEPT = 5;
+}
+
+message OperationReport {
+  CommandKey key = 1;
+  OperationStatus status = 2;
+  optional CommandOutcome outcome = 3;
+}
+
+message OrbObservation {
+  string orb_id = 1;
+  uint64 generation = 2;  // highest generation the agent has accepted for this orb
+  OrbState state = 3;
+}
+
+message ReconcileResponse {
+  string correlation_id = 1;
+  repeated OperationReport operations = 2;
+  repeated OrbObservation orbs = 3;
+  string next_page_token = 4;
+}
+
+message AgentEvent {
+  oneof event {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    CommandAccepted accepted = 3;
+    CommandRejected rejected = 4;
+    CommandProgress progress = 5;
+    LogChunk log = 6;
+    CommandCompleted completed = 7;
+    CancelResult cancel_result = 8;
+    ReconcileResponse reconcile = 9;
+  }
+}
+
+message Welcome {
+  string session_id = 1;
+  uint64 controller_epoch = 2;
+  uint32 protocol_version = 3;
+  uint64 heartbeat_interval_ms = 4;
+}
+
+message CommandDelivery {
+  Command command = 1;
+  uint64 controller_epoch = 2;
+  OrbDefinition orb = 3;
+  // Remaining budgets at send time. The agent pins its deadlines on first acceptance;
+  // redelivery may shorten them, never extend them.
+  uint64 work_remaining_ms = 4;
+  uint64 cleanup_remaining_ms = 5;
+  CommandSecrets secrets = 6;
+}
+
+message CancelCommand {
+  CommandKey key = 1;
+  string reason = 2;
+}
+
+message ReconcileRequest {
+  string correlation_id = 1;
+  repeated string operation_ids = 2;
+  repeated string orb_ids = 3;
+  // When true, report every orb the agent knows (paged).
+  bool all_orbs = 4;
+  string page_token = 5;
+}
+
+message AcknowledgeCompletion {
+  CommandKey key = 1;
+}
+
+message CoordinatorEvent {
+  oneof event {
+    Welcome welcome = 1;
+    CommandDelivery command = 2;
+    CancelCommand cancel = 3;
+    ReconcileRequest reconcile = 4;
+    AcknowledgeCompletion ack = 5;
+  }
+}
