@@ -13,6 +13,10 @@ EnvironmentFile=/etc/orbd/agent.env
 StateDirectory=orbd
 Restart=on-failure
 RestartSec=2
+# SIGTERM only orbd, which checkpoints its QEMU orbs before exiting; the default
+# (control-group) would kill the VMs at the same moment.
+KillMode=mixed
+TimeoutStopSec=300
 
 [Install]
 WantedBy=multi-user.target

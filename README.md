@@ -106,7 +106,8 @@ agent's orbs stay on it, unavailable.
 
 Agents use QEMU when `/dev/kvm` works, otherwise Docker (mount `/var/run/docker.sock`). On
 `docker stop` an agent saves its running QEMU orbs and restores them when it starts again,
-so give it time (`--stop-timeout 300`). Orb disk sizes must be at least Amp's image
+so give it time (`--stop-timeout 300`; under systemd, `KillMode=mixed` and
+`TimeoutStopSec=300`). Orb disk sizes must be at least Amp's image
 (~5 GiB).
 
 ## License
