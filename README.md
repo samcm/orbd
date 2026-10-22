@@ -51,13 +51,13 @@ the same static `orbd` binary; the coordinator also runs on aarch64.
 
 Measured on a Ryzen 9 7940HS with a 2 vCPU / 4 GiB orb on Amp's orb image.
 
-|                        | QEMU                    | Firecracker      | Docker     |
-| ---------------------- | ----------------------- | ---------------- | ---------- |
-| Wake                   | ~0.3 s                  | ~0.05 s          | ~0.5 s     |
-| Processes across sleep | kept                    | kept             | restarted  |
-| Host RAM while asleep  | none                    | none             | none       |
-| `/dev/kvm` in the orb  | yes                     | no               | no         |
-| Status                 | in progress             | planned          | works      |
+|                         | QEMU           | Firecracker | Docker      |
+| ----------------------- | -------------- | ----------- | ----------- |
+| Wake                    | ~0.3 s         | ~0.05 s     | ~0.5 s      |
+| Processes kept on sleep | ✅             | ✅          | ❌          |
+| No host RAM while asleep | ✅            | ✅          | ✅          |
+| `/dev/kvm` in the orb   | ✅             | ❌          | ❌          |
+| Status                  | 🚧 in progress | 🗓️ planned  | ✅ works    |
 
 ## Build
 
