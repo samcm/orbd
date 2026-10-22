@@ -55,7 +55,10 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tar = { version = "0.4", default-features = false }
 nix = { version = "0.31", features = ["fs", "process", "signal", "user", "socket"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+base64 = "0.22"
+time = { version = "0.3", default-features = false, features = ["std"] }
 x509-parser = "0.18"
 
 [profile.release]

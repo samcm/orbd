@@ -1,7 +1,9 @@
-//! Agent configuration (`orbd agent --config agent.yaml`).
+//! Agent configuration. Agents need no file: identity comes from the join token,
+//! runtime and capacity are detected, and [`AgentSection`] is filled from flags/env.
+//! The optional YAML file (`orbd agent --config agent.yaml`) holds advanced runtime and
+//! image settings.
 
-use super::{ConfigError, ResourcesConfig, TlsFiles, load_yaml};
-use crate::model::AgentId;
+use super::{ConfigError, load_yaml};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -9,12 +11,43 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
+    /// From flags/env, never from the file.
+    #[serde(skip)]
     pub agent: AgentSection,
     #[serde(default)]
     pub runtime: RuntimesConfig,
-    /// Image preparation for VM runtimes (OCI image → ext4 root disk).
+    /// Image preparation for VM runtimes (OCI image → ext4 root disk). Defaults to the
+    /// tools baked into orbd's container image.
+    #[serde(default = "default_images")]
     pub images: Option<ImagesConfig>,
 }
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            agent: AgentSection::default(),
+            runtime: RuntimesConfig::default(),
+            images: default_images(),
+        }
+    }
+}
+
+fn default_images() -> Option<ImagesConfig> {
+    Some(ImagesConfig {
+        guest_helper: default_guest_helper(),
+        umoci: default_umoci(),
+        mkfs_ext4: default_mkfs_ext4(),
+        prewarm: Vec::new(),
+        refresh_interval_secs: default_refresh_secs(),
+    })
+}
+
+/// Amp's orb image; detected runtimes pull it at startup.
+pub const AMP_ORB_IMAGE: &str = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest";
+
+/// Where orbd's container image installs the guest kernel and `orbd-guest`.
+pub const DEFAULT_GUEST_KERNEL: &str = "/usr/share/orbd/bzImage";
+pub const DEFAULT_GUEST_HELPER: &str = "/usr/share/orbd/orbd-guest";
 
 /// `[images]`: turns Amp's OCI image into a bootable root disk with orbd's guest
 /// integration. Prepared images live under `<state_dir>/images/`.
@@ -22,6 +55,7 @@ pub struct AgentConfig {
 #[serde(deny_unknown_fields)]
 pub struct ImagesConfig {
     /// Static `orbd-guest` binary (x86_64 musl) installed into every prepared image.
+    #[serde(default = "default_guest_helper")]
     pub guest_helper: PathBuf,
     /// `umoci` binary; must be the pinned version (see `orbd doctor`).
     #[serde(default = "default_umoci")]
@@ -38,6 +72,10 @@ pub struct ImagesConfig {
     pub refresh_interval_secs: u64,
 }
 
+fn default_guest_helper() -> PathBuf {
+    DEFAULT_GUEST_HELPER.into()
+}
+
 fn default_umoci() -> PathBuf {
     "umoci".into()
 }
@@ -50,25 +88,43 @@ fn default_refresh_secs() -> u64 {
     3600
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 pub struct AgentSection {
-    /// Must match the identity in this agent's client certificate.
-    pub id: AgentId,
-    /// e.g. `https://coordinator.example:7443`.
-    pub coordinator_url: String,
-    /// TLS server name to verify; defaults to the URL host.
-    pub coordinator_server_name: Option<String>,
-    pub tls: TlsFiles,
-    /// Holds `agent.sqlite`, images, orb disks, checkpoints, snapshots.
+    /// Holds `agent.sqlite`, the agent's identity, images, orb disks, checkpoints.
     pub state_dir: PathBuf,
-    /// Sockets, locks, process metadata.
+    /// Sockets, locks, process metadata (`<state_dir>/run`).
     pub run_dir: PathBuf,
-    /// 64 hex chars; seals accepted guest env for crash recovery.
+    /// Seals accepted guest env for crash recovery; generated on first start.
     pub secret_key_file: PathBuf,
-    /// Ceiling for orbs on this host (configured guest RAM + overhead, disk).
-    pub capacity: ResourcesConfig,
+    /// Overrides for the detected capacity ceiling.
+    pub capacity: CapacityOverrides,
+    /// DNS servers written into orbs. Never the host's resolvers: a local stub such as
+    /// Tailscale's 100.100.100.100 is unreachable from orbs.
+    pub dns_servers: Vec<String>,
     pub metrics_listen: Option<SocketAddr>,
+}
+
+pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
+
+impl AgentSection {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self {
+            run_dir: state_dir.join("run"),
+            secret_key_file: state_dir.join("secret.key"),
+            state_dir,
+            capacity: CapacityOverrides::default(),
+            dns_servers: DEFAULT_DNS.map(String::from).to_vec(),
+            metrics_listen: None,
+        }
+    }
+}
+
+/// Per-field overrides of the detected capacity.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapacityOverrides {
+    pub vcpus: Option<u32>,
+    pub memory_mib: Option<u64>,
+    pub disk_gib: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -87,13 +143,13 @@ pub struct FakeRuntimeConfig {
     pub memory_preserving_sleep: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DockerRuntimeConfig {
     /// Docker API endpoint; defaults to the local socket.
     pub docker_host: Option<String>,
-    /// DNS servers written into orbs. Explicit, because copying the host's
-    /// resolv.conf breaks orbs whose host resolver is a local stub (e.g. Tailscale).
+    /// DNS servers written into orbs (from `agent.dns_servers`).
+    #[serde(skip)]
     pub dns_servers: Vec<String>,
     /// Docker network for orb containers; defaults to Docker's bridge.
     pub network: Option<String>,
@@ -104,20 +160,9 @@ pub struct DockerRuntimeConfig {
 }
 
 impl AgentConfig {
+    /// Reads the optional advanced-settings file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let cfg: Self = load_yaml(path)?;
-        cfg.agent.capacity.to_resources()?;
-        if cfg.runtime.fake.is_none() && cfg.runtime.docker.is_none() {
-            return Err(ConfigError::Invalid("no runtime configured".into()));
-        }
-        if let Some(d) = &cfg.runtime.docker
-            && d.dns_servers.is_empty()
-        {
-            return Err(ConfigError::Invalid(
-                "runtime.docker.dns_servers must not be empty".into(),
-            ));
-        }
-        Ok(cfg)
+        load_yaml(path)
     }
 
     pub fn db_path(&self) -> PathBuf {

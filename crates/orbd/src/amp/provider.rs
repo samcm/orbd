@@ -99,10 +99,10 @@ pub fn spawn_all(
     if offerings.is_empty() {
         return Ok(tokio::spawn(async move { shutdown.cancelled().await }));
     }
-    let bin_dir = config.coordinator.state_dir.join("bin");
+    let bin_dir = config.state_dir.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     let wrapper = bin_dir.join("orbd-dispatch");
-    let exe = match &config.coordinator.dispatch_exe {
+    let exe = match &config.dispatch_exe {
         Some(p) => p.clone(),
         None => std::env::current_exe().context("locate orbd executable")?,
     };
@@ -114,7 +114,7 @@ pub fn spawn_all(
         &format!("#!/bin/sh\nexec {} dispatch \"$@\"\n", shell_quote(exe)),
         0o755,
     )?;
-    let settings = config.coordinator.state_dir.join("amp-settings.json");
+    let settings = config.state_dir.join("amp-settings.json");
     write_atomic(
         &settings,
         "{\n  \"amp.updates.mode\": \"disabled\"\n}\n",
@@ -123,22 +123,17 @@ pub fn spawn_all(
 
     let mut specs = Vec::new();
     for o in offerings {
-        let endpoint = config
-            .amp_endpoints
-            .iter()
-            .find(|e| e.id == o.amp_endpoint)
-            .ok_or_else(|| anyhow!("offering {}: unknown amp_endpoint", o.id))?;
         specs.push(ChildSpec {
             offering: o.id.as_str().to_owned(),
-            amp_cli: config.coordinator.amp_cli.clone(),
-            amp_url: endpoint.url.clone(),
+            amp_cli: config.amp_cli.clone(),
+            amp_url: config.amp_url.clone(),
             token_file: o.provider_token_file.clone().expect("filtered"),
             wrapper: wrapper.clone(),
             settings: settings.clone(),
             socket: dispatch_socket.to_owned(),
         });
     }
-    let interval = config.coordinator.amp_cli_update_interval_secs;
+    let interval = config.amp_cli_update_interval_secs;
     let (updated_tx, updated_rx) = tokio::sync::watch::channel(0u64);
     let probe = specs[0].clone_for_cli();
     Ok(tokio::spawn(async move {

@@ -1,14 +1,16 @@
 //! `orbd doctor`: reports whether this host has what the VM runtime and image
 //! preparation need. Prints one line per check; fails if a required check fails.
 
+use crate::config::agent::{DEFAULT_GUEST_HELPER, DEFAULT_GUEST_KERNEL};
 use crate::image::UMOCI_VERSION;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Paths to check. Defaults come from `PATH`; `--config` fills them from an agent
-/// config's `[images]` and `[runtime.qemu]` sections.
+/// Paths to check. Tools default to `PATH`, the guest kernel and helper to where orbd's
+/// container image installs them; `--config` takes them from an agent config's
+/// `images` and `runtime.qemu` sections.
 #[derive(Debug, Default)]
 pub struct DoctorOptions {
     pub config: Option<PathBuf>,
@@ -70,7 +72,8 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
     Ok((hex::encode(h.finalize()), len))
 }
 
-fn kvm() -> Result<String, String> {
+/// Opens `/dev/kvm` and checks the KVM API version (12).
+pub(crate) fn kvm_usable() -> Result<(), String> {
     // KVM_GET_API_VERSION = _IO(0xAE, 0x00)
     const KVM_GET_API_VERSION: nix::libc::c_ulong = 0xAE00;
     let f = std::fs::OpenOptions::new()
@@ -86,14 +89,19 @@ fn kvm() -> Result<String, String> {
             0,
         )
     };
+    if api != 12 {
+        return Err(format!("KVM API version {api}, expected 12"));
+    }
+    Ok(())
+}
+
+fn kvm() -> Result<String, String> {
+    kvm_usable()?;
     let nested = ["kvm_intel", "kvm_amd"].iter().find_map(|m| {
         let v = std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested")).ok()?;
         Some(format!("{m} nested={}", v.trim()))
     });
     let nested = nested.unwrap_or_else(|| "nested support unknown".into());
-    if api != 12 {
-        return Err(format!("KVM API version {api}, expected 12"));
-    }
     if nested.ends_with("=N") || nested.ends_with("=0") {
         return Err(format!("API 12, {nested}: orbs get no /dev/kvm"));
     }
@@ -142,7 +150,7 @@ fn guest_helper(path: &Path) -> Result<String, String> {
 pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     let mut umoci = PathBuf::from("umoci");
     let mut mkfs = PathBuf::from("mkfs.ext4");
-    let mut helper: Option<PathBuf> = None;
+    let mut helper = PathBuf::from(DEFAULT_GUEST_HELPER);
     let mut kernel_path = opts.kernel.clone();
     let mut qemu = PathBuf::from("qemu-system-x86_64");
     let mut qemu_img = PathBuf::from("qemu-img");
@@ -158,11 +166,12 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         };
         umoci = get(&["images"], "umoci").unwrap_or(umoci);
         mkfs = get(&["images"], "mkfs_ext4").unwrap_or(mkfs);
-        helper = get(&["images"], "guest_helper");
+        helper = get(&["images"], "guest_helper").unwrap_or(helper);
         kernel_path = kernel_path.or_else(|| get(&["runtime", "qemu"], "kernel"));
         qemu = get(&["runtime", "qemu"], "qemu").unwrap_or(qemu);
         qemu_img = get(&["runtime", "qemu"], "qemu_img").unwrap_or(qemu_img);
     }
+    let kernel_path = kernel_path.unwrap_or_else(|| DEFAULT_GUEST_KERNEL.into());
     if !nix::unistd::geteuid().is_root() && Path::new(&mkfs).components().count() == 1 {
         // Non-root PATHs often lack /sbin, where e2fsprogs lives.
         if let Some(p) = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
@@ -181,14 +190,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     );
     r.line(first_line(&qemu_img, &["--version"]), "qemu-img", true);
     r.line(kvm(), "/dev/kvm", true);
-    r.line(
-        match &kernel_path {
-            Some(p) => kernel(p),
-            None => Err("not configured (runtime.qemu.kernel or --kernel)".into()),
-        },
-        "guest kernel",
-        true,
-    );
+    r.line(kernel(&kernel_path), "guest kernel", true);
     let umoci_check = first_line(&umoci, &["--version"]).and_then(|l| {
         if l == format!("umoci version {UMOCI_VERSION}") {
             Ok(l)
@@ -198,14 +200,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     });
     r.line(umoci_check, "umoci", true);
     r.line(mke2fs(&mkfs), "mkfs.ext4", true);
-    r.line(
-        match &helper {
-            Some(p) => guest_helper(p),
-            None => Err("not configured (images.guest_helper)".into()),
-        },
-        "orbd-guest",
-        true,
-    );
+    r.line(guest_helper(&helper), "orbd-guest", true);
     let privileged = if nix::unistd::geteuid().is_root() {
         Ok("running as root".to_owned())
     } else {

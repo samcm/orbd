@@ -2,20 +2,21 @@
 //! result application, recovery, and the local `Dispatch` service. Backend-neutral:
 //! everything backend-specific lives behind [`crate::backend::ComputeBackend`].
 //!
-//! * `db` — SQLite on one dedicated thread, schema migrations.
+//! * `db` — SQLite on one dedicated thread. One schema version and no upgrade paths: a
+//!   database from another orbd version is refused (delete the state directory).
 //! * `store` — typed queries and the multi-statement transactions.
 //! * `core` — the single actor owning admission, queueing, delivery and results.
 //! * `service` — the tonic `Dispatch` service (validation only).
 
 mod core;
-mod db;
+pub(crate) mod db;
 mod logs;
 mod service;
 mod store;
 mod types;
 
 use crate::backend::{BackendHandle, ComputeBackend};
-use crate::config::coordinator::{BackendConfig, CoordinatorConfig};
+use crate::config::coordinator::CoordinatorConfig;
 use crate::model::{BackendId, Offering, OfferingId};
 use crate::secrets::SecretKey;
 use anyhow::{Context, Result, bail};
@@ -43,20 +44,66 @@ fn lock_state_dir(dir: &std::path::Path) -> Result<nix::fcntl::Flock<std::fs::Fi
     })
 }
 
+/// Serves a gRPC service on a fresh unix socket (mode 0600) until `shutdown`.
+fn serve_unix<S>(
+    socket: &std::path::Path,
+    service: S,
+    shutdown: CancellationToken,
+) -> Result<tokio::task::JoinHandle<()>>
+where
+    S: tower::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+            Response = tonic::codegen::http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + tonic::server::NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing stale {}", socket.display())),
+    }
+    let listener = tokio::net::UnixListener::bind(socket)
+        .with_context(|| format!("binding {}", socket.display()))?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    let path = socket.to_owned();
+    Ok(tokio::spawn(async move {
+        let r = tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                shutdown.cancelled(),
+            )
+            .await;
+        if let Err(e) = r {
+            tracing::error!(socket = %path.display(), error = %e, "local server failed");
+        }
+        let _ = std::fs::remove_file(&path);
+    }))
+}
+
 /// Runs the coordinator until `shutdown` is cancelled.
 pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Result<()> {
-    let state_dir = config.coordinator.state_dir.clone();
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
-    let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
+    let state_dir = config.state_dir.clone();
+    crate::pki::private_dir(&state_dir)?;
     let _lock = lock_state_dir(&state_dir)?;
 
-    let key = Arc::new(SecretKey::load(&config.coordinator.secret_key_file)?);
+    // Keys and the CA are created on first start only; afterwards they must exist.
+    let first_init = !config.db_path().exists();
+    let key = Arc::new(SecretKey::load_or_create(
+        &state_dir.join("secret.key"),
+        first_init,
+    )?);
+    let ca = crate::pki::Ca::load_or_create(&state_dir.join("pki"), first_init)?;
     let db = db::Db::open(&config.db_path())?;
     let epoch = db.call(store::bump_epoch).await?;
     tracing::info!(epoch, "coordinator controller epoch");
 
-    if let Some(listen) = config.coordinator.metrics_listen {
+    if let Some(listen) = config.metrics_listen {
         crate::telemetry::init_metrics(listen).context("starting metrics listener")?;
     }
 
@@ -65,31 +112,31 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         offerings.insert(o.id.clone(), o.to_offering()?);
     }
 
-    // Start backends.
+    // Start the agent fleet.
     let (core_tx, core_rx) = mpsc::channel::<core::Msg>(4096);
     let mut backends: HashMap<BackendId, Arc<dyn ComputeBackend>> = HashMap::new();
-    for b in &config.backends {
-        let handle: BackendHandle = match b {
-            BackendConfig::AgentFleet(cfg) => {
-                crate::backend::fleet::FleetBackend::start(cfg, epoch, shutdown.clone())
-                    .await
-                    .with_context(|| format!("starting backend {}", cfg.id))?
+    let (handle, admin) = crate::backend::fleet::FleetBackend::start(
+        &config,
+        ca,
+        db.clone(),
+        epoch,
+        shutdown.clone(),
+    )
+    .await
+    .context("starting agent fleet")?;
+    let BackendHandle {
+        backend,
+        mut events,
+    } = handle;
+    backends.insert(backend.id().clone(), backend);
+    let tx = core_tx.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = events.next().await {
+            if tx.send(core::Msg::Backend(ev)).await.is_err() {
+                break;
             }
-        };
-        let BackendHandle {
-            backend,
-            mut events,
-        } = handle;
-        backends.insert(b.id().clone(), backend);
-        let tx = core_tx.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = events.next().await {
-                if tx.send(core::Msg::Backend(ev)).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+        }
+    });
 
     // Every offering must be satisfiable by its backend's capabilities.
     for (id, offering) in &offerings {
@@ -116,45 +163,31 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
     let mut core = core::Core::new(db, key.clone(), epoch, offerings, backends, core_tx.clone());
     core.recover().await.context("recovering commands")?;
 
-    // Serve dispatch.
-    let socket = config.coordinator.dispatch_socket.clone();
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::remove_file(&socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("removing stale {}", socket.display())),
-    }
-    let listener = tokio::net::UnixListener::bind(&socket)
-        .with_context(|| format!("binding {}", socket.display()))?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-
     let core_task = tokio::spawn(core.run(core_rx, shutdown.clone()));
-    let service = service::DispatchService {
-        core: core_tx,
-        offerings: offerings_arc,
-        key,
-    };
-    let stop = shutdown.clone();
-    let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(orbd_proto::control::v1::dispatch_server::DispatchServer::new(service))
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::UnixListenerStream::new(listener),
-                stop.cancelled(),
-            )
-            .await
-    });
+    let socket = config.dispatch_socket();
+    let dispatch = serve_unix(
+        &socket,
+        orbd_proto::control::v1::dispatch_server::DispatchServer::new(service::DispatchService {
+            core: core_tx,
+            offerings: offerings_arc,
+            key,
+        }),
+        shutdown.clone(),
+    )?;
+    let admin = serve_unix(
+        &config.admin_socket(),
+        admin.into_server(),
+        shutdown.clone(),
+    )?;
     tracing::info!(socket = %socket.display(), "dispatch socket ready");
 
     // Providers poll Amp only after recovery and with the socket accepting.
     let providers = crate::amp::provider::spawn_all(&config, &socket, shutdown.clone())?;
 
     shutdown.cancelled().await;
-    let _ = server.await;
+    let _ = dispatch.await;
+    let _ = admin.await;
     let _ = core_task.await;
     let _ = providers.await;
-    let _ = std::fs::remove_file(&socket);
     Ok(())
 }

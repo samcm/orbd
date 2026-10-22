@@ -5,12 +5,12 @@ Wants=network-online.target
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/local/bin/orbd agent --config /etc/orbd/agent.yaml
+ExecStart=/usr/local/bin/orbd agent
 Environment=RUST_LOG=info
-# Matches state_dir/run_dir = /var/lib/orbd, /run/orbd in agent.yaml.
+# ORBD_JOIN=<token>; only read until the agent has enrolled.
+EnvironmentFile=/etc/orbd/agent.env
+# /var/lib/orbd, the agent's default state directory.
 StateDirectory=orbd
-RuntimeDirectory=orbd
-RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2
 
