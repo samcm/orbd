@@ -39,18 +39,24 @@
 //! save that is still writing as QEMU does on ENOSPC (cancelled, partial file left);
 //! `qemu::save::throttle=return(<MiB/s>)` caps the save's bandwidth.
 
-mod fsutil;
 mod guest;
-pub mod images;
-mod net;
-mod process;
 mod qmp;
 
-pub use guest::{ByteStream, GuestConnector, VirtioSerialConnector};
-
+use super::vm::checkpoints::{Checkpoints, MANIFEST};
+use super::vm::fsutil::{
+    free_bytes, fsync_dir, read_json, remove_via_trash, rename_durable, write_json_atomic,
+};
+use super::vm::guest as channel;
+use super::vm::images::ImageProvider;
+use super::vm::net::{self, NetAttachment};
+use super::vm::process::{self, CpuIdentity, KernelIdentity, LaunchKind, Process, VmmIdentity};
+use super::vm::{
+    OrbLocks, SAVES, bounded, create_private_dir, file_digest, io_err, log, log_tail, machine_id,
+    on_path, publish_project, run_tool,
+};
 use super::{
-    GuestControl, LogStream, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
-    RuntimeObservation, StartSource,
+    GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError, RuntimeObservation,
+    StartSource,
 };
 use crate::config::agent::QemuRuntimeConfig;
 use crate::image::ImageError;
@@ -59,21 +65,10 @@ use crate::model::{
     RuntimeKind, SleepCheckpointRef, unix_ms_now,
 };
 use async_trait::async_trait;
-use fsutil::{
-    free_bytes, fsync_dir, read_json, remove_via_trash, rename_durable, sha256_file, write_atomic,
-    write_json_atomic,
-};
-use images::ImageProvider;
-use net::NetAttachment;
-use process::{
-    CpuIdentity, KernelIdentity, LaunchConfig, LaunchKind, LaunchRecord, Process, QemuIdentity,
-};
 use qmp::{FileMigration, Qmp};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Oldest QEMU with file migration and `mapped-ram`.
@@ -92,11 +87,28 @@ const PREPARE_SLEEP_TIMEOUT: Duration = Duration::from_secs(15);
 const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw";
 /// How long a cold stop waits for a clean guest shutdown before quitting QEMU.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
-/// Memory saves at once on this host (disk bandwidth is the bottleneck).
-const CONCURRENT_SAVES: usize = 1;
 /// Checkpoint headroom beyond guest RAM (device state, ROMs, stream framing).
 const CHECKPOINT_MARGIN: u64 = 256 * MIB;
 const POLL: Duration = Duration::from_millis(100);
+
+/// Everything that defines the guest-visible machine of one launch. A checkpoint's
+/// manifest stores the config it was saved from; restore relaunches with it verbatim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LaunchConfig {
+    qemu: VmmIdentity,
+    cpu: CpuIdentity,
+    kernel: KernelIdentity,
+    /// Machine, CPU, memory, kernel and device arguments with fixed ids. Host-side
+    /// plumbing (chardev backends, block files, sockets, pidfile, name) is not included.
+    machine_args: Vec<String>,
+}
+
+type LaunchRecord = process::LaunchRecord<LaunchConfig>;
+
+/// The `-name` value carrying the launch nonce; matched in `/proc/<pid>/cmdline` and QMP.
+fn launch_name(orb: OrbId, record: &LaunchRecord) -> String {
+    format!("orbd-{orb}.{}", record.nonce)
+}
 
 /// Immutable per-orb recipe, written once with the disk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,15 +234,14 @@ pub struct QemuRuntime {
     state_dir: PathBuf,
     run_dir: PathBuf,
     images: Arc<dyn ImageProvider>,
-    qemu: QemuIdentity,
+    qemu: VmmIdentity,
     /// Versioned machine type (`q35` resolved at startup), recorded in each launch.
     machine: String,
     migration: FileMigration,
     cpu: CpuIdentity,
     direct_io: bool,
     nested_kvm: bool,
-    locks: Mutex<HashMap<OrbId, Arc<tokio::sync::Mutex<()>>>>,
-    saves: tokio::sync::Semaphore,
+    locks: OrbLocks,
 }
 
 impl QemuRuntime {
@@ -278,25 +289,12 @@ impl QemuRuntime {
             .to_owned();
         check_qemu_version(&version).map_err(|e| other("qemu", &e))?;
         let machine = q35_machine(&qemu_path).map_err(|e| other("qemu", &e))?;
-        let qemu = QemuIdentity {
-            sha256: sha256_file(&qemu_path).map_err(|e| other("qemu binary", &e))?,
+        let qemu = VmmIdentity {
+            sha256: file_digest(&qemu_path, "qemu binary")?,
             path: qemu_path,
             version,
         };
-        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-        let field = |name: &str| {
-            cpuinfo
-                .lines()
-                .find(|l| l.starts_with(name))
-                .and_then(|l| l.split_once(':'))
-                .map(|(_, v)| v.trim().to_owned())
-                .unwrap_or_default()
-        };
-        use sha2::{Digest, Sha256};
-        let cpu = CpuIdentity {
-            model: field("model name"),
-            flags_sha256: hex::encode(Sha256::digest(field("flags").as_bytes())),
-        };
+        let cpu = CpuIdentity::host();
         // Nested virtualization is on unless the loaded KVM module says it is off.
         let nested_kvm = Path::new("/dev/kvm").exists()
             && !["kvm_amd", "kvm_intel"].iter().any(|m| {
@@ -310,7 +308,6 @@ impl QemuRuntime {
         };
         tracing::info!(qemu = %qemu.version, %machine, cpu = %cpu.model, direct_io, ?migration, nested_kvm, "qemu runtime ready");
         Ok(Self {
-            saves: tokio::sync::Semaphore::new(CONCURRENT_SAVES),
             config,
             state_dir: state_dir.to_owned(),
             run_dir: run_dir.to_owned(),
@@ -321,7 +318,7 @@ impl QemuRuntime {
             cpu,
             direct_io,
             nested_kvm,
-            locks: Mutex::default(),
+            locks: OrbLocks::default(),
         })
     }
 
@@ -364,14 +361,7 @@ impl QemuRuntime {
     }
 
     async fn lock(&self, orb: OrbId) -> tokio::sync::OwnedMutexGuard<()> {
-        let m = self
-            .locks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(orb)
-            .or_default()
-            .clone();
-        m.lock_owned().await
+        self.locks.lock(orb).await
     }
 
     fn read_recipe(&self, orb: OrbId) -> Result<VmRecipe, RuntimeError> {
@@ -380,76 +370,8 @@ impl QemuRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("orb {orb} has no disk")))
     }
 
-    // --- checkpoints on disk ----------------------------------------------------
-
-    fn checkpoint_dir(&self, orb: OrbId, generation: u64) -> PathBuf {
-        self.orb_paths(orb).checkpoints.join(generation.to_string())
-    }
-
-    fn tmp_dir(&self, orb: OrbId, generation: u64) -> PathBuf {
-        self.orb_paths(orb)
-            .checkpoints
-            .join(format!("{generation}.tmp"))
-    }
-
-    /// Published generations (with their consumed flag) and in-progress generations.
-    fn list_checkpoints(&self, orb: OrbId) -> (Vec<(u64, bool)>, Vec<u64>) {
-        let (mut published, mut tmp) = (Vec::new(), Vec::new());
-        if let Ok(rd) = std::fs::read_dir(self.orb_paths(orb).checkpoints) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if let Some(g) = name.strip_suffix(".tmp").and_then(|g| g.parse().ok()) {
-                    tmp.push(g);
-                } else if let Ok(g) = name.parse::<u64>() {
-                    published.push((g, e.path().join("consumed").exists()));
-                }
-            }
-        }
-        published.sort_unstable();
-        tmp.sort_unstable();
-        (published, tmp)
-    }
-
-    /// Consumed: marked so, or already discarded (only consumed checkpoints are).
-    fn is_consumed(&self, orb: OrbId, generation: u64) -> bool {
-        let dir = self.checkpoint_dir(orb, generation);
-        !dir.is_dir() || dir.join("consumed").exists()
-    }
-
-    /// Durably marks a published checkpoint consumed: it is never restored again.
-    fn consume(&self, orb: OrbId, generation: u64) -> std::io::Result<()> {
-        let dir = self.checkpoint_dir(orb, generation);
-        if dir.is_dir() && !dir.join("consumed").exists() {
-            write_atomic(&dir.join("consumed"), b"")?;
-        }
-        Ok(())
-    }
-
-    fn consume_all(&self, orb: OrbId) -> std::io::Result<()> {
-        for (g, consumed) in self.list_checkpoints(orb).0 {
-            if !consumed {
-                tracing::info!(orb = %orb, generation = g, "checkpoint is stale; marking consumed");
-                self.consume(orb, g)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn discard_tmps(&self, orb: OrbId) -> std::io::Result<()> {
-        for g in self.list_checkpoints(orb).1 {
-            tracing::info!(orb = %orb, generation = g, "discarding unfinished checkpoint");
-            remove_via_trash(&self.tmp_dir(orb, g), &self.trash())?;
-        }
-        Ok(())
-    }
-
-    /// Renames a complete `.tmp` checkpoint into place (the publication boundary).
-    fn publish(&self, orb: OrbId, generation: u64) -> std::io::Result<()> {
-        let dest = self.checkpoint_dir(orb, generation);
-        if dest.exists() {
-            remove_via_trash(&dest, &self.trash())?;
-        }
-        rename_durable(&self.tmp_dir(orb, generation), &dest)
+    fn checkpoints(&self, orb: OrbId) -> Checkpoints {
+        Checkpoints::new(orb, self.orb_paths(orb).checkpoints, self.trash())
     }
 
     fn clear_run(&self, orb: OrbId) {
@@ -463,10 +385,10 @@ impl QemuRuntime {
     async fn reconcile(&self, orb: OrbId) -> Result<Observed, RuntimeError> {
         let op = self.orb_paths(orb);
         let rp = self.run_paths(orb);
-        let record = process::read_record(&rp.launch);
+        let record: Option<LaunchRecord> = process::read_record(&rp.launch);
         let proc = record
             .as_ref()
-            .and_then(|r| Process::adopt(r, &orb.to_string(), &rp.pidfile));
+            .and_then(|r| Process::adopt(r, &launch_name(orb, r), Some(&rp.pidfile)));
         if !op.dir.is_dir() {
             if let Some(p) = proc {
                 return Ok(Observed::Inconsistent(format!(
@@ -506,7 +428,7 @@ impl QemuRuntime {
                 ))));
             }
         };
-        let expected = record.name(&orb.to_string());
+        let expected = launch_name(orb, record);
         if qmp.name().await.map_err(qmp_err)?.as_deref() != Some(expected.as_str()) {
             return Ok(Some(Observed::Inconsistent(format!(
                 "QEMU process {} is not this orb's launch",
@@ -515,12 +437,12 @@ impl QemuRuntime {
         }
         let status = qmp.status().await.map_err(qmp_err)?;
         if let LaunchKind::Restore { generation } = record.kind
-            && !self.is_consumed(orb, generation)
+            && !self.checkpoints(orb).is_consumed(generation)
         {
             if status == "running" {
                 // Cannot happen (consumed before cont); be safe: RAM has moved on.
                 tracing::error!(orb = %orb, generation, "restored VM runs with an unconsumed checkpoint");
-                self.consume(orb, generation).map_err(io_err)?;
+                self.checkpoints(orb).consume(generation)?;
             } else {
                 // Loaded or loading, vCPUs never ran: drop it, the checkpoint stays valid.
                 tracing::warn!(orb = %orb, generation, %status, "discarding an unfinished restore");
@@ -543,16 +465,12 @@ impl QemuRuntime {
         }
         match status.as_str() {
             "running" => {
-                self.discard_tmps(orb).map_err(io_err)?;
-                self.consume_all(orb).map_err(io_err)?;
+                let cps = self.checkpoints(orb);
+                cps.discard_tmps()?;
+                cps.consume_all()?;
             }
             "paused" | "postmigrate" | "prelaunch" => {
-                let complete = self
-                    .list_checkpoints(orb)
-                    .1
-                    .into_iter()
-                    .rev()
-                    .find(|g| self.tmp_dir(orb, *g).join("manifest.json").exists());
+                let complete = self.checkpoints(orb).complete_tmp();
                 if let (Some(g), "postmigrate") = (complete, status.as_str()) {
                     // A save finished but its agent died before QEMU exited: the guest
                     // never resumed, so finish the save.
@@ -575,7 +493,7 @@ impl QemuRuntime {
                 // An interrupted save (or a restore whose cont was lost): discard any
                 // partial checkpoint, then resume the guest where it stopped.
                 tracing::warn!(orb = %orb, %status, "resuming a VM left stopped by an interrupted operation");
-                self.discard_tmps(orb).map_err(io_err)?;
+                self.checkpoints(orb).discard_tmps()?;
                 qmp.cont().await.map_err(qmp_err)?;
                 status = qmp.status().await.map_err(qmp_err)?;
             }
@@ -587,36 +505,12 @@ impl QemuRuntime {
     /// No process: publish complete saves, discard partial ones, report the latest
     /// restorable checkpoint.
     fn settle_stopped(&self, orb: OrbId) -> Result<Observed, RuntimeError> {
-        for g in self.list_checkpoints(orb).1 {
-            if self.tmp_dir(orb, g).join("manifest.json").exists() {
-                tracing::warn!(orb = %orb, generation = g, "publishing a complete checkpoint left by an interrupted save");
-                self.publish(orb, g).map_err(io_err)?;
-            } else {
-                remove_via_trash(&self.tmp_dir(orb, g), &self.trash()).map_err(io_err)?;
-            }
-        }
-        let live: Vec<u64> = self
-            .list_checkpoints(orb)
-            .0
-            .into_iter()
-            .filter(|(_, consumed)| !consumed)
-            .map(|(g, _)| g)
-            .collect();
-        let mut latest = live.last().copied();
-        for g in &live[..live.len().saturating_sub(1)] {
-            tracing::warn!(orb = %orb, generation = g, "older unconsumed checkpoint; marking consumed");
-            self.consume(orb, *g).map_err(io_err)?;
-        }
         // A checkpoint this host can no longer restore exactly (QEMU, CPU, kernel or
         // machine changed) is dropped: the orb cold-boots and its processes are lost.
-        if let Some(g) = latest
-            && let Err(e) = self.restorable(orb, g)
-        {
-            tracing::error!(orb = %orb, generation = g, error = %e, "checkpoint cannot be restored; the orb will cold-boot");
-            self.consume(orb, g).map_err(io_err)?;
-            latest = None;
-        }
-        Ok(Observed::Stopped { checkpoint: latest })
+        let checkpoint = self
+            .checkpoints(orb)
+            .settle(|g| self.restorable(orb, g).map(|_| ()))?;
+        Ok(Observed::Stopped { checkpoint })
     }
 
     async fn inspect_inner(&self, orb: OrbId) -> Result<RuntimeObservation, RuntimeError> {
@@ -645,8 +539,7 @@ impl QemuRuntime {
         }
         let kernel = KernelIdentity {
             path: self.config.kernel.clone(),
-            sha256: sha256_file(&self.config.kernel)
-                .map_err(|e| RuntimeError::Other(format!("kernel: {e}")))?,
+            sha256: file_digest(&self.config.kernel, "kernel")?,
         };
         let mut a: Vec<String> = [
             "-machine",
@@ -711,7 +604,7 @@ impl QemuRuntime {
         });
         let mut a = vec![
             "-name".into(),
-            format!("guest={},debug-threads=on", record.name(&orb.to_string())),
+            format!("guest={},debug-threads=on", launch_name(orb, record)),
             "-nodefaults".into(),
             "-no-user-config".into(),
             "-nographic".into(),
@@ -750,28 +643,23 @@ impl QemuRuntime {
         let rp = self.run_paths(orb);
         self.clear_run(orb);
         create_private_dir(&rp.dir).map_err(io_err)?;
-        let record = LaunchRecord {
-            nonce: uuid::Uuid::new_v4().simple().to_string(),
-            boot_id: process::host_boot_id(),
-            kind,
-            config,
-            pid: None,
-            start_time: None,
-        };
+        let record = LaunchRecord::new(kind, config);
         let mut args = self.host_args(orb, &record);
         args.extend(record.config.machine_args.iter().cloned());
         let op = self.orb_paths(orb);
         let (proc, record) = process::spawn(process::Spawn {
-            qemu: &record.config.qemu.path.clone(),
+            program: &record.config.qemu.path.clone(),
             args,
-            log_file: &op.qemu_log,
+            stdout: &op.qemu_log,
+            stderr: &op.qemu_log,
             record_path: &rp.launch,
             record,
             cgroup: self.cgroup_dir(orb),
+            netns: self.read_recipe(orb)?.net.netns_path(),
         })
         .map_err(|e| RuntimeError::Other(format!("launching QEMU: {e}")))?;
-        log_ctx(ctx, &format!("QEMU started (pid {})", proc.pid));
-        let expected = record.name(&orb.to_string());
+        log(ctx, &format!("QEMU started (pid {})", proc.pid));
+        let expected = launch_name(orb, &record);
         let ready_by = Instant::now() + Duration::from_secs(30);
         loop {
             if !proc.is_alive() {
@@ -832,7 +720,7 @@ impl QemuRuntime {
             proc.kill_and_wait(Duration::from_secs(5)).await;
             return Err(RuntimeError::Other(format!("QEMU is {status} after boot")));
         }
-        log_ctx(ctx, "VM booted");
+        log(ctx, "VM booted");
         Ok(())
     }
 
@@ -886,7 +774,7 @@ impl QemuRuntime {
             memory_bytes: res.memory_bytes,
             disk_bytes: res.disk_bytes,
             base,
-            net: NetAttachment::prepare(orb.id),
+            net: NetAttachment::user(orb.id),
             created_unix_ms: unix_ms_now(),
         };
         let staging = self.state_dir.join("staging").join(format!(
@@ -900,7 +788,7 @@ impl QemuRuntime {
             }
             write_json_atomic(&staging.join("vm.json"), &recipe).map_err(io_err)?;
             let disk = staging.join("disk.qcow2");
-            log_ctx(ctx, "creating disk overlay");
+            log(ctx, "creating disk overlay");
             run_tool(
                 ctx,
                 &self.config.qemu_img,
@@ -958,10 +846,7 @@ impl QemuRuntime {
         bounded(ctx, qmp.stop()).await?.map_err(qmp_err)?;
         crate::crash_point!("qemu::save::after_stop");
 
-        let tmp = self.tmp_dir(orb, generation);
-        remove_via_trash(&tmp, &self.trash()).map_err(io_err)?;
-        create_private_dir(&tmp).map_err(io_err)?;
-        fsync_dir(&self.orb_paths(orb).checkpoints).map_err(io_err)?;
+        let tmp = self.checkpoints(orb).fresh_tmp(generation)?;
         // Created private here; QEMU reopens it (O_TRUNC) and writes it in place.
         let memory = tmp.join("memory");
         let file = {
@@ -993,7 +878,7 @@ impl QemuRuntime {
                     inject_write_fault()?;
                     let done = info.ram.map_or(0, |r| r.transferred);
                     if done >= next_log {
-                        log_ctx(ctx, &format!("checkpoint: {} MiB written", done / MIB));
+                        log(ctx, &format!("checkpoint: {} MiB written", done / MIB));
                         next_log = (done / (512 * MIB) + 1) * 512 * MIB;
                     }
                     bounded(ctx, tokio::time::sleep(POLL)).await?;
@@ -1030,7 +915,7 @@ impl QemuRuntime {
             save_ms: started.elapsed().as_millis() as u64,
         };
         // The manifest marks the memory file complete.
-        write_json_atomic(&tmp.join("manifest.json"), &manifest).map_err(io_err)?;
+        write_json_atomic(&tmp.join(MANIFEST), &manifest).map_err(io_err)?;
         tracing::info!(
             orb = %orb,
             generation,
@@ -1049,7 +934,7 @@ impl QemuRuntime {
         let fut = async {
             let qmp = self.qmp(orb).await?;
             cancel_migration(&qmp).await?;
-            remove_via_trash(&self.tmp_dir(orb, generation), &self.trash()).map_err(io_err)?;
+            self.checkpoints(orb).discard_tmp(generation)?;
             if qmp.status().await.map_err(qmp_err)? != "running" {
                 qmp.cont().await.map_err(qmp_err)?;
             }
@@ -1083,11 +968,10 @@ impl QemuRuntime {
 
     /// The checkpoint's manifest, if this host can restore it exactly.
     fn restorable(&self, orb: OrbId, generation: u64) -> Result<CheckpointManifest, RuntimeError> {
-        let dir = self.checkpoint_dir(orb, generation);
-        let manifest: CheckpointManifest =
-            read_json(&dir.join("manifest.json"))
-                .map_err(io_err)?
-                .ok_or_else(|| RuntimeError::CheckpointIncompatible("manifest missing".into()))?;
+        let dir = self.checkpoints(orb).published(generation);
+        let manifest: CheckpointManifest = read_json(&dir.join(MANIFEST))
+            .map_err(io_err)?
+            .ok_or_else(|| RuntimeError::CheckpointIncompatible("manifest missing".into()))?;
         let recipe = self.read_recipe(orb)?;
         self.check_compatible(&manifest, &recipe, &dir.join("memory"))?;
         Ok(manifest)
@@ -1115,7 +999,7 @@ impl QemuRuntime {
         if m.ram_bytes != recipe.memory_bytes || m.base != recipe.base {
             return bad("recipe changed since the save".into());
         }
-        match sha256_file(&m.launch.kernel.path) {
+        match super::vm::fsutil::sha256_file(&m.launch.kernel.path) {
             Ok(d) if d == m.launch.kernel.sha256 => {}
             Ok(_) => {
                 return bad(format!(
@@ -1156,7 +1040,7 @@ impl QemuRuntime {
             }
         }
         let manifest = self.restorable(orb.id, g)?;
-        let memory = self.checkpoint_dir(orb.id, g).join("memory");
+        let memory = self.checkpoints(orb.id).published(g).join("memory");
         self.verify_base(&self.read_recipe(orb.id)?)?;
         let started = Instant::now();
         let proc = self
@@ -1175,10 +1059,10 @@ impl QemuRuntime {
         crate::crash_point!("qemu::restore::after_load");
         // From here the restored guest may run and write its disk: the checkpoint must
         // never be restored again.
-        if let Err(e) = self.consume(orb.id, g) {
+        if let Err(e) = self.checkpoints(orb.id).consume(g) {
             proc.kill_and_wait(Duration::from_secs(10)).await;
             self.clear_run(orb.id);
-            return Err(io_err(e));
+            return Err(e);
         }
         crate::crash_point!("qemu::restore::after_consume");
         let qmp = self.qmp(orb.id).await?;
@@ -1189,7 +1073,7 @@ impl QemuRuntime {
         }
         let ms = started.elapsed().as_millis();
         tracing::info!(orb = %orb.id, generation = g, ms, "restored from memory checkpoint");
-        log_ctx(ctx, &format!("restored checkpoint {g} in {ms} ms"));
+        log(ctx, &format!("restored checkpoint {g} in {ms} ms"));
         Ok(())
     }
 
@@ -1254,17 +1138,20 @@ impl QemuRuntime {
                     .checked_sub(Duration::from_secs(5))
                     .unwrap_or(deadline),
             );
-            log_ctx(ctx, "shutting the guest down");
-            self.guest_shutdown(orb, (Instant::now() + Duration::from_secs(3)).min(soft))
-                .await;
+            log(ctx, "shutting the guest down");
+            channel::shutdown(
+                &self.connector(orb),
+                (Instant::now() + Duration::from_secs(3)).min(soft),
+            )
+            .await;
             if let Ok(q) = self.qmp(orb).await {
                 let _ = q.system_powerdown().await;
             }
             if proc.wait_exit(soft).await {
-                log_ctx(ctx, "guest shut down");
+                log(ctx, "guest shut down");
                 return Ok(());
             }
-            log_ctx(ctx, "guest did not shut down in time; stopping QEMU");
+            log(ctx, "guest did not shut down in time; stopping QEMU");
         }
         if self.quit_and_reap(orb, proc, deadline).await {
             Ok(())
@@ -1330,7 +1217,7 @@ impl Runtime for QemuRuntime {
                     }
                 }
                 // Booting writes the disk: published checkpoints become stale first.
-                self.consume_all(orb.id).map_err(io_err)?;
+                self.checkpoints(orb.id).consume_all()?;
                 self.boot(orb, ctx).await
             }
             StartSource::MemoryCheckpoint(cp) => self.restore(orb, cp, ctx).await,
@@ -1366,29 +1253,34 @@ impl Runtime for QemuRuntime {
                 "checkpoint needs up to {need} bytes, {free} free"
             )));
         }
-        let _permit = bounded(ctx, self.saves.acquire())
+        let _permit = bounded(ctx, SAVES.acquire())
             .await?
             .map_err(|_| RuntimeError::Other("save semaphore closed".into()))?;
-        log_ctx(ctx, "asking the guest to prepare for sleep");
+        log(ctx, "asking the guest to prepare for sleep");
         let prep_deadline = (Instant::now() + PREPARE_SLEEP_TIMEOUT).min(ctx.work_deadline);
-        let guest_boot_id = match bounded(ctx, self.prepare_sleep(orb.id, prep_deadline)).await? {
+        let guest_boot_id = match bounded(
+            ctx,
+            channel::prepare_sleep(&self.connector(orb.id), prep_deadline),
+        )
+        .await?
+        {
             Ok(boot_id) => Some(boot_id),
             Err(e) => {
                 // The memory image is consistent without it; the sync only matters if
                 // the checkpoint is later lost and the disk cold-boots.
                 tracing::warn!(orb = %orb.id, error = %e, "guest did not prepare for sleep; saving anyway");
-                log_ctx(
+                log(
                     ctx,
                     &format!("guest did not prepare for sleep ({e}); saving anyway"),
                 );
                 None
             }
         };
-        log_ctx(ctx, &format!("saving memory checkpoint {g}"));
+        log(ctx, &format!("saving memory checkpoint {g}"));
         let manifest = match self.save(orb.id, &recipe, g, guest_boot_id, ctx).await {
             Ok(m) => m,
             Err(e) => {
-                log_ctx(ctx, &format!("save failed ({e}); resuming the guest"));
+                log(ctx, &format!("save failed ({e}); resuming the guest"));
                 self.abort_save(orb.id, g, ctx.cleanup_deadline).await;
                 return Err(match e {
                     RuntimeError::Cancelled
@@ -1411,10 +1303,10 @@ impl Runtime for QemuRuntime {
             )));
         }
         crate::crash_point!("qemu::save::after_quit");
-        self.publish(orb.id, g).map_err(io_err)?;
+        self.checkpoints(orb.id).publish(g)?;
         crate::crash_point!("qemu::save::after_publish");
         self.clear_run(orb.id);
-        log_ctx(
+        log(
             ctx,
             &format!(
                 "checkpoint {g} published: {} MiB for {} MiB of RAM in {} ms",
@@ -1450,9 +1342,7 @@ impl Runtime for QemuRuntime {
         checkpoint: &SleepCheckpointRef,
     ) -> Result<(), RuntimeError> {
         let _g = self.lock(orb).await;
-        let dir = self.checkpoint_dir(orb, checkpoint.generation);
-        self.consume(orb, checkpoint.generation).map_err(io_err)?;
-        remove_via_trash(&dir, &self.trash()).map_err(io_err)
+        self.checkpoints(orb).discard(checkpoint.generation)
     }
 
     /// `qemu-img convert` of the stopped overlay (with its backing) into a standalone
@@ -1478,15 +1368,9 @@ impl Runtime for QemuRuntime {
                 )));
             }
         }
-        let staging = self
-            .state_dir
-            .join("staging")
-            .join(format!("project-{key}-{}", uuid::Uuid::new_v4().simple()));
         let disk = self.orb_paths(orb.id).disk;
-        let built = async {
-            std::fs::create_dir_all(&staging).map_err(io_err)?;
-            let raw = staging.join("disk.raw");
-            log_ctx(ctx, &format!("converting disk into project snapshot {key}"));
+        log(ctx, &format!("converting disk into project snapshot {key}"));
+        publish_project(&self.state_dir, key, orb.id, |raw| async move {
             run_tool(
                 ctx,
                 &self.config.qemu_img,
@@ -1501,40 +1385,22 @@ impl Runtime for QemuRuntime {
                     raw.display().to_string(),
                 ],
             )
-            .await?;
-            std::fs::File::open(&raw)
-                .and_then(|f| f.sync_all())
-                .map_err(io_err)?;
-            let meta = serde_json::json!({
-                "key": key,
-                "source_orb": orb.id,
-                "created_unix_ms": unix_ms_now(),
-                "bytes": std::fs::metadata(&raw).map(|m| m.len()).unwrap_or(0),
-            });
-            write_json_atomic(&staging.join("meta.json"), &meta).map_err(io_err)?;
-            fsync_dir(&staging).map_err(io_err)
-        }
-        .await;
-        if let Err(e) = built {
-            let _ = remove_via_trash(&staging, &self.trash());
-            return Err(e);
-        }
-        if dest.exists() {
-            remove_via_trash(&dest, &self.trash()).map_err(io_err)?;
-        }
-        rename_durable(&staging, &dest).map_err(io_err)?;
+            .await
+        })
+        .await?;
         crate::crash_point!("qemu::clone::after_publish");
-        log_ctx(ctx, &format!("project snapshot {key} published"));
+        log(ctx, &format!("project snapshot {key} published"));
         Ok(done)
     }
 
     async fn delete(&self, orb: OrbId, ctx: &OpContext) -> Result<(), RuntimeError> {
         let _g = bounded(ctx, self.lock(orb)).await?;
         let rp = self.run_paths(orb);
-        if let Some(record) = process::read_record(&rp.launch)
-            && let Some(proc) = Process::adopt(&record, &orb.to_string(), &rp.pidfile)
+        if let Some(record) = process::read_record::<LaunchConfig>(&rp.launch)
+            && let Some(proc) =
+                Process::adopt(&record, &launch_name(orb, &record), Some(&rp.pidfile))
         {
-            log_ctx(ctx, &format!("killing QEMU (pid {})", proc.pid));
+            log(ctx, &format!("killing QEMU (pid {})", proc.pid));
             if !proc.kill_and_wait(Duration::from_secs(10)).await {
                 return Err(RuntimeError::Other(format!(
                     "QEMU process {} does not exit",
@@ -1542,12 +1408,10 @@ impl Runtime for QemuRuntime {
                 )));
             }
         }
-        if let Ok(recipe) = self.read_recipe(orb) {
-            recipe.net.remove();
-        }
+        net::release(orb, &self.state_dir);
         let dir = self.orb_paths(orb).dir;
         if dir.exists() {
-            log_ctx(ctx, "removing disk and checkpoints");
+            log(ctx, "removing disk and checkpoints");
         }
         remove_via_trash(&dir, &self.trash()).map_err(io_err)?;
         self.clear_run(orb);
@@ -1640,47 +1504,6 @@ fn inject_write_fault() -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Runs a host tool (qemu-img) with fixed arguments, bounded by the context; killed
-/// if cancelled or late.
-async fn run_tool(ctx: &OpContext, program: &Path, args: &[String]) -> Result<(), RuntimeError> {
-    let child = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = bounded(ctx, child)
-        .await?
-        .map_err(|e| RuntimeError::Other(format!("{}: {e}", program.display())))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = format!("{} {}: {}", program.display(), args[0], err.trim());
-        return Err(if err.contains("No space left") {
-            RuntimeError::InsufficientDisk(msg)
-        } else {
-            RuntimeError::Other(msg)
-        });
-    }
-    Ok(())
-}
-
-/// `program` itself if it has a directory part, else its first match on PATH.
-fn on_path(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 {
-        return Some(program.to_owned());
-    }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(program))
-        .find(|p| p.is_file())
-}
-
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-}
-
 /// True when files in `dir` can be opened with O_DIRECT (cache=none).
 fn probe_direct_io(dir: &Path) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1696,47 +1519,6 @@ fn probe_direct_io(dir: &Path) -> bool {
     ok
 }
 
-/// Stable per-orb systemd machine id (project-snapshot clones get their own).
-fn machine_id(orb: OrbId) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(&Sha256::digest(format!("orbd-machine-id:{orb}").as_bytes())[..16])
-}
-
-/// Last lines of a QEMU log, for error messages.
-fn log_tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().rev().take(5).collect();
-    lines.into_iter().rev().collect::<Vec<_>>().join(" | ")
-}
-
-fn io_err(e: std::io::Error) -> RuntimeError {
-    if e.raw_os_error() == Some(nix::libc::ENOSPC) {
-        RuntimeError::InsufficientDisk(e.to_string())
-    } else {
-        RuntimeError::Other(e.to_string())
-    }
-}
-
 fn qmp_err(e: qmp::QmpError) -> RuntimeError {
     RuntimeError::Other(e.to_string())
-}
-
-/// Streams a progress line to the operation log. Advisory: dropped if the sink is full.
-pub(crate) fn log_ctx(ctx: &OpContext, line: &str) {
-    tracing::debug!(operation = %ctx.operation_id, "{line}");
-    let _ = ctx
-        .log
-        .try_send((LogStream::Stdout, bytes::Bytes::from(format!("{line}\n"))));
-}
-
-use log_ctx as log;
-
-/// Runs `fut` until it finishes, `ctx.cancel` fires or the work deadline passes.
-async fn bounded<F: Future>(ctx: &OpContext, fut: F) -> Result<F::Output, RuntimeError> {
-    tokio::select! {
-        biased;
-        _ = ctx.cancel.cancelled() => Err(RuntimeError::Cancelled),
-        _ = tokio::time::sleep_until(ctx.work_deadline.into()) => Err(RuntimeError::DeadlineExceeded),
-        out = fut => Ok(out),
-    }
 }

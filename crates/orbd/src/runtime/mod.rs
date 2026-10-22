@@ -10,7 +10,9 @@
 
 pub mod docker;
 pub mod fake;
+pub mod firecracker;
 pub mod qemu;
+pub mod vm;
 
 use crate::model::{
     InitialDiskSource, OrbDefinition, OrbId, ProjectSnapshotKey, ProjectSnapshotRef, RuntimeKind,

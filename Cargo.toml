@@ -45,6 +45,9 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Firecracker API client (HTTP/1.1 over its unix socket).
+hyper = { version = "1", features = ["client", "http1"] }
+http-body-util = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }

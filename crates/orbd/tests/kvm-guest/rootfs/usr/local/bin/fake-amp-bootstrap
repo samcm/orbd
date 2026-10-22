@@ -1,4 +1,11 @@
-#!/bin/sh
+#!/bin/bash
 # Stands in for `amp orb bootstrap`: proves the credentials arrived, never prints them.
 echo "fake-amp-bootstrap: ORB_TOKEN has ${#ORB_TOKEN} chars"
+# E2E_PROBE="host:port ...": which TCP destinations this orb reaches (open: accepted;
+# refused: reachable, nothing listening; dropped: filtered).
+for target in $E2E_PROBE; do
+    timeout 5 bash -c "exec 3<>/dev/tcp/${target%:*}/${target##*:}" 2>/dev/null
+    case $? in 0) r=open ;; 124) r=dropped ;; *) r=refused ;; esac
+    echo "probe $target $r"
+done
 exec sleep infinity

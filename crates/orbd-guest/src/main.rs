@@ -5,7 +5,8 @@
 //! * `orbd-guest init`: early-boot setup (grow the root filesystem, /dev/kvm access,
 //!   machine identity for new orbs and clones).
 //! * `orbd-guest serve [--port NAME]`: serve the host on the virtio-serial port
-//!   (default `org.orbd.control`).
+//!   (default `org.orbd.control`), or on vsock when the kernel command line has
+//!   `orbd.vsock=<port>` (Firecracker).
 
 macro_rules! log {
     ($($arg:tt)*) => { eprintln!("orbd-guest: {}", format_args!($($arg)*)) };
@@ -42,5 +43,16 @@ fn main() {
 
 fn serve(port: &str) -> ! {
     transport::block_sigio();
-    server::serve(&transport::VirtioSerial::new(port))
+    match vsock_port() {
+        Some(p) => server::serve(&transport::Vsock::new(p)),
+        None => server::serve(&transport::VirtioSerial::new(port)),
+    }
+}
+
+/// `orbd.vsock=<port>` on the kernel command line (Firecracker) selects vsock.
+fn vsock_port() -> Option<u32> {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()?
+        .split_whitespace()
+        .find_map(|a| a.strip_prefix("orbd.vsock=")?.parse().ok())
 }

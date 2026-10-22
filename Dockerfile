@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# ghcr.io/samcm/orbd: `orbd coordinator` (amd64, arm64) and `orbd agent` with the QEMU
-# runtime (amd64). Built from prebuilt artifacts (the build.yml outputs) in the context:
+# ghcr.io/samcm/orbd: `orbd coordinator` (amd64, arm64) and `orbd agent` with the QEMU and
+# Firecracker runtimes (amd64). Built from prebuilt artifacts (the build.yml outputs) in
+# the context:
 #
 #   amd64/orbd  amd64/orbd-guest  amd64/bzImage  arm64/orbd
 #
@@ -14,6 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN curl -fsSL -o /umoci https://github.com/opencontainers/umoci/releases/download/v0.6.0/umoci.linux.amd64 \
     && echo "b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71  /umoci" | sha256sum -c \
     && chmod 0755 /umoci
+# Firecracker (release binary only; no jailer). A new build means sleeping Firecracker
+# orbs cold-boot once: checkpoints restore only on the exact binary.
+RUN curl -fsSL -o /tmp/fc.tgz https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz \
+    && echo "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558  /tmp/fc.tgz" | sha256sum -c \
+    && tar -xzf /tmp/fc.tgz -C /tmp \
+    && install -m 0755 /tmp/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64 /firecracker
 # Amp CLI as baked in; the coordinator runs `amp update` at startup and every 6 h.
 # Empty AMP_VERSION means the current release.
 ARG TARGETARCH
@@ -42,11 +49,12 @@ FROM base AS base-amd64
 RUN printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
         >/etc/apt/sources.list.d/backports.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends e2fsprogs \
+    && apt-get install -y --no-install-recommends e2fsprogs iproute2 nftables \
     && apt-get install -y --no-install-recommends -t trixie-backports qemu-system-x86 qemu-utils \
     && rm -rf /var/lib/apt/lists/* \
     && qemu-system-x86_64 --version
 COPY --from=fetch /umoci /usr/local/bin/umoci
+COPY --from=fetch /firecracker /usr/local/bin/firecracker
 COPY amd64/bzImage /usr/share/orbd/bzImage
 COPY --chmod=0755 amd64/orbd-guest /usr/share/orbd/orbd-guest
 

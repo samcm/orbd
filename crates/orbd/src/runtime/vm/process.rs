@@ -1,18 +1,18 @@
-//! QEMU process supervision: a one-shot launcher (fork → new session → optional cgroup
-//! move → exec of a foreground QEMU), durable launch records, and validated adoption of
-//! QEMUs that outlived an earlier agent process.
+//! VMM process supervision: a one-shot launcher (fork → new session → optional cgroup
+//! move → optional network namespace → exec of a foreground VMM), durable launch
+//! records, and validated adoption of VMMs that outlived an earlier agent process.
 //!
-//! QEMU is never `-daemonize`d and never a long-lived child that the agent must keep
-//! reaping: the spawned `Child` handle is dropped at once (tokio reaps it in the
-//! background if it exits while this agent lives) and every later wait goes through a
-//! pidfd, the same for launched and adopted processes. A process is accepted as an
-//! orb's QEMU only if the host boot id, `/proc/<pid>` start time and the launch nonce in
-//! its argv match the launch record (and, for QMP users, `query-name`).
+//! A VMM is never daemonized and never a long-lived child that the agent must keep
+//! reaping: the spawned `Child` handle is dropped at once (reaped in the background if
+//! it exits while this agent lives) and every later wait goes through a pidfd, the same
+//! for launched and adopted processes. A process is accepted as an orb's VMM only if the
+//! host boot id, `/proc/<pid>` start time and the launch marker in its argv match the
+//! launch record (and the VMM's own API then reports the same marker).
 //!
-//! Production placement: QEMUs must not live in the agent service's cgroup, or a
-//! service stop kills every orb. Under systemd use `KillMode=process` or set
-//! `runtime.qemu.cgroup_parent` to a delegated cgroup v2 directory; the launcher moves
-//! each QEMU into `<cgroup_parent>/orbd-<orb>` before exec.
+//! Production placement: VMMs must not live in the agent service's cgroup, or a service
+//! stop kills every orb. Under systemd use `KillMode=process` or set the runtime's
+//! `cgroup_parent` to a delegated cgroup v2 directory; the launcher moves each VMM into
+//! `<cgroup_parent>/orbd-<orb>` before exec.
 
 use super::fsutil::{read_json, write_json_atomic};
 use nix::libc;
@@ -22,19 +22,38 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Identity of the QEMU binary (recorded in manifests; restore requires the same version).
+/// Binary of a VMM (recorded in manifests; restore requires the same binary).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QemuIdentity {
+pub struct VmmIdentity {
     pub path: PathBuf,
     pub version: String,
     pub sha256: String,
 }
 
-/// Host CPU as `-cpu host` sees it (restore requires the same model and flags).
+/// Host CPU as the guest sees it (restore requires the same model and flags).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuIdentity {
     pub model: String,
     pub flags_sha256: String,
+}
+
+impl CpuIdentity {
+    pub fn host() -> Self {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let field = |name: &str| {
+            cpuinfo
+                .lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_owned())
+                .unwrap_or_default()
+        };
+        use sha2::{Digest, Sha256};
+        Self {
+            model: field("model name"),
+            flags_sha256: hex::encode(Sha256::digest(field("flags").as_bytes())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,47 +62,42 @@ pub struct KernelIdentity {
     pub sha256: String,
 }
 
-/// Everything that defines the guest-visible machine of one launch. A checkpoint's
-/// manifest stores the config it was saved from; restore relaunches with it verbatim.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LaunchConfig {
-    pub qemu: QemuIdentity,
-    pub cpu: CpuIdentity,
-    pub kernel: KernelIdentity,
-    /// Machine, CPU, memory, kernel and device arguments with fixed ids. Host-side
-    /// plumbing (chardev backends, block files, sockets, pidfile, name) is not included.
-    pub machine_args: Vec<String>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum LaunchKind {
     /// Boots the kernel; the guest runs from the first instruction.
     Boot,
-    /// `-S -incoming defer`, loading this checkpoint generation.
+    /// Loads this checkpoint generation with vCPUs stopped.
     Restore { generation: u64 },
 }
 
-/// Durable pre-launch intent (`<run>/qemu/<orb>/launch.json`), written before exec and
-/// completed with pid and start time after it.
+/// Durable pre-launch intent (`<run>/<runtime>/<orb>/launch.json`), written before
+/// exec and completed with pid and start time after it. `config` is the runtime's
+/// guest-visible machine definition.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LaunchRecord {
+pub struct LaunchRecord<C> {
     pub nonce: String,
     pub boot_id: String,
     pub kind: LaunchKind,
-    pub config: LaunchConfig,
+    pub config: C,
     pub pid: Option<i32>,
     pub start_time: Option<u64>,
 }
 
-impl LaunchRecord {
-    /// The `-name` value carrying the nonce; matched in `/proc/<pid>/cmdline` and QMP.
-    pub fn name(&self, orb: &str) -> String {
-        format!("orbd-{orb}.{}", self.nonce)
+impl<C> LaunchRecord<C> {
+    pub fn new(kind: LaunchKind, config: C) -> Self {
+        Self {
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            boot_id: host_boot_id(),
+            kind,
+            config,
+            pid: None,
+            start_time: None,
+        }
     }
 }
 
-pub fn read_record(path: &Path) -> Option<LaunchRecord> {
+pub fn read_record<C: serde::de::DeserializeOwned>(path: &Path) -> Option<LaunchRecord<C>> {
     read_json(path).ok().flatten()
 }
 
@@ -101,7 +115,7 @@ pub fn start_time(pid: i32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// A validated, live QEMU process, held through a pidfd (no pid-reuse races).
+/// A validated, live VMM process, held through a pidfd (no pid-reuse races).
 pub struct Process {
     pub pid: i32,
     pidfd: OwnedFd,
@@ -121,24 +135,28 @@ impl Process {
         })
     }
 
-    /// Adopts the QEMU described by `record`, if it is still the same process.
-    pub fn adopt(record: &LaunchRecord, orb: &str, pidfile: &Path) -> Option<Self> {
+    /// Adopts the VMM described by `record` and recognised by `marker` (a unique
+    /// string in its argv), if it is still the same process. Without a recorded pid
+    /// (the agent died right after exec) the pid comes from `pidfile` or a `/proc` scan.
+    pub fn adopt<C>(
+        record: &LaunchRecord<C>,
+        marker: &str,
+        pidfile: Option<&Path>,
+    ) -> Option<Self> {
         if record.boot_id != host_boot_id() {
             return None;
         }
-        let pid = record.pid.or_else(|| {
-            std::fs::read_to_string(pidfile)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-        })?;
+        let pid = record
+            .pid
+            .or_else(|| {
+                std::fs::read_to_string(pidfile?)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            })
+            .or_else(|| find_by_marker(marker))?;
         let p = Self::open(pid)?;
         // Validate after opening the pidfd, so the checks are about this process.
-        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        let marker = format!("guest={},", record.name(orb));
-        let has_marker = cmdline
-            .split(|b| *b == 0)
-            .any(|a| a.starts_with(marker.as_bytes()));
-        if !has_marker {
+        if !has_marker(pid, marker) {
             return None;
         }
         if let Some(st) = record.start_time
@@ -198,25 +216,49 @@ impl Process {
     }
 }
 
-pub struct Spawn<'a> {
-    pub qemu: &'a Path,
-    pub args: Vec<String>,
-    pub log_file: &'a Path,
-    pub record_path: &'a Path,
-    pub record: LaunchRecord,
-    /// Cgroup v2 directory to move QEMU into before exec.
-    pub cgroup: Option<PathBuf>,
+fn has_marker(pid: i32, marker: &str) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+        cmdline
+            .split(|b| *b == 0)
+            .any(|a| String::from_utf8_lossy(a).contains(marker))
+    })
 }
 
-/// Records the launch intent, then forks and execs QEMU in its own session. Returns once
-/// the process exists (not once QEMU is ready).
-pub fn spawn(s: Spawn<'_>) -> std::io::Result<(Process, LaunchRecord)> {
+fn find_by_marker(marker: &str) -> Option<i32> {
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .find(|pid| has_marker(*pid, marker))
+}
+
+pub struct Spawn<'a, C> {
+    pub program: &'a Path,
+    pub args: Vec<String>,
+    /// Receives the VMM's stdout (Firecracker: the guest's serial console).
+    pub stdout: &'a Path,
+    pub stderr: &'a Path,
+    pub record_path: &'a Path,
+    pub record: LaunchRecord<C>,
+    /// Cgroup v2 directory to move the VMM into before exec.
+    pub cgroup: Option<PathBuf>,
+    /// Network namespace (`/run/netns/<name>`) the VMM runs in.
+    pub netns: Option<PathBuf>,
+}
+
+/// Records the launch intent, then forks and execs the VMM in its own session. Returns
+/// once the process exists (not once it is ready).
+pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchRecord<C>)> {
     let mut record = s.record;
     write_json_atomic(s.record_path, &record)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(s.log_file)?;
+    let open_log = |p: &Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+    };
+    let stdout = open_log(s.stdout)?;
+    let stderr = open_log(s.stderr)?;
     let procs = match &s.cgroup {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
@@ -228,13 +270,15 @@ pub fn spawn(s: Spawn<'_>) -> std::io::Result<(Process, LaunchRecord)> {
         }
         None => None,
     };
+    let netns = s.netns.as_deref().map(std::fs::File::open).transpose()?;
     let procs_fd = procs.as_ref().map(|f| f.as_raw_fd());
-    let mut cmd = std::process::Command::new(s.qemu);
+    let netns_fd = netns.as_ref().map(|f| f.as_raw_fd());
+    let mut cmd = std::process::Command::new(s.program);
     cmd.args(&s.args)
         .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    // SAFETY: only async-signal-safe calls (setsid, write) between fork and exec.
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: only async-signal-safe calls (setsid, write, setns) between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -245,11 +289,17 @@ pub fn spawn(s: Spawn<'_>) -> std::io::Result<(Process, LaunchRecord)> {
             {
                 return Err(std::io::Error::last_os_error());
             }
+            if let Some(fd) = netns_fd
+                && libc::setns(fd, libc::CLONE_NEWNET) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     let child = cmd.spawn()?;
     let pid = child.id() as i32;
+    crate::crash_point!("vm::launch::after_exec");
     let proc = Process::open(pid).ok_or_else(|| std::io::Error::other("pidfd_open failed"))?;
     // Not waited here: a std Child never reaps on drop, so reap it on a detached thread
     // only while this agent lives; afterwards init (or the subreaper) does.

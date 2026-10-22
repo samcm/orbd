@@ -47,6 +47,7 @@ async fn prepares_amp_image_with_guest_integration() {
         mkfs_ext4: "mkfs.ext4".into(),
         prewarm: vec![],
         refresh_interval_secs: 3600,
+        static_images: vec![],
     };
     let store = ImageStore::open(&config, state.path()).unwrap();
 

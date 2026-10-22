@@ -92,10 +92,12 @@ jobs:
       artifact: true
 
   # Real VMs on GitHub-hosted runners: ephemeral VMs with /dev/kvm and no secrets, so
-  # pull requests run here too. Both suites run inside the image built above, so they
-  # test the shipped QEMU and guest kernel.
-  # - gates: tests/qemu_kvm.rs (ignored by default) through a real coordinator and agent.
-  # - container: tests/container-e2e.sh, the coordinator and agent containers as deployed.
+  # pull requests run here too. Every suite runs inside the image built above, so they
+  # test the shipped QEMU, Firecracker and guest kernel.
+  # - qemu, firecracker: the gates in tests/kvm.rs (ignored by default) through a real
+  #   coordinator and agent, on that runtime.
+  # - container: tests/container-e2e.sh, the coordinator and agent containers as deployed,
+  #   with a QEMU and a Firecracker orb on one agent.
   kvm:
     name: kvm (${{ matrix.suite }})
     needs: [build, image]
@@ -104,9 +106,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [gates, container]
+        suite: [qemu, firecracker, container]
     env:
-      ROOTFS: target/kvm-guest/rootfs.ext4
+      # Not under target/: the rust cache restores target/ over it.
+      ROOTFS: kvm-guest/rootfs.ext4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -156,30 +159,31 @@ jobs:
             artifacts/orbd-guest-x86_64-unknown-linux-musl/orbd-guest artifacts/guest-kernel/bzImage "$ROOTFS"
 
       # Static musl test binaries run in the image whatever its libc.
-      - if: matrix.suite == 'gates'
+      - if: matrix.suite != 'container'
         run: |
           rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
           sudo apt-get install -y -qq musl-tools
-      - if: matrix.suite == 'gates'
+      - if: matrix.suite != 'container'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: kvm-musl
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: matrix.suite == 'gates'
+      - if: matrix.suite != 'container'
         name: Build the gates
         env:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          cargo test --locked -p orbd --features failpoints --test qemu_kvm \
+          cargo test --locked -p orbd --features failpoints --test kvm \
             --target x86_64-unknown-linux-musl --no-run --message-format=json |
-            jq -r 'select(.profile.test == true and .target.name == "qemu_kvm") | .executable' >gates.txt
+            jq -r 'select(.profile.test == true and .target.name == "kvm") | .executable' >gates.txt
           cat gates.txt
-      - if: matrix.suite == 'gates'
+      - if: matrix.suite != 'container'
         name: Run the gates in the image
         # procps provides the `kill` the test harness runs; QEMU is the image's own.
         run: |
           docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD/crates/orbd" \
             -e ORBD_KVM_KERNEL=/usr/share/orbd/bzImage -e "ORBD_KVM_ROOTFS=$PWD/$ROOTFS" -e ORBD_KVM_NESTED \
+            -e ORBD_KVM_RUNTIME=${{ matrix.suite }} \
             --entrypoint sh orbd:smoke -c \
             'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture' \
             "$(cat gates.txt)"

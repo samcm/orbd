@@ -1,4 +1,4 @@
-# Guest assets for the QEMU runtime
+# Guest assets for the VM runtimes (QEMU, Firecracker)
 
 - `kernel/`: `build.sh` builds the pinned 6.18 LTS guest kernel (`bzImage`, final
   `config`, `bzImage.sha256`, `manifest.txt`) from `orbd.config`. Everything is built in:
@@ -15,9 +15,14 @@ entry for `/`, so the kernel mounts the root read-write). Optionally
 `systemd.machine_id=<32 hex>` derived from the orb id, which gives project-snapshot
 clones their own machine id from the first boot.
 
-Guest channel: a virtio-serial port named `org.orbd.control` (see
-`proto/orbd/guest/v1/guest.proto`). The guest finds it through sysfs, so it does not
-depend on udev's `/dev/virtio-ports` links. The host connects, sends `Hello`, then any of
+Firecracker boots the same kernel with `console=ttyS0 reboot=k panic=1 root=/dev/vda rw
+systemd.machine_id=<id> orbd.vsock=1024` and a CPU template that hides VMX/SVM (no
+`/dev/kvm` in its orbs).
+
+Guest channel: a virtio-serial port named `org.orbd.control` (QEMU) or, with
+`orbd.vsock=<port>` on the command line, an AF_VSOCK listener on that port (Firecracker;
+see `proto/orbd/guest/v1/guest.proto`). The guest finds the port through sysfs, so it
+does not depend on udev's `/dev/virtio-ports` links. The host connects, sends `Hello`, then any of
 `Wake`, `PrepareSleep`, `Shutdown`; replies carry the request id. A reply to a connection
 that has gone is dropped: reconnect, send `Hello` and read `last_generation`.
 
