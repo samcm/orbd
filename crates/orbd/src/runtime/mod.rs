@@ -10,6 +10,7 @@
 
 pub mod docker;
 pub mod fake;
+pub mod qemu;
 
 use crate::model::{
     InitialDiskSource, OrbDefinition, OrbId, ProjectSnapshotKey, ProjectSnapshotRef, RuntimeKind,
@@ -184,4 +185,8 @@ pub trait GuestControl: Send + Sync {
         request: BootstrapRequest,
         ctx: &OpContext,
     ) -> Result<(), GuestError>;
+
+    /// After a memory restore that no spawn asked for (agent maintenance): steps the
+    /// guest clock and reapplies its network. No credentials, Amp's units untouched.
+    async fn resync(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), GuestError>;
 }

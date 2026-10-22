@@ -38,6 +38,7 @@ pub struct Cluster {
     /// Each agent's join token, passed on every start like a container's ORBD_JOIN.
     tokens: BTreeMap<String, String>,
     agent_orbs: u64,
+    offering: String,
 }
 
 pub struct Job {
@@ -50,6 +51,27 @@ impl Cluster {
     /// Writes configs for a coordinator and the given agents, each agent with room for
     /// `agent_orbs` orbs of the test offering.
     pub fn new(agent_ids: &[&str], agent_orbs: u64) -> Self {
+        Self::with_runtime(
+            agent_ids,
+            agent_orbs,
+            "fake",
+            "runtime:\n  fake:\n    memory_preserving_sleep: true\n",
+        )
+    }
+
+    /// A cluster whose single offering (2 vCPUs, 2 GiB, 4 GiB disk) runs on `runtime`;
+    /// every agent reads `agent_yaml` as its optional config file.
+    pub fn with_runtime(
+        agent_ids: &[&str],
+        agent_orbs: u64,
+        runtime: &str,
+        agent_yaml: &str,
+    ) -> Self {
+        let offering = if runtime == "fake" {
+            OFFERING.to_owned()
+        } else {
+            format!("{runtime}-2vcpu-2gb")
+        };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let control_port = free_port();
@@ -63,18 +85,15 @@ state_dir: {root}/coordinator
 metrics_listen: 127.0.0.1:{metrics_port}
 heartbeat_interval_ms: 300
 offerings:
-  - id: {OFFERING}
-    runtime: fake
+  - id: {offering}
+    runtime: {runtime}
     resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}
 "#,
                 root = root.display(),
             ),
         );
-        // Only the fake runtime needs a file; everything else is flags and env.
-        write(
-            &root.join("agent.yaml"),
-            "runtime:\n  fake:\n    memory_preserving_sleep: true\n",
-        );
+        // Only runtime settings go in a file; everything else is flags and env.
+        write(&root.join("agent.yaml"), agent_yaml);
         Self {
             dir,
             control_port,
@@ -83,10 +102,11 @@ offerings:
             agents: agent_ids.iter().map(|a| (a.to_string(), None)).collect(),
             tokens: BTreeMap::new(),
             agent_orbs,
+            offering,
         }
     }
 
-    fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         self.dir.path()
     }
 
@@ -220,6 +240,23 @@ offerings:
         }
     }
 
+    /// Sends a signal (e.g. `TERM`) to a running agent without waiting.
+    pub fn signal_agent(&self, id: &str, signal: &str) {
+        let child = self.agents.get(id).unwrap().as_ref().unwrap();
+        let _ = Command::new("kill")
+            .args([&format!("-{signal}"), &child.id().to_string()])
+            .status();
+    }
+
+    /// Stops an agent gracefully (SIGTERM, as a container stop does) and waits for it.
+    pub fn terminate_agent(&mut self, id: &str, within: Duration) -> std::process::ExitStatus {
+        let mut child = self.agents.get_mut(id).unwrap().take().unwrap();
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        wait_exit(&mut child, within).expect("agent did not stop in time")
+    }
+
     pub fn kill_coordinator(&mut self) {
         if let Some(mut c) = self.coordinator.take() {
             let _ = c.kill();
@@ -276,7 +313,7 @@ offerings:
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("ORBD_DISPATCH_SOCKET", self.dispatch_socket())
-            .env("ORBD_OFFERING_ID", OFFERING)
+            .env("ORBD_OFFERING_ID", &self.offering)
             .env("ORB_OPERATION", op)
             .env("ORB_ID", orb)
             .env("ORB_SANDBOX_ID", format!("sandbox-{orb}"))

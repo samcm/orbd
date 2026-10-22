@@ -122,7 +122,14 @@ fn run_session(
                 }
                 mut other if !greeted => {
                     scrub(&mut other);
-                    reply_error(session, msg.request_id, "expected Hello first");
+                    send(
+                        session,
+                        msg.request_id,
+                        guest_message::Body::Error(Error {
+                            message: "expected Hello first".into(),
+                            retry: true,
+                        }),
+                    );
                 }
                 body => {
                     let _ = tx.send(Job {
@@ -164,6 +171,9 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared) {
                 unsafe { libc::sync() };
                 log!("prepared for sleep (filesystems synced)");
                 Ok(shared.last_generation.load(Ordering::SeqCst))
+            }
+            host_message::Body::Resync(r) => {
+                crate::wake::resync(r).map(|()| shared.last_generation.load(Ordering::SeqCst))
             }
             host_message::Body::Shutdown(_) => {
                 log!("shutdown requested");
@@ -222,7 +232,10 @@ fn reply_error(session: &Arc<dyn Session>, request_id: u64, message: &str) {
     send(
         session,
         request_id,
-        guest_message::Body::Error(Error { message }),
+        guest_message::Body::Error(Error {
+            message,
+            retry: false,
+        }),
     );
 }
 

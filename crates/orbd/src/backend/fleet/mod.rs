@@ -96,6 +96,8 @@ struct AgentSlot {
 
 struct Session {
     id: Uuid,
+    /// Announced by heartbeat; a new session (agent restart) starts not draining.
+    draining: bool,
     tx: mpsc::UnboundedSender<pb::CoordinatorEvent>,
     cancel: CancellationToken,
     pending_reconcile: HashMap<String, oneshot::Sender<pb::ReconcileResponse>>,
@@ -252,6 +254,7 @@ impl Inner {
         });
         slot.session = Some(Session {
             id,
+            draining: false,
             tx,
             cancel: cancel.clone(),
             pending_reconcile: HashMap::new(),
@@ -360,6 +363,17 @@ impl Inner {
             E::Hello(_) => tracing::warn!(%agent, "ignoring repeated Hello on live session"),
             E::Heartbeat(hb) => {
                 if let Some(slot) = st.agents.get_mut(agent) {
+                    if let Some(s) = slot.session.as_mut()
+                        && hb.draining
+                        && !s.draining
+                    {
+                        s.draining = true;
+                        tracing::info!(%agent, "agent is draining");
+                        self.emit(BackendEvent::AvailabilityChanged {
+                            location: self.location(agent),
+                            availability: Availability::Draining,
+                        });
+                    }
                     slot.heartbeat = Some((hb, Instant::now()));
                 }
             }
@@ -531,8 +545,12 @@ impl ComputeBackend for FleetBackend {
                 Availability::Unavailable {
                     reason: "agent removed".into(),
                 }
-            } else if slot.session.is_some() {
-                Availability::Available
+            } else if let Some(s) = slot.session.as_ref() {
+                if s.draining {
+                    Availability::Draining
+                } else {
+                    Availability::Available
+                }
             } else if slot.unavailable_reason.is_empty() {
                 Availability::Unavailable {
                     reason: "agent has not connected".into(),

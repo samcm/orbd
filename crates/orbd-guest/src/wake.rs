@@ -3,7 +3,7 @@
 
 use crate::cmd::{self, check, run};
 use crate::files::{create_dirs_owned, user_ids, write_atomic};
-use crate::proto::{EnvVar, Wake};
+use crate::proto::{EnvVar, Resync, Wake};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -117,6 +117,18 @@ pub fn wake(w: &Wake) -> Result<(), String> {
         state.active, state.sub, state.restarts
     );
     Err(redact(&failed(unit, &what)))
+}
+
+/// `Resync`: clock and network only, after a restore no spawn asked for.
+pub fn resync(r: &Resync) -> Result<(), String> {
+    log!("resync");
+    if r.current_time_unix_ns > 0 {
+        step_clock(r.current_time_unix_ns)?;
+    }
+    if let Some(net) = &r.network {
+        crate::net::apply(net)?;
+    }
+    Ok(())
 }
 
 fn step_clock(unix_ns: i64) -> Result<(), String> {

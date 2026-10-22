@@ -1,0 +1,6 @@
+#!/bin/sh
+# Dirties orbd.blob=<MiB> of guest RAM with random data and re-checks its digest.
+mb=$(sed -n 's/.*orbd\.blob=\([0-9]*\).*/\1/p' /proc/cmdline)
+head -c "${mb}M" /dev/urandom >/dev/shm/blob
+echo "blob created $(sha256sum /dev/shm/blob | cut -c1-16)"
+while :; do sleep 10; echo "blob check $(sha256sum /dev/shm/blob | cut -c1-16)"; done

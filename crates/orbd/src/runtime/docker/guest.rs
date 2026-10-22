@@ -268,6 +268,11 @@ impl UnitState {
 
 #[async_trait]
 impl GuestControl for DockerRuntime {
+    /// Never needed: Docker orbs have no memory checkpoints.
+    async fn resync(&self, _orb: &OrbDefinition, _ctx: &OpContext) -> Result<(), GuestError> {
+        Ok(())
+    }
+
     async fn bootstrap(
         &self,
         orb: &OrbDefinition,

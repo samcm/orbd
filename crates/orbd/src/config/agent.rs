@@ -132,6 +132,63 @@ pub struct CapacityOverrides {
 pub struct RuntimesConfig {
     pub fake: Option<FakeRuntimeConfig>,
     pub docker: Option<DockerRuntimeConfig>,
+    pub qemu: Option<QemuRuntimeConfig>,
+}
+
+/// QEMU q35 VMs with nested KVM and memory-preserving sleep. Every field has a default
+/// matching orbd's container image, so a zero-config agent needs none of them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QemuRuntimeConfig {
+    /// `qemu-system-x86_64`; a bare name is looked up on PATH.
+    #[serde(default = "default_qemu")]
+    pub qemu: PathBuf,
+    #[serde(default = "default_qemu_img")]
+    pub qemu_img: PathBuf,
+    /// Guest kernel (bzImage, everything built in). Its digest is pinned in each
+    /// checkpoint: a replaced kernel makes sleeping orbs cold-boot on their next spawn.
+    #[serde(default = "default_kernel")]
+    pub kernel: PathBuf,
+    /// Delegated cgroup v2 directory; each QEMU runs in `<cgroup_parent>/orbd-<orb>`,
+    /// outside the agent's cgroup, so stopping the agent service leaves VMs running.
+    pub cgroup_parent: Option<PathBuf>,
+    /// Prebuilt raw ext4 root disks by image reference, used instead of the image
+    /// pipeline (development and KVM tests).
+    #[serde(default)]
+    pub static_images: Vec<QemuStaticImage>,
+    /// DNS servers delivered to guests (from `agent.dns_servers`).
+    #[serde(skip)]
+    pub dns_servers: Vec<String>,
+}
+
+impl Default for QemuRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            qemu: default_qemu(),
+            qemu_img: default_qemu_img(),
+            kernel: default_kernel(),
+            cgroup_parent: None,
+            static_images: Vec::new(),
+            dns_servers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QemuStaticImage {
+    pub image_ref: String,
+    pub rootfs: PathBuf,
+}
+
+fn default_qemu() -> PathBuf {
+    "qemu-system-x86_64".into()
+}
+fn default_qemu_img() -> PathBuf {
+    "qemu-img".into()
+}
+fn default_kernel() -> PathBuf {
+    DEFAULT_GUEST_KERNEL.into()
 }
 
 /// Test runtime with durable fake state. Never enable in production.

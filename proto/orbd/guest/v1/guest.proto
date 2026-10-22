@@ -34,6 +34,7 @@ message HostMessage {
     PrepareSleep prepare_sleep = 11;
     Wake wake = 12;
     Shutdown shutdown = 13;
+    Resync resync = 14;
   }
 }
 
@@ -56,6 +57,14 @@ message Wake {
 }
 
 message Shutdown {}
+
+// After a memory restore that no Amp spawn asked for (agent maintenance): steps the wall
+// clock and reapplies network/DNS, nothing else. No credentials; amp-headless and the
+// bootstrap unit are left alone. Acked with the last acked Wake generation.
+message Resync {
+  int64 current_time_unix_ns = 1;
+  NetworkConfig network = 2;
+}
 
 message GuestMessage {
   uint64 request_id = 1;
@@ -80,4 +89,7 @@ message Ack {
 
 message Error {
   string message = 1;
+  // The request was not processed because of the connection's state (e.g. no Hello on
+  // it yet). Reconnect, send Hello, and send the request again.
+  bool retry = 2;
 }

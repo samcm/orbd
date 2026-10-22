@@ -5,7 +5,7 @@
 //! operation: command + orb definition, sealed guest env, pinned deadlines, progress
 //! markers, terminal outcome, acked), `tombstones` (cancel-before-accept) and `orbs`
 //! (highest accepted generation, created flag, last observed state, next checkpoint
-//! generation).
+//! generation, maintenance restore intent).
 
 use crate::model::{
     Command, CommandFailure, CommandOutcome, FailureCode, OrbDefinition, OrbState, StableOrbState,
@@ -56,14 +56,12 @@ impl Db {
     }
 }
 
-fn init(conn: &mut Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (
+/// Bump on any schema change; there is no upgrade path (greenfield).
+const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA: &str = "CREATE TABLE meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS receipts (
+         CREATE TABLE receipts (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             operation_id TEXT NOT NULL UNIQUE,
             orb_id TEXT NOT NULL,
@@ -80,18 +78,38 @@ fn init(conn: &mut Connection) -> rusqlite::Result<()> {
             outcome_json TEXT,
             completed_at_unix_ms INTEGER,
             acked INTEGER NOT NULL DEFAULT 0);
-         CREATE INDEX IF NOT EXISTS receipts_status ON receipts(status, acked);
-         CREATE TABLE IF NOT EXISTS tombstones (
+         CREATE INDEX receipts_status ON receipts(status, acked);
+         CREATE TABLE tombstones (
             operation_id TEXT PRIMARY KEY,
             orb_id TEXT NOT NULL,
             recorded_at_unix_ms INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS orbs (
+         CREATE TABLE orbs (
             orb_id TEXT PRIMARY KEY,
             highest_generation INTEGER NOT NULL,
             created INTEGER NOT NULL DEFAULT 0,
             last_state_json TEXT,
-            next_checkpoint_generation INTEGER NOT NULL DEFAULT 1);",
-    )
+            next_checkpoint_generation INTEGER NOT NULL DEFAULT 1,
+            restore_json TEXT);";
+
+fn init(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    match current {
+        SCHEMA_VERSION => Ok(()),
+        0 => {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            Ok(())
+        }
+        v => anyhow::bail!(
+            "agent database schema version {v} is not {SCHEMA_VERSION} (this orbd); orbd has \
+             no upgrade path: delete the agent state directory to start over"
+        ),
+    }
 }
 
 // --- records ----------------------------------------------------------------
@@ -318,9 +336,11 @@ pub fn decide_delivery(
             ),
         ));
     }
+    // Any accepted command supersedes a maintenance restore intent.
     tx.execute(
         "INSERT INTO orbs(orb_id, highest_generation) VALUES (?1, ?2)
-         ON CONFLICT(orb_id) DO UPDATE SET highest_generation = excluded.highest_generation",
+         ON CONFLICT(orb_id) DO UPDATE SET highest_generation = excluded.highest_generation,
+            restore_json = NULL",
         params![orb, new.command.generation as i64],
     )?;
     tx.execute(
@@ -453,6 +473,62 @@ pub fn allocate_checkpoint_generation(
     save_progress(&tx, op, progress)?;
     tx.commit()?;
     Ok(g as u64)
+}
+
+/// Allocates the orb's next checkpoint generation outside any operation (agent drain).
+pub fn allocate_maintenance_checkpoint(conn: &mut Connection, orb: OrbId) -> rusqlite::Result<u64> {
+    let tx = conn.transaction()?;
+    let g: i64 = tx.query_row(
+        "SELECT next_checkpoint_generation FROM orbs WHERE orb_id = ?1",
+        [orb.to_string()],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "UPDATE orbs SET next_checkpoint_generation = ?2 WHERE orb_id = ?1",
+        params![orb.to_string(), g + 1],
+    )?;
+    tx.commit()?;
+    Ok(g as u64)
+}
+
+/// Restore the orb from `checkpoint` when the agent starts again, unless a command
+/// with a generation above `generation` is accepted first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreIntent {
+    pub generation: u64,
+    pub checkpoint: SleepCheckpointRef,
+}
+
+/// Records what a maintenance step observed, with the restore intent it leaves.
+pub fn record_maintenance(
+    conn: &Connection,
+    orb: OrbId,
+    state: &OrbState,
+    intent: Option<&RestoreIntent>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE orbs SET last_state_json = ?2, restore_json = ?3 WHERE orb_id = ?1",
+        params![orb.to_string(), json(state), intent.map(json)],
+    )?;
+    Ok(())
+}
+
+pub fn set_last_state(conn: &Connection, orb: OrbId, state: &OrbState) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE orbs SET last_state_json = ?2 WHERE orb_id = ?1",
+        params![orb.to_string(), json(state)],
+    )?;
+    Ok(())
+}
+
+pub fn list_restore_intents(conn: &Connection) -> rusqlite::Result<Vec<(OrbRow, RestoreIntent)>> {
+    let mut st = conn.prepare(&format!(
+        "SELECT {ORB_COLS}, restore_json FROM orbs WHERE restore_json IS NOT NULL ORDER BY orb_id"
+    ))?;
+    st.query_map([], |r| {
+        Ok((orb_from_row(r)?, from_json(&r.get::<_, String>(4)?)?))
+    })?
+    .collect()
 }
 
 pub fn complete(

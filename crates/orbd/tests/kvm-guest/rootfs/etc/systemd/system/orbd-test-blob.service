@@ -1,0 +1,10 @@
+[Unit]
+Description=orbd test: dirty guest memory
+ConditionKernelCommandLine=orbd.blob
+
+[Service]
+ExecStart=/usr/local/bin/orbd-test-blob
+StandardOutput=file:/dev/ttyS0
+
+[Install]
+WantedBy=multi-user.target

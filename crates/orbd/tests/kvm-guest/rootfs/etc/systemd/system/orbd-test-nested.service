@@ -1,0 +1,11 @@
+[Unit]
+Description=orbd test: nested KVM guest
+After=orbd-guest.service
+
+[Service]
+User=user
+ExecStart=/usr/local/bin/orbd-test-nested
+StandardOutput=file:/dev/ttyS0
+
+[Install]
+WantedBy=multi-user.target

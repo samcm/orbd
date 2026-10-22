@@ -379,6 +379,10 @@ impl Runtime for FakeRuntime {
 
 #[async_trait]
 impl GuestControl for FakeRuntime {
+    async fn resync(&self, _orb: &OrbDefinition, _ctx: &OpContext) -> Result<(), GuestError> {
+        Ok(())
+    }
+
     async fn bootstrap(
         &self,
         orb: &OrbDefinition,

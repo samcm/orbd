@@ -1,0 +1,4 @@
+#!/bin/sh
+# A long-lived process: its pid and count must survive memory-preserving sleep.
+n=0
+while :; do n=$((n+1)); echo "counter pid=$$ n=$n t=$(date +%s)"; sleep 1; done

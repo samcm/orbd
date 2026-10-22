@@ -399,6 +399,9 @@ message Heartbeat {
   Resources reserved = 2;           // agent-local reservations (running/starting orbs)
   uint64 disk_free_bytes = 3;
   uint32 memory_pressure_permille = 4;
+  // The agent is shutting down: it accepts no new commands and is checkpointing its
+  // running orbs, which it restores when it starts again.
+  bool draining = 5;
 }
 
 message CommandAccepted {

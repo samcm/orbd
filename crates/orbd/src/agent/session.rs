@@ -101,7 +101,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
     })))
 }
 
-fn heartbeat(sh: &Shared) -> pb::AgentEvent {
+pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
     let free = nix::sys::statvfs::statvfs(&sh.config.agent.state_dir)
         .map(|s| s.blocks_available() * s.fragment_size())
         .unwrap_or(0);
@@ -110,6 +110,7 @@ fn heartbeat(sh: &Shared) -> pb::AgentEvent {
         reserved: Some(sh.reserved_total().into()),
         disk_free_bytes: free,
         memory_pressure_permille: 0,
+        draining: sh.draining.is_cancelled(),
     }))
 }
 
@@ -292,6 +293,30 @@ async fn handle_delivery(sh: &Arc<Shared>, d: pb::CommandDelivery) -> anyhow::Re
             generation: c.generation,
         })
         .unwrap_or_default();
+    if sh.draining.is_cancelled() {
+        // Shutting down: known operations replay, new ones wait for the next start.
+        let known = match CommandKey::try_from(&raw_key) {
+            Ok(k) => {
+                let op = k.operation_id;
+                sh.db.call(move |c| db::get_receipt(c, op)).await?
+            }
+            Err(_) => None,
+        };
+        match known {
+            Some(r) => {
+                sh.send_control(accepted_event(raw_key));
+                if r.terminal {
+                    sh.send_control(completed_event(&r.command.key(), &outcome_of(&r)));
+                }
+            }
+            None => sh.send_control(rejected_event(
+                raw_key,
+                FailureCode::BackendUnavailable,
+                "agent is shutting down".into(),
+            )),
+        }
+        return Ok(());
+    }
     let p = match parse_delivery(sh, &d) {
         Ok(p) => p,
         Err((code, msg)) => {
