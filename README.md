@@ -28,8 +28,8 @@ each orb on an agent. Agents run on your own x86_64 hosts, dial the coordinator 
 mutual-TLS gRPC, and run orbs in QEMU, Firecracker or Docker. Coordinator and agent are
 the same static `orbd` binary; the coordinator also runs on aarch64.
 
-> **Work in progress.** Docker works end to end with Amp; QEMU is being built.
-> Configuration and on-disk formats will change.
+> **Early.** QEMU and Docker work end to end with Amp; Firecracker is planned.
+> Configuration and on-disk formats may still change.
 
 ```
                  Amp
@@ -57,7 +57,7 @@ Measured on a Ryzen 9 7940HS with a 2 vCPU / 4 GiB orb on Amp's orb image.
 | Processes kept on sleep | ✅             | ✅          | ❌          |
 | No host RAM while asleep | ✅            | ✅          | ✅          |
 | `/dev/kvm` in the orb   | ✅             | ❌          | ❌          |
-| Status                  | 🚧 in progress | 🗓️ planned  | ✅ works    |
+| Status                  | ✅ works       | 🗓️ planned  | ✅ works    |
 
 ## Build
 
@@ -76,10 +76,10 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    ```yaml
    public_url: https://coordinator.example:7443   # agents dial this
    offerings:
-     - id: docker-2vcpu-4gb
-       runtime: docker
-       resources: { vcpus: 2, memory_mib: 4096, disk_gib: 20 }
-       provider_token_file: /etc/orbd/tokens/docker-2vcpu-4gb
+     - id: qemu-4vcpu-8gb
+       runtime: qemu
+       resources: { vcpus: 4, memory_mib: 8192, disk_gib: 40 }
+       provider_token_file: /etc/orbd/tokens/qemu-4vcpu-8gb
    ```
 
    ```sh
@@ -93,7 +93,6 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 
    ```sh
    docker run -d --privileged --stop-timeout 300 -v orbd-agent:/var/lib/orbd \
-     -v /var/run/docker.sock:/var/run/docker.sock \
      -e ORBD_JOIN=<token> ghcr.io/samcm/orbd agent
    ```
 
@@ -103,7 +102,12 @@ The coordinator creates its CA and keys in its volume on first start; keep that 
 Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
 `ORBD_CAPACITY_MEMORY_MIB`, `ORBD_CAPACITY_DISK_GIB`); orbs use DNS `1.1.1.1` and `9.9.9.9`
 (`ORBD_DNS`). `orbd agent list` and `orbd agent remove <id>` manage agents; a removed
-agent's orbs stay on it, unavailable. Stopping an agent's container stops its QEMU orbs.
+agent's orbs stay on it, unavailable.
+
+Agents use QEMU when `/dev/kvm` works, otherwise Docker (mount `/var/run/docker.sock`). On
+`docker stop` an agent saves its running QEMU orbs and restores them when it starts again,
+so give it time (`--stop-timeout 300`). Orb disk sizes must be at least Amp's image
+(~5 GiB).
 
 ## License
 
