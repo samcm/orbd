@@ -220,6 +220,23 @@ offerings:
         }
     }
 
+    /// Sends a signal (e.g. `TERM`) to a running agent without waiting.
+    pub fn signal_agent(&self, id: &str, signal: &str) {
+        let child = self.agents.get(id).unwrap().as_ref().unwrap();
+        let _ = Command::new("kill")
+            .args([&format!("-{signal}"), &child.id().to_string()])
+            .status();
+    }
+
+    /// Stops an agent gracefully (SIGTERM, as a container stop does) and waits for it.
+    pub fn terminate_agent(&mut self, id: &str, within: Duration) -> std::process::ExitStatus {
+        let mut child = self.agents.get_mut(id).unwrap().take().unwrap();
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        wait_exit(&mut child, within).expect("agent did not stop in time")
+    }
+
     pub fn kill_coordinator(&mut self) {
         if let Some(mut c) = self.coordinator.take() {
             let _ = c.kill();

@@ -7,6 +7,8 @@
 //! * [`executor`]: one actor per orb; strictly serialized, idempotent action logic,
 //!   pinned deadlines, recovery after restart.
 //! * [`logs`]: bounded log queue kept apart from control messages.
+//! * [`maintenance`]: graceful stop (drain: checkpoint running orbs, leave restore
+//!   intents) and their restore at the next start.
 //!
 //! Crash points (feature `failpoints`, `FAILPOINTS="<name>=return"` aborts):
 //! `agent::accepted_committed` (receipt durable, Accepted not yet sent),
@@ -21,6 +23,7 @@ mod detect;
 mod executor;
 mod identity;
 mod logs;
+mod maintenance;
 mod session;
 
 use crate::config::agent::AgentConfig;
@@ -50,10 +53,14 @@ pub(crate) struct Shared {
     pub runtimes: HashMap<RuntimeKind, Arc<dyn Runtime>>,
     pub capacity: Resources,
     pub boot_id: String,
+    /// Stops the session loop and the executors.
     pub shutdown: CancellationToken,
+    /// Graceful stop in progress: no new commands, in-flight work interrupted (it stays
+    /// accepted), running orbs checkpointed.
+    pub draining: CancellationToken,
     pub reserved: Mutex<HashMap<OrbId, Resources>>,
     pub tokens: Mutex<HashMap<OperationId, CancellationToken>>,
-    pub actors: Mutex<HashMap<OrbId, mpsc::UnboundedSender<OperationId>>>,
+    pub actors: Mutex<HashMap<OrbId, mpsc::UnboundedSender<executor::Work>>>,
     pub session: Mutex<Option<SessionHandle>>,
     pub logs: Arc<logs::LogQueue>,
     pub tasks: TaskTracker,
@@ -106,12 +113,15 @@ fn acquire_lock(path: &std::path::Path) -> anyhow::Result<nix::fcntl::Flock<std:
         .map_err(|(_, e)| anyhow::anyhow!("another agent holds {}: {e}", path.display()))
 }
 
-/// Runs the agent until `shutdown` is cancelled. Running orbs survive agent exit.
+/// Runs the agent until `stop` is cancelled (SIGTERM), then drains: running
+/// memory-preserving orbs are checkpointed and restored at the next start, so they
+/// survive the agent's process tree being killed (e.g. a container stop). Orbs also
+/// survive a crash of the agent alone (VMMs are adopted at the next start).
 /// `join` is the join token, used only until the agent is enrolled.
 pub async fn run(
     mut config: AgentConfig,
     join: Option<String>,
-    shutdown: CancellationToken,
+    stop: CancellationToken,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.agent.state_dir)?;
     std::fs::create_dir_all(&config.agent.run_dir)?;
@@ -120,7 +130,7 @@ pub async fn run(
     let key = SecretKey::load_or_create(&config.agent.secret_key_file, first_init)?;
     let db = db::Db::open(&config.db_path())?;
     let Some(identity) =
-        identity::Identity::establish(&config.agent.state_dir, join.as_deref(), &shutdown).await?
+        identity::Identity::establish(&config.agent.state_dir, join.as_deref(), &stop).await?
     else {
         return Ok(());
     };
@@ -177,7 +187,8 @@ pub async fn run(
         runtimes,
         capacity,
         boot_id: uuid::Uuid::new_v4().to_string(),
-        shutdown: shutdown.clone(),
+        shutdown: CancellationToken::new(),
+        draining: CancellationToken::new(),
         reserved: Mutex::default(),
         tokens: Mutex::default(),
         actors: Mutex::default(),
@@ -187,11 +198,18 @@ pub async fn run(
     });
     tracing::info!(agent = %shared.identity.agent_id, boot_id = %shared.boot_id, "agent starting");
 
+    // Ready (Hello) only after interrupted work is requeued and drained orbs restored.
     executor::recover(&shared).await?;
     tokio::spawn(identity::renew_loop(shared.clone()));
-    session::run_loop(&shared).await;
+    let session = tokio::spawn({
+        let sh = shared.clone();
+        async move { session::run_loop(&sh).await }
+    });
+    stop.cancelled().await;
+    maintenance::drain(&shared).await;
 
-    shutdown.cancel();
+    shared.shutdown.cancel();
+    let _ = session.await;
     shared.tasks.close();
     if tokio::time::timeout(std::time::Duration::from_secs(10), shared.tasks.wait())
         .await

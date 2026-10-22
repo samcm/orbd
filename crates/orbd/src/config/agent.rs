@@ -102,6 +102,16 @@ pub struct AgentSection {
     /// Tailscale's 100.100.100.100 is unreachable from orbs.
     pub dns_servers: Vec<String>,
     pub metrics_listen: Option<SocketAddr>,
+    /// How long a graceful stop (SIGTERM) may take: running memory-preserving orbs are
+    /// checkpointed (smallest first) and restored at the next start. Give the process
+    /// manager a longer stop timeout, e.g. `docker stop -t 300` or compose
+    /// `stop_grace_period: 300s` for the default.
+    #[serde(default = "default_shutdown_budget_secs")]
+    pub shutdown_budget_secs: u64,
+}
+
+fn default_shutdown_budget_secs() -> u64 {
+    280
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
@@ -135,21 +145,25 @@ pub struct RuntimesConfig {
     pub qemu: Option<QemuRuntimeConfig>,
 }
 
-/// QEMU q35 VMs with nested KVM and memory-preserving sleep.
+/// QEMU q35 VMs with nested KVM and memory-preserving sleep. The defaults match the
+/// agent container image, so `runtime: { qemu: {} }` is enough there.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QemuRuntimeConfig {
-    /// `qemu-system-x86_64`.
+    /// `qemu-system-x86_64`; a bare name is looked up on PATH.
     #[serde(default = "default_qemu_binary")]
     pub qemu: PathBuf,
     #[serde(default = "default_qemu_img")]
     pub qemu_img: PathBuf,
     /// Guest kernel (bzImage, everything built in). Its digest is pinned in each
-    /// checkpoint; keep a replaced kernel at its old path until no orb sleeps on it.
+    /// checkpoint: a replaced kernel makes sleeping orbs cold-boot on their next spawn.
+    #[serde(default = "default_kernel")]
     pub kernel: PathBuf,
     #[serde(default = "default_kernel_cmdline")]
     pub kernel_cmdline: String,
-    /// DNS servers delivered to guests. Explicit: never the host's resolv.conf.
+    /// DNS servers delivered to guests. Explicit: never the host's resolv.conf, which
+    /// may point at a local stub resolver the guest cannot use.
+    #[serde(default = "default_dns_servers")]
     pub dns_servers: Vec<String>,
     /// Memory saves running at once on this host.
     #[serde(default = "default_concurrent_saves")]
@@ -177,10 +191,16 @@ pub struct QemuStaticImage {
 }
 
 fn default_qemu_binary() -> PathBuf {
-    "/usr/bin/qemu-system-x86_64".into()
+    "qemu-system-x86_64".into()
 }
 fn default_qemu_img() -> PathBuf {
-    "/usr/bin/qemu-img".into()
+    "qemu-img".into()
+}
+fn default_kernel() -> PathBuf {
+    "/usr/share/orbd/bzImage".into()
+}
+fn default_dns_servers() -> Vec<String> {
+    vec!["1.1.1.1".into(), "8.8.8.8".into()]
 }
 fn default_kernel_cmdline() -> String {
     "console=ttyS0 root=/dev/vda rw".into()

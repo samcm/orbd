@@ -51,17 +51,54 @@ fn instant_at(unix_ms: u64) -> Instant {
     }
 }
 
-/// Startup: rebuild reservations from what is actually running, then requeue every
-/// accepted-but-not-terminal receipt in acceptance order.
+/// One unit of work for an orb's actor.
+pub(crate) enum Work {
+    Op(OperationId),
+    /// Agent maintenance (drain checkpoint, restore after restart), serialized with the
+    /// orb's operations so it never races a spawn, pause or delete.
+    Maintenance(
+        Box<OrbDefinition>,
+        super::maintenance::Task,
+        tokio::sync::oneshot::Sender<super::maintenance::Outcome>,
+    ),
+}
+
+/// Startup: rebuild reservations from what is actually running, requeue every
+/// accepted-but-not-terminal receipt in acceptance order, then restore orbs the last
+/// drain checkpointed (unless their own operations or later commands supersede that).
 pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
     let defs = sh.db.call(|c| db::list_orb_definitions(c)).await?;
     for d in defs {
         let Some(rt) = runtime_for(sh, &d) else {
             continue;
         };
+        let observed = rt.inspect(d.id).await;
+        // A VMM that ended while the agent was down (host reboot, container stop
+        // without a drain) took its processes with it: record that, not "running".
+        if let Ok(RuntimeObservation::Stopped { checkpoint }) = &observed {
+            let id = d.id;
+            let row = sh.db.call(move |c| db::get_orb(c, id)).await?;
+            if row
+                .and_then(|r| r.last_state)
+                .is_some_and(|s| matches!(s.last_known(), StableOrbState::Running))
+            {
+                let state = OrbState::known(match checkpoint {
+                    Some(cp) => StableOrbState::Sleeping {
+                        checkpoint: cp.clone(),
+                    },
+                    None => StableOrbState::DiskOnlyStopped {
+                        reason: "the VM stopped while the agent was down; processes lost".into(),
+                    },
+                });
+                tracing::warn!(orb = %id, state = ?state, "orb is no longer running");
+                sh.db
+                    .call(move |c| db::set_last_state(c, id, &state))
+                    .await?;
+            }
+        }
         // An orb we cannot inspect is assumed to hold its resources.
         let running = !matches!(
-            rt.inspect(d.id).await,
+            observed,
             Ok(RuntimeObservation::Absent | RuntimeObservation::Stopped { .. })
         );
         if running {
@@ -73,14 +110,19 @@ pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
     }
     let pending = sh.db.call(|c| db::list_unfinished(c)).await?;
     tracing::info!(count = pending.len(), "requeueing unfinished operations");
+    let busy: std::collections::HashSet<OrbId> = pending.iter().map(|r| r.orb.id).collect();
     for r in pending {
         sh.token_for(r.operation_id);
         enqueue(sh, r.orb.id, r.operation_id);
     }
-    Ok(())
+    super::maintenance::restore_all(sh, &busy).await
 }
 
 pub(crate) fn enqueue(sh: &Arc<Shared>, orb: OrbId, op: OperationId) {
+    enqueue_work(sh, orb, Work::Op(op));
+}
+
+pub(crate) fn enqueue_work(sh: &Arc<Shared>, orb: OrbId, work: Work) {
     let tx = {
         let mut actors = sh.actors.lock().unwrap_or_else(|e| e.into_inner());
         actors
@@ -92,14 +134,23 @@ pub(crate) fn enqueue(sh: &Arc<Shared>, orb: OrbId, op: OperationId) {
             })
             .clone()
     };
-    let _ = tx.send(op);
+    let _ = tx.send(work);
 }
 
-async fn actor(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<OperationId>) {
+async fn actor(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Work>) {
     loop {
-        let op = tokio::select! {
+        let work = tokio::select! {
             _ = sh.shutdown.cancelled() => return,
-            o = rx.recv() => match o { Some(o) => o, None => return },
+            w = rx.recv() => match w { Some(w) => w, None => return },
+        };
+        let op = match work {
+            // Draining: queued operations stay accepted and run after the restart.
+            Work::Op(_) if sh.draining.is_cancelled() => continue,
+            Work::Op(op) => op,
+            Work::Maintenance(orb, task, done) => {
+                let _ = done.send(super::maintenance::run(&sh, &orb, task).await);
+                continue;
+            }
         };
         metrics::gauge!("orbd_agent_running_executors").increment(1.0);
         let r = run_op(&sh, op).await;
@@ -229,6 +280,7 @@ async fn run_op(sh: &Arc<Shared>, op_id: OperationId) -> anyhow::Result<()> {
             tokio::select! {
                 _ = token.cancelled() => {}
                 _ = sh.shutdown.cancelled() => {}
+                _ = sh.draining.cancelled() => {}
                 _ = tokio::time::sleep_until(work_dl.into()) => {}
             }
             wc.cancel();
@@ -244,8 +296,10 @@ async fn run_op(sh: &Arc<Shared>, op_id: OperationId) -> anyhow::Result<()> {
     };
     run.log(&format!("{action_name}: starting"));
 
-    let already_late =
-        token.is_cancelled() || sh.shutdown.is_cancelled() || Instant::now() >= work_dl;
+    let already_late = token.is_cancelled()
+        || sh.shutdown.is_cancelled()
+        || sh.draining.is_cancelled()
+        || Instant::now() >= work_dl;
     let res: Option<Result<Finished, Flow>> = if already_late {
         Some(Err(Flow::Interrupted))
     } else {
@@ -282,7 +336,7 @@ async fn run_op(sh: &Arc<Shared>, op_id: OperationId) -> anyhow::Result<()> {
         }
         Some(Err(Flow::Fatal(e))) => return Err(e),
         Some(Err(Flow::Interrupted)) | None => {
-            if sh.shutdown.is_cancelled() {
+            if sh.shutdown.is_cancelled() || sh.draining.is_cancelled() {
                 return Ok(()); // stays accepted; resumed after restart
             }
             let (code, why) = if token.is_cancelled() {

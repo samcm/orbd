@@ -185,4 +185,8 @@ pub trait GuestControl: Send + Sync {
         request: BootstrapRequest,
         ctx: &OpContext,
     ) -> Result<(), GuestError>;
+
+    /// After a memory restore that no spawn asked for (agent maintenance): steps the
+    /// guest clock and reapplies its network. No credentials, Amp's units untouched.
+    async fn resync(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), GuestError>;
 }

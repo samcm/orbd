@@ -26,7 +26,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME: usize = 64 * 1024;
 const RETRY: Duration = Duration::from_millis(200);
-const HELLO_ATTEMPT: Duration = Duration::from_secs(10);
+/// Hello timeouts per connection: 1 s, doubling to 10 s. A Hello can be lost when a
+/// restored guest drops a connection it still held from before the save.
+const HELLO_ATTEMPT_MAX: Duration = Duration::from_secs(10);
 
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for T {}
@@ -132,13 +134,15 @@ pub async fn open(
     deadline: Instant,
 ) -> Result<(Channel, gpb::HelloReply), ChannelError> {
     let mut last = ChannelError::Timeout;
+    let mut wait = Duration::from_secs(1);
     while Instant::now() < deadline {
         match connector.connect().await {
             Ok(stream) => {
                 let mut ch = Channel { stream, next_id: 0 };
                 // Bounded per connection: a guest helper that restarted meanwhile only
                 // answers on a fresh connection.
-                let attempt = (Instant::now() + HELLO_ATTEMPT).min(deadline);
+                let attempt = (Instant::now() + wait).min(deadline);
+                wait = (wait * 2).min(HELLO_ATTEMPT_MAX);
                 match ch
                     .request(gpb::host_message::Body::Hello(gpb::Hello {}), attempt)
                     .await
@@ -200,6 +204,13 @@ impl QemuRuntime {
     }
 }
 
+fn now_unix_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 fn redact(text: &str, env: &PermittedGuestEnv) -> String {
     let mut text = text.to_owned();
     for (name, value) in &env.0 {
@@ -221,6 +232,53 @@ fn interrupted(ctx: &OpContext) -> GuestError {
 
 #[async_trait]
 impl GuestControl for QemuRuntime {
+    async fn resync(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), GuestError> {
+        let recipe = self
+            .read_recipe(orb.id)
+            .map_err(|e| GuestError::Unreachable(e.to_string()))?;
+        let connector = self.connector(orb.id);
+        loop {
+            let attempt = async {
+                let (mut ch, _) = open(&connector, ctx.work_deadline).await?;
+                let resync = gpb::Resync {
+                    current_time_unix_ns: now_unix_ns(),
+                    network: Some(recipe.net.guest_config(&self.config.dns_servers)),
+                };
+                match ch
+                    .request(gpb::host_message::Body::Resync(resync), ctx.work_deadline)
+                    .await?
+                {
+                    gpb::guest_message::Body::Ack(_) => Ok(Ok(())),
+                    gpb::guest_message::Body::Error(e) if e.retry => {
+                        Err(ChannelError::Protocol(e.message))
+                    }
+                    gpb::guest_message::Body::Error(e) => Ok(Err(e.message)),
+                    other => Err(ChannelError::Protocol(format!(
+                        "unexpected Resync reply {other:?}"
+                    ))),
+                }
+            };
+            let res = tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(GuestError::Cancelled),
+                r = attempt => r,
+            };
+            match res {
+                Ok(Ok(())) => {
+                    log(ctx, "guest resynced (clock, network)");
+                    return Ok(());
+                }
+                Ok(Err(msg)) => return Err(GuestError::BootstrapFailed(msg)),
+                Err(_) if Instant::now() >= ctx.work_deadline => {
+                    return Err(GuestError::DeadlineExceeded);
+                }
+                Err(e) => {
+                    log(ctx, &format!("guest channel: {e}; reconnecting"));
+                    tokio::time::sleep(RETRY).await;
+                }
+            }
+        }
+    }
+
     /// Sends Wake (env, clock, network, cold/warm) and waits for the guest to ack the
     /// generation, within the work deadline. Idempotent per generation: a guest that
     /// already acked it (HelloReply.last_generation) is not woken twice.
@@ -295,10 +353,7 @@ impl GuestControl for QemuRuntime {
                 }
                 let wake = gpb::Wake {
                     generation: request.generation,
-                    current_time_unix_ns: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0),
+                    current_time_unix_ns: now_unix_ns(),
                     permitted_env: env
                         .0
                         .iter()

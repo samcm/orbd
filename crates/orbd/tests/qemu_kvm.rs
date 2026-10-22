@@ -16,13 +16,13 @@
 
 mod common;
 use common::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const IMAGE: &str = "example.invalid/amp-orb:latest";
 const MEMORY_MIB: u64 = 2048;
 
-fn cluster(on_checkpoint_failure: &str, cmdline_extra: &str) -> Cluster {
+fn cluster(on_checkpoint_failure: &str, cmdline_extra: &str, orbs: u64) -> Cluster {
     let kernel = std::env::var("ORBD_KVM_KERNEL").expect("set ORBD_KVM_KERNEL");
     let rootfs = std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS");
     Cluster::with_runtime(
@@ -34,7 +34,7 @@ fn cluster(on_checkpoint_failure: &str, cmdline_extra: &str) -> Cluster {
             memory_mib: MEMORY_MIB,
             disk_gib: 4,
             on_checkpoint_failure: on_checkpoint_failure.into(),
-            agent_orbs: 1,
+            agent_orbs: orbs,
             agent_runtime: format!(
                 r#"  qemu:
     kernel: {kernel}
@@ -85,18 +85,25 @@ fn qemu_pids(root: &std::path::Path) -> Vec<i32> {
     pids
 }
 
-fn orb_dir(c: &Cluster) -> PathBuf {
+/// The cluster's orb directories, oldest orb first (orb ids are time-ordered).
+fn orb_dirs(c: &Cluster) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(state(c).join("orbs"))
         .unwrap()
         .flatten()
         .map(|e| e.path())
         .collect();
+    dirs.sort();
+    dirs
+}
+
+fn orb_dir(c: &Cluster) -> PathBuf {
+    let mut dirs = orb_dirs(c);
     assert_eq!(dirs.len(), 1, "expected one orb");
     dirs.pop().unwrap()
 }
 
-fn console(c: &Cluster) -> String {
-    std::fs::read_to_string(orb_dir(c).join("logs/console.log")).unwrap_or_default()
+fn console(orb: &Path) -> String {
+    std::fs::read_to_string(orb.join("logs/console.log")).unwrap_or_default()
 }
 
 /// Counter samples in console order: `(pid, n)` for the process counter and `n` for
@@ -123,24 +130,24 @@ fn samples(console: &str) -> (Vec<(u32, u64)>, Vec<u64>) {
 }
 
 /// Waits until both counters advanced by at least two since `after`.
-fn wait_progress(c: &Cluster, after: (usize, usize)) -> ((u32, u64), u64) {
+fn wait_progress(orb: &Path, after: (usize, usize)) -> ((u32, u64), u64) {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (counter, l2) = samples(&console(c));
+        let (counter, l2) = samples(&console(orb));
         if counter.len() >= after.0 + 2 && l2.len() >= after.1 + 2 {
             return (*counter.last().unwrap(), *l2.last().unwrap());
         }
         assert!(
             Instant::now() < deadline,
             "guest counters did not advance; console tail:\n{}",
-            tail(&console(c))
+            tail(&console(orb))
         );
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-fn counts(c: &Cluster) -> (usize, usize) {
-    let (a, b) = samples(&console(c));
+fn counts(orb: &Path) -> (usize, usize) {
+    let (a, b) = samples(&console(orb));
     (a.len(), b.len())
 }
 
@@ -151,8 +158,8 @@ fn tail(s: &str) -> String {
 
 /// Every counter sample since the first boot strictly increases: no restart (processes
 /// lost) and no repeat (stale RAM replayed). Same for the nested guest's counter.
-fn assert_continuous(c: &Cluster) {
-    let (counter, l2) = samples(&console(c));
+fn assert_continuous(orb: &Path) {
+    let (counter, l2) = samples(&console(orb));
     let n: Vec<u64> = counter.iter().map(|(_, n)| *n).collect();
     assert!(
         n.windows(2).all(|w| w[1] > w[0]),
@@ -164,9 +171,9 @@ fn assert_continuous(c: &Cluster) {
     );
 }
 
-fn checkpoint_files(c: &Cluster) -> Vec<(String, u64)> {
+fn checkpoint_files(orb: &Path) -> Vec<(String, u64)> {
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(orb_dir(c).join("checkpoints")) {
+    if let Ok(rd) = std::fs::read_dir(orb.join("checkpoints")) {
         for e in rd.flatten() {
             let mem = e.path().join("memory");
             if let Ok(m) = std::fs::metadata(&mem) {
@@ -182,17 +189,17 @@ fn checkpoint_files(c: &Cluster) -> Vec<(String, u64)> {
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn sleep_preserves_processes_and_nested_guest() {
-    let mut c = cluster("cold_stop", "");
+    let mut c = cluster("cold_stop", "", 1);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
 
     let t = Instant::now();
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
     eprintln!("cold spawn (create, boot, Wake ack): {:?}", t.elapsed());
-    wait_progress(&c, (0, 0));
+    wait_progress(&orb_dir(&c), (0, 0));
 
     for round in 1..=3 {
-        let before = counts(&c);
+        let before = counts(&orb_dir(&c));
         let t = Instant::now();
         assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
         let sleep_time = t.elapsed();
@@ -200,7 +207,7 @@ fn sleep_preserves_processes_and_nested_guest() {
             qemu_pids(c.root()).is_empty(),
             "a sleeping orb must not hold a QEMU process"
         );
-        let files = checkpoint_files(&c);
+        let files = checkpoint_files(&orb_dir(&c));
         assert_eq!(
             files.len(),
             1,
@@ -225,15 +232,15 @@ fn sleep_preserves_processes_and_nested_guest() {
             .join("; ");
         eprintln!("round {round}: wake {:?} ({restored})", t.elapsed());
         assert!(
-            checkpoint_files(&c).is_empty(),
+            checkpoint_files(&orb_dir(&c)).is_empty(),
             "the restored checkpoint is discarded"
         );
-        wait_progress(&c, before);
-        assert_continuous(&c);
+        wait_progress(&orb_dir(&c), before);
+        assert_continuous(&orb_dir(&c));
     }
 
     // Agent crash with the VM running: the restarted agent adopts it.
-    let before = counts(&c);
+    let before = counts(&orb_dir(&c));
     c.kill_agent("agent-a");
     let vms = qemu_pids(c.root());
     assert_eq!(vms.len(), 1, "QEMU must outlive the agent");
@@ -244,8 +251,8 @@ fn sleep_preserves_processes_and_nested_guest() {
         "spawn after agent restart",
     );
     assert_eq!(qemu_pids(c.root()), vms, "the running VM was adopted");
-    wait_progress(&c, before);
-    assert_continuous(&c);
+    wait_progress(&orb_dir(&c), before);
+    assert_continuous(&orb_dir(&c));
 
     assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
     assert!(qemu_pids(c.root()).is_empty());
@@ -264,23 +271,23 @@ fn sleep_preserves_processes_and_nested_guest() {
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
-    let mut c = cluster("cold_stop", "");
+    let mut c = cluster("cold_stop", "", 1);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
-    wait_progress(&c, (0, 0));
+    wait_progress(&orb_dir(&c), (0, 0));
 
     let agent_log = |c: &Cluster| {
         std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap_or_default()
     };
     // Every boundary below runs against a VM that was itself restored.
-    let before = counts(&c);
+    let before = counts(&orb_dir(&c));
     assert_ok(&c.dispatch("pause", "amp-1", &[]), "warm-up pause");
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "warm-up wake");
-    wait_progress(&c, before);
+    wait_progress(&orb_dir(&c), before);
 
     let crash = |c: &mut Cluster, op: &str, point: &str| {
-        let before = counts(c);
+        let before = counts(&orb_dir(c));
         let mark = agent_log(c).len();
         c.kill_agent("agent-a");
         c.start_agent("agent-a", &format!("{point}=return"));
@@ -294,11 +301,15 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
         match op {
             "pause" => {
                 assert_eq!(vms, 0, "{point}: a paused orb must not run");
-                assert_eq!(checkpoint_files(c).len(), 1, "{point}: one checkpoint");
+                assert_eq!(
+                    checkpoint_files(&orb_dir(c)).len(),
+                    1,
+                    "{point}: one checkpoint"
+                );
             }
             _ => {
                 assert_eq!(vms, 1, "{point}: a spawned orb must run");
-                wait_progress(c, before);
+                wait_progress(&orb_dir(c), before);
             }
         }
         let logs = agent_log(c);
@@ -320,10 +331,10 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
         "agent::pause::after_stop",
     ] {
         crash(&mut c, "pause", point);
-        let before = counts(&c);
+        let before = counts(&orb_dir(&c));
         assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake");
-        wait_progress(&c, before);
-        assert_continuous(&c);
+        wait_progress(&orb_dir(&c), before);
+        assert_continuous(&orb_dir(&c));
     }
     for point in [
         "qemu::restore::after_load",
@@ -332,7 +343,7 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
     ] {
         assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
         crash(&mut c, "spawn", point);
-        assert_continuous(&c);
+        assert_continuous(&orb_dir(&c));
     }
 
     // Disk full mid-save under the cold-stop policy: the pause fails with processes
@@ -347,24 +358,142 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
         "cold-stop policy stops the VM"
     );
     assert!(
-        checkpoint_files(&c).is_empty(),
+        checkpoint_files(&orb_dir(&c)).is_empty(),
         "the partial checkpoint is gone"
     );
     // A restarted counter shows up as its count going down.
     let boots = |c: &Cluster| {
-        let n: Vec<u64> = samples(&console(c)).0.iter().map(|(_, n)| *n).collect();
+        let n: Vec<u64> = samples(&console(&orb_dir(c)))
+            .0
+            .iter()
+            .map(|(_, n)| *n)
+            .collect();
         n.windows(2).filter(|w| w[1] < w[0]).count()
     };
     let boots_before = boots(&c);
-    let before = counts(&c);
+    let before = counts(&orb_dir(&c));
     assert_ok(
         &c.dispatch("spawn", "amp-1", &[]),
         "cold boot after failed save",
     );
-    wait_progress(&c, before);
+    wait_progress(&orb_dir(&c), before);
     assert_eq!(
         boots(&c),
         boots_before + 1,
         "the spawn cold-boots a new counter"
     );
+}
+
+fn line_count(orb: &Path, pat: &str) -> usize {
+    console(orb).lines().filter(|l| l.contains(pat)).count()
+}
+
+/// A graceful agent stop (SIGTERM, as a container stop sends) checkpoints both running
+/// orbs and leaves no VMM behind; the next agent start restores them without any Amp
+/// command: processes and nested guests continue, Amp's bootstrap is not restarted, and
+/// the guest only had its clock and network resynced. Then a drain cut short by kill -9
+/// (with the VMMs dying alongside, as in a container) ends honestly: what was not saved
+/// is reported stopped with processes lost and cold-boots on the next spawn.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+fn graceful_agent_restart_keeps_running_orbs() {
+    let mut c = cluster("cold_stop", "", 2);
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn 2");
+    let orbs = orb_dirs(&c);
+    for o in &orbs {
+        wait_progress(o, (0, 0));
+    }
+    let bootstraps: Vec<usize> = orbs
+        .iter()
+        .map(|o| line_count(o, "fake-amp-bootstrap:"))
+        .collect();
+    let before: Vec<(usize, usize)> = orbs.iter().map(|o| counts(o)).collect();
+
+    let t = Instant::now();
+    let status = c.terminate_agent("agent-a", Duration::from_secs(300));
+    eprintln!("drain took {:?}, agent exit {status:?}", t.elapsed());
+    assert!(status.success());
+    assert!(qemu_pids(c.root()).is_empty(), "drained orbs hold no VMM");
+    for o in &orbs {
+        assert_eq!(checkpoint_files(o).len(), 1, "one checkpoint per orb");
+    }
+
+    let t = Instant::now();
+    c.start_agent("agent-a", "");
+    c.wait_connected(1);
+    eprintln!("agent ready with restored orbs after {:?}", t.elapsed());
+    let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap();
+    for l in log.lines().filter(|l| {
+        l.contains("drain") || l.contains("restore finished") || l.contains("after agent restart")
+    }) {
+        eprintln!("  {}", l.split_once("Z ").map_or(l, |(_, r)| r));
+    }
+    assert_eq!(qemu_pids(c.root()).len(), 2, "both orbs run again");
+    for (i, o) in orbs.iter().enumerate() {
+        wait_progress(o, before[i]);
+        assert_continuous(o);
+        assert!(
+            checkpoint_files(o).is_empty(),
+            "restored checkpoints are discarded"
+        );
+        assert_eq!(
+            line_count(o, "fake-amp-bootstrap:"),
+            bootstraps[i],
+            "Amp's bootstrap must not be restarted without a spawn"
+        );
+        assert!(line_count(o, "orbd-guest: resync") >= 1, "guest resynced");
+    }
+    // A spawn after the maintenance restore is an ordinary warm wake.
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn after restore");
+    assert_continuous(&orbs[0]);
+
+    // Drain cut short: the first save is slowed down, the agent is killed mid-save and
+    // every VMM dies with it.
+    c.terminate_agent("agent-a", Duration::from_secs(300));
+    c.start_agent("agent-a", "qemu::save::throttle=return(500)");
+    c.wait_connected(1);
+    assert_eq!(qemu_pids(c.root()).len(), 2);
+    c.signal_agent("agent-a", "TERM");
+    std::thread::sleep(Duration::from_secs(5));
+    c.kill_agent("agent-a");
+    for pid in qemu_pids(c.root()) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    let max_before: Vec<u64> = orbs
+        .iter()
+        .map(|o| {
+            samples(&console(o))
+                .0
+                .iter()
+                .map(|(_, n)| *n)
+                .max()
+                .unwrap()
+        })
+        .collect();
+    c.start_agent("agent-a", "");
+    c.wait_connected(1);
+    assert!(qemu_pids(c.root()).is_empty(), "nothing unsaved is resumed");
+    let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap();
+    let honest: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("no longer running") || l.contains("not restorable"))
+        .collect();
+    eprintln!("after the cut-short drain:\n{}", honest.join("\n"));
+    assert!(!honest.is_empty());
+    for (i, o) in orbs.iter().enumerate() {
+        assert!(
+            checkpoint_files(o).is_empty(),
+            "no unfinished save survives"
+        );
+        let job = c.dispatch("spawn", &format!("amp-{}", i + 1), &[]);
+        assert_ok(&job, "spawn after a cut-short drain");
+        let before = counts(o);
+        let ((_, n), _) = wait_progress(o, before);
+        assert!(n < max_before[i], "a cold boot restarts the counter");
+    }
 }

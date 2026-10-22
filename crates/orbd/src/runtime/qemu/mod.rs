@@ -242,10 +242,12 @@ impl QemuRuntime {
         if !config.kernel.is_file() {
             return Err(other("kernel", &config.kernel.display()));
         }
-        let out = std::process::Command::new(&config.qemu)
+        let qemu_path = on_path(&config.qemu)
+            .ok_or_else(|| other("qemu", &format!("{} not found", config.qemu.display())))?;
+        let out = std::process::Command::new(&qemu_path)
             .arg("--version")
             .output()
-            .map_err(|e| other(&config.qemu.display().to_string(), &e))?;
+            .map_err(|e| other(&qemu_path.display().to_string(), &e))?;
         let version = String::from_utf8_lossy(&out.stdout)
             .lines()
             .next()
@@ -253,8 +255,8 @@ impl QemuRuntime {
             .trim()
             .to_owned();
         let qemu = QemuIdentity {
-            path: config.qemu.clone(),
-            sha256: sha256_file(&config.qemu).map_err(|e| other("qemu binary", &e))?,
+            sha256: sha256_file(&qemu_path).map_err(|e| other("qemu binary", &e))?,
+            path: qemu_path,
             version,
         };
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
@@ -1645,6 +1647,16 @@ async fn run_tool(ctx: &OpContext, program: &Path, args: &[String]) -> Result<()
         });
     }
     Ok(())
+}
+
+/// `program` itself if it has a directory part, else its first match on PATH.
+fn on_path(program: &Path) -> Option<PathBuf> {
+    if program.components().count() > 1 {
+        return Some(program.to_owned());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(program))
+        .find(|p| p.is_file())
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {

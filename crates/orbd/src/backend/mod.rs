@@ -69,6 +69,8 @@ pub enum Availability {
     Unavailable {
         reason: String,
     },
+    /// Connected but shutting down: takes no new commands until it reconnects.
+    Draining,
 }
 
 #[derive(Clone, Debug)]
