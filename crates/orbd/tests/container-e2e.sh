@@ -42,6 +42,9 @@ cleanup() {
 trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Not `grep -q`: it exits at the first match, and under pipefail the writer's SIGPIPE
+# then fails the whole pipeline.
+has() { grep "$@" >/dev/null; }
 wait_for() { # SECONDS WHAT COMMAND...
     local deadline=$((SECONDS + $1)) what=$2
     shift 2
@@ -86,7 +89,7 @@ wait_counter() { # N
     done
 }
 vmms() { docker top "$agent" -eo pid,args | grep -c '[q]emu-system' || true; }
-connected() { docker exec "$coord" orbd agent list | grep -qP '^agent-1\tconnected\t'; }
+connected() { docker exec "$coord" orbd agent list | has -P '^agent-1\tconnected\t'; }
 
 cat >"$work/orbd.yaml" <<EOF
 public_url: https://$coord:7443
@@ -135,7 +138,7 @@ echo "== docker stop took $((SECONDS - t))s"
 code=$(docker inspect -f '{{.State.ExitCode}}' "$agent")
 [ "$code" = 0 ] || fail "agent container exited with $code"
 docker logs "$agent" 2>&1 | strip | grep -E 'drain' | sed 's/^/   /'
-docker logs "$agent" 2>&1 | strip | grep -qE 'drain finished saved=1 not_running=0 failed=0' ||
+docker logs "$agent" 2>&1 | strip | has -E 'drain finished saved=1 not_running=0 failed=0' ||
     fail "the agent did not save the running orb on stop"
 disconnected() { ! connected; }
 wait_for 30 "the coordinator to drop the agent" disconnected
@@ -144,7 +147,7 @@ t=$SECONDS
 docker start "$agent" >/dev/null
 wait_for 120 "the agent to reconnect" connected
 echo "== docker start: agent connected after $((SECONDS - t))s"
-docker logs "$agent" 2>&1 | strip | grep -qE 'maintenance restore finished restored=1 not_restored=0' ||
+docker logs "$agent" 2>&1 | strip | has -E 'maintenance restore finished restored=1 not_restored=0' ||
     fail "the agent did not restore the orb on start"
 [ "$(vmms)" = 1 ] || fail "the restored orb has no QEMU process"
 read -r pid2 n < <(wait_counter "$n")
