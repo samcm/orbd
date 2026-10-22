@@ -1,0 +1,93 @@
+name: ci
+
+# Pull requests (including forks) run with a read-only token on GitHub-hosted
+# runners only. Nothing here is privileged; see the disabled kvm job below.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", orbd/failpoints]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets --locked --features "${{ matrix.features }}" -- -D warnings
+
+  test:
+    name: test (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", orbd/failpoints]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --workspace --locked --features "${{ matrix.features }}"
+
+  build:
+    uses: ./.github/workflows/build.yml
+
+  # Privileged QEMU/KVM tests on a self-hosted runner. Disabled until such a
+  # runner exists. Before enabling:
+  # - Move this job to its own workflow triggered only by `push` to main and
+  #   `workflow_dispatch`. A pull request can edit workflow files, so an `if:`
+  #   guard in a workflow that runs on `pull_request` does not protect the host.
+  # - Register the runner so it only accepts that workflow (an org runner group
+  #   limited to selected workflows), make it ephemeral, and keep fork PR
+  #   approval required in the repository settings.
+  #
+  # kvm:
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   needs: [test]
+  #   runs-on: [self-hosted, linux, x64, kvm]
+  #   timeout-minutes: 60
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         persist-credentials: false
+  #     - run: test -w /dev/kvm
+  #     - run: cargo test --workspace --locked --features orbd/failpoints -- --ignored kvm

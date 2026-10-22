@@ -1,0 +1,59 @@
+# Static musl release binaries, shared by ci.yml and release.yml.
+name: build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  ZIG_VERSION: 0.17.0
+  CARGO_ZIGBUILD_VERSION: 0.24.0
+
+jobs:
+  musl:
+    name: musl (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      # Zig is the C cross toolchain for bundled SQLite (rusqlite) and ring.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo zigbuild --locked --release -p orbd --target ${{ matrix.target }}
+      - name: Check binary is static and runs
+        run: |
+          bin=target/${{ matrix.target }}/release/orbd
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-musl ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+            qemu-aarch64-static "$bin" --version
+          else
+            "$bin" --version
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: orbd-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/orbd
+          if-no-files-found: error
+          retention-days: 14
