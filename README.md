@@ -126,26 +126,6 @@ one orb shape.
 _TODO._ Each offering needs its own orb provider token from your Amp workspace settings.
 Keep tokens out of configuration files that you commit.
 
-## Dependency updates
-
-Dependabot opens one grouped pull request per week for Cargo and one for GitHub Actions,
-plus individual pull requests for major updates (including 0.x minor bumps, which Cargo
-treats as breaking). Nothing merges automatically. Before merging, a maintainer:
-
-- reads the upstream changelog or release notes, and the code diff between versions for
-  anything touching build scripts, proc macros, `unsafe`, networking or crypto;
-- checks advisories (`cargo deny` runs in CI) and supply-chain signals: changed
-  maintainers or publishers, yanked versions, new transitive dependencies, a sudden jump
-  in what a crate pulls in;
-- for GitHub Actions, checks the new version is still pinned by commit SHA and comes from
-  the expected owner;
-- requires CI (`ci-ok`) to be green and runs the relevant tests locally, including the
-  real-process crash-recovery suite (`cargo test --features failpoints`) for changes to
-  crypto, storage or RPC crates.
-
-The PR then gets a short comment saying what was checked, and is merged, fixed, or
-closed with a reason.
-
 ## License
 
 [MIT](LICENSE)
