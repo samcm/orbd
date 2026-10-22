@@ -83,6 +83,8 @@ qemu_common() {
 		-machine q35,accel=kvm -cpu host -smp "$VCPUS" -m "$MEMORY"
 		-nographic -nodefaults -serial "file:$1" -monitor none
 		-device virtio-rng-pci
+		# Hands pages the guest frees back to this orb.
+		-device virtio-balloon-pci,free-page-reporting=on
 		-drive "file=$2,if=virtio,cache=unsafe,discard=unmap,detect-zeroes=unmap"
 		-drive "file=$3,if=virtio,media=cdrom,readonly=on"
 	)

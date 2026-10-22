@@ -77,5 +77,8 @@ export DOCKER_HOST=$(dev/docker-hosts/hostctl docker-sock 1)   # ssh-forwarded u
   `10.0.2.2` (so do containers in it, through the guest's NAT); only SSH is forwarded in,
   on `127.0.0.1:$((2220+N))`.
 
-Sizes: `ORBD_HOST_VCPUS` (4) and `ORBD_HOST_MEMORY` (8G) per host; memory is allocated as
-the guest touches it. State lives in `ORBD_HOSTS_STATE` (`~/.cache/orbd-docker-hosts`).
+Sizes: `ORBD_HOST_VCPUS` (4) and `ORBD_HOST_MEMORY` (8G) per host. Memory is allocated
+as the guest touches it and freed pages are handed back (virtio-balloon free page
+reporting), but the guest's page cache keeps its share, so budget the full size per VM
+(the base build is a VM too): two hosts need up to ~17 GiB of the orb's memory limit
+(`cat /sys/fs/cgroup/memory.max`), or the orb's OOM killer stops QEMU. State lives in `ORBD_HOSTS_STATE` (`~/.cache/orbd-docker-hosts`).
