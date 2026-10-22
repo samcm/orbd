@@ -80,58 +80,67 @@ impl Cluster {
         );
 
         let pki = root.join("pki");
-        let mut coord = format!(
-            r#"
-[coordinator]
-state_dir = "{root}/coordinator"
-dispatch_socket = "{root}/coordinator/dispatch.sock"
-secret_key_file = "{root}/coordinator.key"
-metrics_listen = "127.0.0.1:{metrics_port}"
+        let agents: String = agent_ids
+            .iter()
+            .map(|a| format!("      - id: {a}\n"))
+            .collect();
+        let coord = format!(
+            r#"coordinator:
+  state_dir: {root}/coordinator
+  dispatch_socket: {root}/coordinator/dispatch.sock
+  secret_key_file: {root}/coordinator.key
+  metrics_listen: 127.0.0.1:{metrics_port}
 
-[[amp_endpoint]]
-id = "amp"
-url = "https://ampcode.com"
+amp_endpoints:
+  - id: amp
+    url: https://ampcode.com
 
-[[backend]]
-kind = "agent_fleet"
-id = "fleet"
-listen = "127.0.0.1:{control_port}"
-heartbeat_interval_ms = 300
-tls = {{ certificate_file = "{pki}/localhost.pem", private_key_file = "{pki}/localhost.key", ca_file = "{pki}/ca.pem" }}
-
-[[offering]]
-id = "{OFFERING}"
-amp_endpoint = "amp"
-backend = "fleet"
-runtime = "fake"
-resources = {{ vcpus = 2, memory_mib = 2048, disk_gib = 4 }}
-pause = {{ mode = "memory_preserving", on_checkpoint_failure = "cold_stop" }}
+backends:
+  - kind: agent_fleet
+    id: fleet
+    listen: 127.0.0.1:{control_port}
+    heartbeat_interval_ms: 300
+    tls:
+      certificate_file: {pki}/localhost.pem
+      private_key_file: {pki}/localhost.key
+      ca_file: {pki}/ca.pem
+    agents:
+{agents}
+offerings:
+  - id: {OFFERING}
+    amp_endpoint: amp
+    backend: fleet
+    runtime: fake
+    resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}
+    pause: {{ mode: memory_preserving, on_checkpoint_failure: cold_stop }}
 "#,
             root = root.display(),
             pki = pki.display(),
         );
         for a in agent_ids {
-            coord.push_str(&format!("\n[[backend.agent]]\nid = \"{a}\"\n"));
             let agent_dir = root.join("agents").join(a);
             write(
                 &agent_dir.join("secret.key"),
                 orbd::secrets::SecretKey::generate_hex(),
             );
             write(
-                &agent_dir.join("agent.toml"),
+                &agent_dir.join("agent.yaml"),
                 format!(
-                    r#"
-[agent]
-id = "{a}"
-coordinator_url = "https://localhost:{control_port}"
-state_dir = "{d}/state"
-run_dir = "{d}/run"
-secret_key_file = "{d}/secret.key"
-capacity = {{ vcpus = {cpus}, memory_mib = {mem}, disk_gib = {disk} }}
-tls = {{ certificate_file = "{pki}/{a}.pem", private_key_file = "{pki}/{a}.key", ca_file = "{pki}/ca.pem" }}
+                    r#"agent:
+  id: {a}
+  coordinator_url: https://localhost:{control_port}
+  state_dir: {d}/state
+  run_dir: {d}/run
+  secret_key_file: {d}/secret.key
+  capacity: {{ vcpus: {cpus}, memory_mib: {mem}, disk_gib: {disk} }}
+  tls:
+    certificate_file: {pki}/{a}.pem
+    private_key_file: {pki}/{a}.key
+    ca_file: {pki}/ca.pem
 
-[runtime.fake]
-memory_preserving_sleep = true
+runtime:
+  fake:
+    memory_preserving_sleep: true
 "#,
                     d = agent_dir.display(),
                     pki = pki.display(),
@@ -141,7 +150,7 @@ memory_preserving_sleep = true
                 ),
             );
         }
-        write(&root.join("coordinator.toml"), coord);
+        write(&root.join("coordinator.yaml"), coord);
 
         Self {
             dir,
@@ -187,7 +196,7 @@ memory_preserving_sleep = true
     }
 
     pub fn start_coordinator(&mut self, failpoints: &str) {
-        let cfg = self.root().join("coordinator.toml");
+        let cfg = self.root().join("coordinator.yaml");
         let child = self.spawn_orbd(
             &["coordinator", "--config", cfg.to_str().unwrap()],
             "coordinator.log",
@@ -199,7 +208,7 @@ memory_preserving_sleep = true
     }
 
     pub fn start_agent(&mut self, id: &str, failpoints: &str) {
-        let cfg = self.root().join("agents").join(id).join("agent.toml");
+        let cfg = self.root().join("agents").join(id).join("agent.yaml");
         let child = self.spawn_orbd(
             &["agent", "--config", cfg.to_str().unwrap()],
             &format!("agent-{id}.log"),

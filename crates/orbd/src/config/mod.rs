@@ -1,4 +1,4 @@
-//! TOML configuration. Everything here is deployment input; the app ships no
+//! YAML configuration. Everything here is deployment input; the app ships no
 //! deployment-specific defaults (no hosts, tokens, offerings or budgets).
 //! Unknown fields are rejected. Units are normalised to exact integer bytes at load.
 
@@ -18,18 +18,18 @@ pub enum ConfigError {
     #[error("parsing {path}: {source}")]
     Parse {
         path: String,
-        source: Box<toml::de::Error>,
+        source: Box<serde_saphyr::Error>,
     },
     #[error("invalid configuration: {0}")]
     Invalid(String),
 }
 
-pub(crate) fn load_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigError> {
+pub(crate) fn load_yaml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.display().to_string(),
         source,
     })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+    serde_saphyr::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.display().to_string(),
         source: Box::new(source),
     })

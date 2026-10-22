@@ -1,6 +1,6 @@
-//! Agent configuration (`orbd agent --config agent.toml`).
+//! Agent configuration (`orbd agent --config agent.yaml`).
 
-use super::{ConfigError, ResourcesConfig, TlsFiles, load_toml};
+use super::{ConfigError, ResourcesConfig, TlsFiles, load_yaml};
 use crate::model::AgentId;
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -105,7 +105,7 @@ pub struct DockerRuntimeConfig {
 
 impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let cfg: Self = load_toml(path)?;
+        let cfg: Self = load_yaml(path)?;
         cfg.agent.capacity.to_resources()?;
         if cfg.runtime.fake.is_none() && cfg.runtime.docker.is_none() {
             return Err(ConfigError::Invalid("no runtime configured".into()));

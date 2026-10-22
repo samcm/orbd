@@ -1,6 +1,6 @@
-//! Coordinator configuration (`orbd coordinator --config coordinator.toml`).
+//! Coordinator configuration (`orbd coordinator --config coordinator.yaml`).
 
-use super::{ConfigError, ResourcesConfig, TlsFiles, load_toml};
+use super::{ConfigError, ResourcesConfig, TlsFiles, load_yaml};
 use crate::model::{
     AgentId, AmpEndpointId, BackendId, CapabilityRequirements, CheckpointFailurePolicy,
     ExecutionTarget, NestedKvmRequirement, Offering, OfferingId, PausePolicy, RuntimeKind,
@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct CoordinatorConfig {
     pub coordinator: CoordinatorSection,
-    #[serde(rename = "amp_endpoint", default)]
+    #[serde(default)]
     pub amp_endpoints: Vec<AmpEndpointConfig>,
-    #[serde(rename = "backend", default)]
+    #[serde(default)]
     pub backends: Vec<BackendConfig>,
-    #[serde(rename = "offering", default)]
+    #[serde(default)]
     pub offerings: Vec<OfferingConfig>,
 }
 
@@ -85,7 +85,7 @@ pub struct FleetBackendConfig {
     pub tls: TlsFiles,
     /// Agents allowed to connect. Each agent's certificate must name its id
     /// (subject CN or a DNS SAN).
-    #[serde(rename = "agent", default)]
+    #[serde(default)]
     pub agents: Vec<AuthorizedAgent>,
     /// Heartbeat interval sent to agents in `Welcome`.
     #[serde(default = "default_heartbeat_ms")]
@@ -173,7 +173,7 @@ impl OfferingConfig {
 
 impl CoordinatorConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let cfg: Self = load_toml(path)?;
+        let cfg: Self = load_yaml(path)?;
         cfg.validate()?;
         Ok(cfg)
     }

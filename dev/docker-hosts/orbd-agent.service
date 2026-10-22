@@ -5,9 +5,9 @@ Wants=network-online.target
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/local/bin/orbd agent --config /etc/orbd/agent.toml
+ExecStart=/usr/local/bin/orbd agent --config /etc/orbd/agent.yaml
 Environment=RUST_LOG=info
-# Matches state_dir/run_dir = /var/lib/orbd, /run/orbd in agent.toml.
+# Matches state_dir/run_dir = /var/lib/orbd, /run/orbd in agent.yaml.
 StateDirectory=orbd
 RuntimeDirectory=orbd
 RuntimeDirectoryPreserve=yes

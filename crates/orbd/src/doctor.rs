@@ -148,7 +148,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     let mut qemu_img = PathBuf::from("qemu-img");
     if let Some(config) = &opts.config {
         let text = std::fs::read_to_string(config)?;
-        let v: toml::Value = toml::from_str(&text)?;
+        let v: serde_json::Value = serde_saphyr::from_str(&text)?;
         let get = |section: &[&str], key: &str| -> Option<PathBuf> {
             let mut t = &v;
             for s in section {

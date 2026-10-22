@@ -303,13 +303,13 @@ cmd_install_orbd() {
 	local tmp=/tmp/orbd-install.$$
 	ssh -F "$SSH_CONFIG" "$host" "rm -rf $tmp && mkdir -p $tmp/files"
 	scp -q -F "$SSH_CONFIG" "$bin" "$host:$tmp/orbd"
-	scp -q -F "$SSH_CONFIG" "$cfg" "$host:$tmp/agent.toml"
+	scp -q -F "$SSH_CONFIG" "$cfg" "$host:$tmp/agent.yaml"
 	[[ $# -eq 0 ]] || scp -q -F "$SSH_CONFIG" "$@" "$host:$tmp/files/"
 	scp -q -F "$SSH_CONFIG" "$HERE/orbd-agent.service" "$host:$tmp/orbd-agent.service"
 	ssh -F "$SSH_CONFIG" "$host" "set -e
 		sudo install -m 0755 $tmp/orbd /usr/local/bin/orbd
 		sudo install -d -m 0700 /etc/orbd
-		sudo install -m 0600 $tmp/agent.toml /etc/orbd/agent.toml
+		sudo install -m 0600 $tmp/agent.yaml /etc/orbd/agent.yaml
 		for f in $tmp/files/*; do [ -e \"\$f\" ] && sudo install -m 0600 \"\$f\" /etc/orbd/; done
 		sudo install -m 0644 $tmp/orbd-agent.service /etc/systemd/system/orbd-agent.service
 		rm -rf $tmp

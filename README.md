@@ -60,53 +60,60 @@ or aarch64) and one or more agent hosts with the runtime you want (Docker for no
 2. **Certificates.** Create a CA, a server certificate for the coordinator, and a client
    certificate per agent whose CN (or DNS SAN) is the agent's id.
 3. **Secret keys.** `orbd gen-key > key` on each host, mode 0600.
-4. **Coordinator** — `orbd coordinator --config coordinator.toml`:
+4. **Coordinator** — `orbd coordinator --config coordinator.yaml`:
 
-   ```toml
-   [coordinator]
-   state_dir = "/var/lib/orbd"
-   dispatch_socket = "/run/orbd/dispatch.sock"
-   secret_key_file = "/etc/orbd/key"
-   metrics_listen = "127.0.0.1:9464"
+   ```yaml
+   coordinator:
+     state_dir: /var/lib/orbd
+     dispatch_socket: /run/orbd/dispatch.sock
+     secret_key_file: /etc/orbd/key
+     metrics_listen: 127.0.0.1:9464
 
-   [[amp_endpoint]]
-   id = "amp"
-   url = "https://ampcode.com"
+   amp_endpoints:
+     - id: amp
+       url: https://ampcode.com
 
-   [[backend]]
-   kind = "agent_fleet"
-   id = "fleet"
-   listen = "0.0.0.0:7443"
-   tls = { certificate_file = "/etc/orbd/server.pem", private_key_file = "/etc/orbd/server.key", ca_file = "/etc/orbd/ca.pem" }
-   [[backend.agent]]
-   id = "host-1"
+   backends:
+     - kind: agent_fleet
+       id: fleet
+       listen: 0.0.0.0:7443
+       tls:
+         certificate_file: /etc/orbd/server.pem
+         private_key_file: /etc/orbd/server.key
+         ca_file: /etc/orbd/ca.pem
+       agents:
+         - id: host-1
 
-   [[offering]]
-   id = "docker-2vcpu-4gb"
-   amp_endpoint = "amp"
-   provider_token_file = "/etc/orbd/docker-2vcpu-4gb.token"
-   backend = "fleet"
-   runtime = "docker"
-   resources = { vcpus = 2, memory_mib = 4096, disk_gib = 20 }
-   pause = { mode = "disk_only" }
+   offerings:
+     - id: docker-2vcpu-4gb
+       amp_endpoint: amp
+       provider_token_file: /etc/orbd/docker-2vcpu-4gb.token
+       backend: fleet
+       runtime: docker
+       resources: { vcpus: 2, memory_mib: 4096, disk_gib: 20 }
+       pause: { mode: disk_only }
    ```
 
-5. **Agent** — `orbd agent --config agent.toml` on each host:
+5. **Agent** — `orbd agent --config agent.yaml` on each host:
 
-   ```toml
-   [agent]
-   id = "host-1"
-   coordinator_url = "https://coordinator.example:7443"
-   state_dir = "/var/lib/orbd"
-   run_dir = "/run/orbd"
-   secret_key_file = "/etc/orbd/key"
-   capacity = { vcpus = 16, memory_mib = 32768, disk_gib = 500 }
-   tls = { certificate_file = "/etc/orbd/host-1.pem", private_key_file = "/etc/orbd/host-1.key", ca_file = "/etc/orbd/ca.pem" }
+   ```yaml
+   agent:
+     id: host-1
+     coordinator_url: https://coordinator.example:7443
+     state_dir: /var/lib/orbd
+     run_dir: /run/orbd
+     secret_key_file: /etc/orbd/key
+     capacity: { vcpus: 16, memory_mib: 32768, disk_gib: 500 }
+     tls:
+       certificate_file: /etc/orbd/host-1.pem
+       private_key_file: /etc/orbd/host-1.key
+       ca_file: /etc/orbd/ca.pem
 
-   [runtime.docker]
-   dns_servers = ["1.1.1.1", "8.8.8.8"]
-   # Amp's orb image is ~6 GB; spawns fail until it is pulled.
-   prewarm_images = ["us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest"]
+   runtime:
+     docker:
+       dns_servers: [1.1.1.1, 8.8.8.8]
+       # Amp's orb image is ~6 GB; spawns fail until it is pulled.
+       prewarm_images: [us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest]
    ```
 
 Threads you create on that provider in Amp then run on your hosts. Prometheus metrics

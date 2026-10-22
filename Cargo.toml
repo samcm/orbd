@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 fail = "0.5"
-toml = "1"
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "router"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
