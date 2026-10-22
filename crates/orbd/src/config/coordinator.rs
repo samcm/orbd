@@ -34,9 +34,21 @@ pub struct CoordinatorSection {
     pub secret_key_file: PathBuf,
     /// Prometheus listener, e.g. `127.0.0.1:9464`. Disabled when absent.
     pub metrics_listen: Option<SocketAddr>,
+    /// Executable the generated `orbd-dispatch` wrapper runs as `<exe> dispatch`.
+    /// Defaults to the running orbd binary; set it to a stable path (e.g.
+    /// `/usr/local/bin/orbd`) if the binary is replaced in place on upgrade.
+    pub dispatch_exe: Option<PathBuf>,
     /// Amp CLI used for `amp orb provider` children.
     #[serde(default = "default_amp_cli")]
     pub amp_cli: PathBuf,
+    /// How often to run `amp update` for `amp_cli` (seconds; 0 disables). Providers are
+    /// restarted onto a new version between jobs. The CLI never self-updates.
+    #[serde(default = "default_amp_cli_update_interval")]
+    pub amp_cli_update_interval_secs: u64,
+}
+
+fn default_amp_cli_update_interval() -> u64 {
+    6 * 60 * 60
 }
 
 fn default_amp_cli() -> PathBuf {

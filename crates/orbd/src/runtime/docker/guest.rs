@@ -19,6 +19,10 @@ use zeroize::Zeroizing;
 /// Runs `amp orb bootstrap` for the life of the orb; restarts only on failure.
 const BOOTSTRAP_UNIT: &str = "amp-headless-bootstrap.service";
 const HEADLESS_UNIT: &str = "amp-headless.service";
+/// Transient unit used only when the image lacks [`BOOTSTRAP_UNIT`]: runs the documented
+/// contract (`amp orb bootstrap` as `user` with ORB_TOKEN and AMP_URL), reading the same
+/// env file so the token never appears in a command line.
+const FALLBACK_UNIT: &str = "orbd-amp-bootstrap.service";
 /// The bootstrap unit's `EnvironmentFile=`.
 const ENV_FILE: &str = "/home/user/.config/amp/headless-bootstrap.env";
 /// Runs as `user` (so the file is owned by it); the file body arrives on stdin.
@@ -156,9 +160,24 @@ impl DockerRuntime {
         }
     }
 
+    /// True when systemd in the orb can load `unit` (it exists in the image).
+    async fn has_unit(&self, orb: OrbId, unit: &str, ctx: &OpContext) -> Result<bool, GuestError> {
+        let out = self
+            .guest_exec(
+                orb,
+                "root",
+                &["systemctl", "show", "--property=LoadState", "--value", unit],
+                None,
+                ctx,
+            )
+            .await?;
+        Ok(out.stdout.trim() == "loaded")
+    }
+
     async fn bootstrap_unit_state(
         &self,
         orb: OrbId,
+        unit: &str,
         ctx: &OpContext,
     ) -> Result<UnitState, GuestError> {
         let out = self
@@ -169,7 +188,7 @@ impl DockerRuntime {
                     "systemctl",
                     "show",
                     "--property=ActiveState,SubState,MainPID,NRestarts",
-                    BOOTSTRAP_UNIT,
+                    unit,
                 ],
                 None,
                 ctx,
@@ -181,6 +200,7 @@ impl DockerRuntime {
     async fn bootstrap_failed(
         &self,
         orb: OrbId,
+        unit: &str,
         env: &PermittedGuestEnv,
         what: &str,
         ctx: &OpContext,
@@ -192,7 +212,7 @@ impl DockerRuntime {
                 &[
                     "journalctl",
                     "--unit",
-                    BOOTSTRAP_UNIT,
+                    unit,
                     "--lines=40",
                     "--no-pager",
                     "--output=short-iso",
@@ -304,24 +324,85 @@ impl GuestControl for DockerRuntime {
         }
         log(ctx, &format!("wrote {ENV_FILE}"));
 
-        log(ctx, &format!("restarting {BOOTSTRAP_UNIT}"));
-        let out = self
-            .guest_exec(
-                orb.id,
-                "root",
-                &["systemctl", "restart", BOOTSTRAP_UNIT],
-                None,
+        // Prefer the image's own unit: its ExecStartPre updates the orb's amp CLI on
+        // every start and wake, and Amp updates the orb plumbing during setup.
+        let unit = if self.has_unit(orb.id, BOOTSTRAP_UNIT, ctx).await? {
+            log(ctx, &format!("restarting {BOOTSTRAP_UNIT}"));
+            let out = self
+                .guest_exec(
+                    orb.id,
+                    "root",
+                    &["systemctl", "restart", BOOTSTRAP_UNIT],
+                    None,
+                    ctx,
+                )
+                .await?;
+            if out.code != 0 {
+                let what = format!(
+                    "systemctl restart {BOOTSTRAP_UNIT} failed: {}",
+                    out.stderr.trim()
+                );
+                return Err(self
+                    .bootstrap_failed(orb.id, BOOTSTRAP_UNIT, env, &what, ctx)
+                    .await);
+            }
+            BOOTSTRAP_UNIT
+        } else {
+            tracing::warn!(orb = %orb.id, "image has no {BOOTSTRAP_UNIT}; using fallback `amp orb bootstrap`");
+            log(
                 ctx,
-            )
-            .await?;
-        if out.code != 0 {
-            let what = format!(
-                "systemctl restart {BOOTSTRAP_UNIT} failed: {}",
-                out.stderr.trim()
+                &format!(
+                    "image has no {BOOTSTRAP_UNIT}; falling back to `amp orb bootstrap` ({FALLBACK_UNIT})"
+                ),
             );
-            return Err(self.bootstrap_failed(orb.id, env, &what, ctx).await);
-        }
-        let first = self.bootstrap_unit_state(orb.id, ctx).await?;
+            let _ = self
+                .guest_exec(
+                    orb.id,
+                    "root",
+                    &["systemctl", "stop", FALLBACK_UNIT],
+                    None,
+                    ctx,
+                )
+                .await?;
+            let _ = self
+                .guest_exec(
+                    orb.id,
+                    "root",
+                    &["systemctl", "reset-failed", FALLBACK_UNIT],
+                    None,
+                    ctx,
+                )
+                .await?;
+            let env_file = format!("--property=EnvironmentFile={ENV_FILE}");
+            let out = self
+                .guest_exec(
+                    orb.id,
+                    "root",
+                    &[
+                        "systemd-run",
+                        "--unit",
+                        FALLBACK_UNIT,
+                        "--uid=user",
+                        "--gid=user",
+                        "--property=Restart=on-failure",
+                        &env_file,
+                        "/bin/sh",
+                        "-lc",
+                        "exec amp orb bootstrap",
+                    ],
+                    None,
+                    ctx,
+                )
+                .await?;
+            if out.code != 0 {
+                let what = format!("systemd-run {FALLBACK_UNIT} failed: {}", out.stderr.trim());
+                return Err(self
+                    .bootstrap_failed(orb.id, FALLBACK_UNIT, env, &what, ctx)
+                    .await);
+            }
+            FALLBACK_UNIT
+        };
+        let first = self.bootstrap_unit_state(orb.id, unit, ctx).await?;
         let settled_at = Instant::now() + BOOTSTRAP_SETTLE;
         let mut state = first.clone();
         while state.running()
@@ -329,17 +410,17 @@ impl GuestControl for DockerRuntime {
             && state.restarts == first.restarts
         {
             if Instant::now() >= settled_at {
-                log(ctx, &format!("{BOOTSTRAP_UNIT} is running"));
+                log(ctx, &format!("{unit} is running"));
                 return Ok(());
             }
             bounded(ctx, tokio::time::sleep(POLL)).await?;
-            state = self.bootstrap_unit_state(orb.id, ctx).await?;
+            state = self.bootstrap_unit_state(orb.id, unit, ctx).await?;
         }
         let what = format!(
-            "{BOOTSTRAP_UNIT} did not stay running ({}/{}, restarts {})",
+            "{unit} did not stay running ({}/{}, restarts {})",
             state.active, state.sub, state.restarts
         );
-        Err(self.bootstrap_failed(orb.id, env, &what, ctx).await)
+        Err(self.bootstrap_failed(orb.id, unit, env, &what, ctx).await)
     }
 }
 
