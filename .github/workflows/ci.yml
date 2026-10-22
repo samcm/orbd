@@ -1,8 +1,7 @@
 name: ci
 
-# Pull requests (including forks) run on GitHub-hosted runners only. Only the image
-# job gets packages: write, and it pushes only on main (fork PRs get a read-only
-# token anyway). Nothing here is privileged; see the disabled kvm job below.
+# Pull requests (including forks) run with a read-only token on GitHub-hosted
+# runners only. Nothing here is privileged; see the disabled kvm job below.
 on:
   push:
     branches: [main]
@@ -88,11 +87,8 @@ jobs:
   image:
     needs: [build]
     uses: ./.github/workflows/image.yml
-    permissions:
-      contents: read
-      packages: write
     with:
-      push: ${{ github.event_name == 'push' }}
+      push: false
 
   # Privileged QEMU/KVM tests on a self-hosted runner. Disabled until such a
   # runner exists. Before enabling:

@@ -29,13 +29,10 @@ FROM debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 orbd \
-    && useradd --system --uid 10001 --gid orbd --home-dir /home/orbd --create-home orbd \
-    && install -d -o orbd -g orbd /home/orbd/.amp /home/orbd/.amp/bin /var/lib/orbd /run/orbd \
-    && install -d /etc/orbd
-# `amp update` installs to ~/.amp/bin/amp, so the CLI lives there, owned by orbd.
-COPY --from=fetch --chown=orbd:orbd /amp /home/orbd/.amp/bin/amp
-ENV PATH=/home/orbd/.amp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    && mkdir -p /etc/orbd /var/lib/orbd /run/orbd
+# `amp update` installs to ~/.amp/bin/amp, so the CLI lives there and is first on PATH.
+COPY --from=fetch /amp /root/.amp/bin/amp
+ENV PATH=/root/.amp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 FROM base AS base-arm64
 
@@ -52,8 +49,6 @@ ARG TARGETARCH
 COPY --chmod=0755 $TARGETARCH/orbd /usr/local/bin/orbd
 LABEL org.opencontainers.image.source=https://github.com/samcm/orbd
 VOLUME /var/lib/orbd
-# The agent needs root: run it with --user root.
-USER orbd
 # tini forwards SIGTERM to orbd (orbs are checkpointed on stop) and reaps orphans.
 ENTRYPOINT ["/usr/bin/tini", "--", "orbd"]
 CMD ["--help"]

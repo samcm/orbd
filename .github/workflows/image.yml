@@ -1,5 +1,6 @@
-# Container image ghcr.io/samcm/orbd from build.yml's artifacts (same run). Pushes
-# :main and :sha-<short> from main, :vX.Y.Z and :latest from tags; never from PRs.
+# Container image ghcr.io/samcm/orbd from build.yml's artifacts (same run). ci.yml
+# builds and smoke-tests it; publish.yml pushes :main and :sha-<short> from main,
+# release.yml pushes :vX.Y.Z and :latest from tags.
 name: image
 
 on:
@@ -9,7 +10,7 @@ on:
         type: boolean
         required: true
 
-# Permissions come from the caller: packages: write only where it publishes.
+# Permissions come from the caller; only publish.yml and release.yml grant packages: write.
 
 jobs:
   image:

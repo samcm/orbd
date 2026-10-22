@@ -122,8 +122,7 @@ are on `metrics_listen`; `orbd doctor` checks a host's prerequisites.
 ## Run with Docker
 
 `ghcr.io/samcm/orbd` (amd64, arm64) has the Amp CLI and, on amd64, everything the QEMU
-runtime needs. Configs go in `/etc/orbd/`, state in `/var/lib/orbd`. The coordinator
-runs as uid 10001, which must be able to read its files. The agent needs root, and a
+runtime needs. Configs go in `/etc/orbd/`, state in `/var/lib/orbd`. The agent needs a
 long stop timeout so it can checkpoint its orbs on `docker stop`.
 
 ```sh
@@ -131,7 +130,7 @@ docker run -d --name orbd-coordinator -p 7443:7443 \
   -v /etc/orbd:/etc/orbd:ro -v orbd-coordinator:/var/lib/orbd \
   ghcr.io/samcm/orbd coordinator --config /etc/orbd/coordinator.yaml
 
-docker run -d --name orbd-agent --privileged --user root --stop-timeout 300 \
+docker run -d --name orbd-agent --privileged --stop-timeout 300 \
   -v /etc/orbd:/etc/orbd:ro -v orbd-agent:/var/lib/orbd \
   ghcr.io/samcm/orbd agent --config /etc/orbd/agent.yaml
 ```
