@@ -6,6 +6,23 @@
 
 A self-hosted backend for [Amp orbs](https://ampcode.com/docs/orbs/self-hosted).
 
+## Why
+
+Amp lets you run orbs on your own hardware, but you have to supply the program that
+creates and stops them. The obvious version, a container per orb, falls short:
+
+- Pausing stops the container, so the agent's processes restart on every wake.
+- There's no `/dev/kvm` inside, so you can't build or test VM software (Firecracker,
+  QEMU) from an orb.
+- Spreading orbs across several machines means writing placement, locking and retries
+  yourself, because Amp can deliver the same job twice.
+
+orbd runs each orb in a VM that sleeps to disk: a sleeping orb uses no host RAM, wakes in
+about 0.3 s with its processes intact, and has `/dev/kvm`. One coordinator serves many
+hosts, and later hosted sandboxes such as E2B.
+
+## How it works
+
 A coordinator runs one `amp orb provider` per offering (e.g. `qemu-4vcpu-8gb`) and places
 each orb on an agent. Agents run on your own x86_64 hosts, dial the coordinator over
 mutual-TLS gRPC, and run orbs in QEMU, Firecracker or Docker. Coordinator and agent are
