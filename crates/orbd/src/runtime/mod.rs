@@ -8,6 +8,7 @@
 //! again after a crash (inspect first, then act). Runtimes never receive shell
 //! commands, host paths or free-form VMM arguments from the coordinator.
 
+pub mod docker;
 pub mod fake;
 
 use crate::model::{
