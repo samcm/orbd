@@ -92,7 +92,7 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 3. **Agents** (x86_64), one token each:
 
    ```sh
-   docker run -d --privileged -v orbd-agent:/var/lib/orbd \
+   docker run -d --privileged --stop-timeout 300 -v orbd-agent:/var/lib/orbd \
      -v /var/run/docker.sock:/var/run/docker.sock \
      -e ORBD_JOIN=<token> ghcr.io/samcm/orbd agent
    ```
@@ -104,22 +104,6 @@ Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
 `ORBD_CAPACITY_MEMORY_MIB`, `ORBD_CAPACITY_DISK_GIB`); orbs use DNS `1.1.1.1` and `9.9.9.9`
 (`ORBD_DNS`). `orbd agent list` and `orbd agent remove <id>` manage agents; a removed
 agent's orbs stay on it, unavailable. Stopping an agent's container stops its QEMU orbs.
-
-## Run with Docker
-
-`ghcr.io/samcm/orbd` (amd64, arm64) has the Amp CLI and, on amd64, everything the QEMU
-runtime needs. Configs go in `/etc/orbd/`, state in `/var/lib/orbd`. The agent needs a
-long stop timeout so it can checkpoint its orbs on `docker stop`.
-
-```sh
-docker run -d --name orbd-coordinator -p 7443:7443 \
-  -v /etc/orbd:/etc/orbd:ro -v orbd-coordinator:/var/lib/orbd \
-  ghcr.io/samcm/orbd coordinator --config /etc/orbd/coordinator.yaml
-
-docker run -d --name orbd-agent --privileged --stop-timeout 300 \
-  -v /etc/orbd:/etc/orbd:ro -v orbd-agent:/var/lib/orbd \
-  ghcr.io/samcm/orbd agent --config /etc/orbd/agent.yaml
-```
 
 ## License
 
