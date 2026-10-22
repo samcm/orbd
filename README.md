@@ -126,6 +126,14 @@ one orb shape.
 _TODO._ Each offering needs its own orb provider token from your Amp workspace settings.
 Keep tokens out of configuration files that you commit.
 
+## Dependency updates
+
+Dependabot opens one grouped pull request per week for Cargo and one for GitHub Actions.
+Patch and minor updates merge automatically once the required `ci-ok` check passes.
+Major updates, including 0.x minor bumps that Cargo treats as breaking, and anything
+that fails CI wait for a maintainer, who adapts the code and merges or closes them with a
+reason.
+
 ## License
 
 [MIT](LICENSE)
