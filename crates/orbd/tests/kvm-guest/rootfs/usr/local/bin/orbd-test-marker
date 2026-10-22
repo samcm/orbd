@@ -1,0 +1,12 @@
+#!/bin/sh
+# Disk identity: written on the first boot of a disk, carried along by project snapshots.
+# Repeated, because kernel messages can garble a single line on the serial console.
+m=/var/lib/orbd-test/marker
+state=present
+if [ ! -f "$m" ]; then
+    mkdir -p "${m%/*}"
+    od -An -N8 -tx1 /dev/urandom | tr -d ' \n' >"$m"
+    sync
+    state=created
+fi
+while :; do echo "marker $state $(cat "$m")"; sleep 2; done

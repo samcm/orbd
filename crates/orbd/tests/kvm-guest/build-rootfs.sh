@@ -5,6 +5,7 @@
 #   orbd-test-counter  `counter pid=<pid> n=<n>` every second (must survive sleep)
 #   orbd-test-nested   a nested KVM guest (QEMU as `user`) printing `l2: l2counter n=<n>`
 #   orbd-test-blob     with `orbd.blob=<MiB>` on the kernel command line: dirty RAM
+#   orbd-test-marker   `marker created|present <id>`: a disk's identity, kept by snapshots
 #
 #   build-rootfs.sh ORBD_GUEST_BINARY GUEST_KERNEL OUT.ext4 [GUEST_ROOTFS_DIR]
 #
@@ -38,7 +39,7 @@ mmdebstrap --mode=unshare --variant=minbase \
     --customize-hook="cp -r '$guest_rootfs/.' '$here/rootfs/.' \"\$1/\"" \
     --customize-hook="install -D -m 0644 '$kernel' \"\$1/opt/l2/bzImage\"" \
     --customize-hook="install -D -m 0644 '$work/l2.ext4' \"\$1/opt/l2/root.ext4\"" \
-    --customize-hook='chroot "$1" systemctl enable orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-nested.service orbd-test-blob.service' \
+    --customize-hook='chroot "$1" systemctl enable orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-nested.service orbd-test-blob.service orbd-test-marker.service' \
     --customize-hook='chroot "$1" systemctl mask serial-getty@ttyS0.service' \
     --customize-hook=': >"$1/etc/machine-id"' \
     bookworm "$work/root.tar"

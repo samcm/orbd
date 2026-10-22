@@ -187,13 +187,18 @@ impl TryFrom<&OrbSpec> for pb::OrbSpec {
                 scope: SnapshotScope::BackendScope,
             } => pb::SnapshotScope::Backend,
         };
-        let source = match &s.initial_disk {
-            InitialDiskSource::Image { image_ref } => {
-                pb::initial_disk_source::Source::ImageRef(image_ref.clone())
-            }
-            InitialDiskSource::ProjectSnapshot(r) => {
-                pb::initial_disk_source::Source::ProjectSnapshotKey(r.key.0.clone())
-            }
+        let (source, fallback_image_ref) = match &s.initial_disk {
+            InitialDiskSource::Image { image_ref } => (
+                pb::initial_disk_source::Source::ImageRef(image_ref.clone()),
+                String::new(),
+            ),
+            InitialDiskSource::ProjectSnapshot {
+                snapshot,
+                image_ref,
+            } => (
+                pb::initial_disk_source::Source::ProjectSnapshotKey(snapshot.key.0.clone()),
+                image_ref.clone(),
+            ),
         };
         Ok(Self {
             runtime: pb::RuntimeKind::from(*runtime) as i32,
@@ -203,6 +208,7 @@ impl TryFrom<&OrbSpec> for pb::OrbSpec {
             nested_kvm: nested as i32,
             initial_disk: Some(pb::InitialDiskSource {
                 source: Some(source),
+                fallback_image_ref,
             }),
             release_compute_when_paused: req.release_compute_when_paused,
             required_snapshot_scope: snap_scope as i32,
@@ -245,14 +251,24 @@ impl TryFrom<&pb::OrbSpec> for OrbSpec {
             },
             Err(_) => return err("snapshot scope"),
         };
-        let initial_disk = match s.initial_disk.as_ref().and_then(|d| d.source.as_ref()) {
+        let disk = s
+            .initial_disk
+            .as_ref()
+            .ok_or(WireError("initial disk source".into()))?;
+        let initial_disk = match &disk.source {
             Some(pb::initial_disk_source::Source::ImageRef(r)) => InitialDiskSource::Image {
                 image_ref: r.clone(),
             },
             Some(pb::initial_disk_source::Source::ProjectSnapshotKey(k)) => {
-                InitialDiskSource::ProjectSnapshot(ProjectSnapshotRef {
-                    key: ProjectSnapshotKey(k.clone()),
-                })
+                if disk.fallback_image_ref.is_empty() {
+                    return err("fallback image for a project snapshot");
+                }
+                InitialDiskSource::ProjectSnapshot {
+                    snapshot: ProjectSnapshotRef {
+                        key: ProjectSnapshotKey(k.clone()),
+                    },
+                    image_ref: disk.fallback_image_ref.clone(),
+                }
             }
             None => return err("initial disk source"),
         };

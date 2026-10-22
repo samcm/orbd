@@ -488,3 +488,100 @@ fn graceful_agent_restart_keeps_running_orbs() {
         assert!(n < max_before[i], "a cold boot restarts the counter");
     }
 }
+
+/// The marker an orb's disk reported on its last boot: (created on this boot, id).
+fn marker(orb: &Path) -> Option<(bool, String)> {
+    console(orb).lines().rev().find_map(|l| {
+        let (created, id) = l
+            .strip_prefix("marker created ")
+            .map(|id| (true, id))
+            .or_else(|| l.strip_prefix("marker present ").map(|id| (false, id)))?;
+        // Lines garbled by interleaved console output do not count.
+        (id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| (created, id.to_owned()))
+    })
+}
+
+fn wait_marker(orb: &Path) -> (bool, String) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Some(m) = marker(orb) {
+            return m;
+        }
+        assert!(Instant::now() < deadline, "no marker on {}", orb.display());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A pause with ORB_SNAPSHOT_ID publishes the disk as a project snapshot; spawning new
+/// orbs with that id boots them from it (the first orb's disk marker is present),
+/// whether the coordinator learned of it from the pause result or from the agent's
+/// Hello after a restart. A snapshot that has vanished from the host falls back to
+/// the spawn's image instead of wedging the orb.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+fn spawn_boots_from_project_snapshot() {
+    // Disk is reserved per orb for life: room for four.
+    let mut c = cluster(4);
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    let snap = [("ORB_SNAPSHOT_ID", "snap-1")];
+    let new_orb = |c: &Cluster, before: &[PathBuf]| -> PathBuf {
+        orb_dirs(c)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .expect("a new orb")
+    };
+
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");
+    let first = orb_dir(&c);
+    let (created, id) = wait_marker(&first);
+    assert!(created);
+    eprintln!("amp-1 disk marker created {id}");
+    assert_ok(&c.dispatch("pause", "amp-1", &snap), "pause with snapshot");
+
+    // Known from the pause result.
+    let before = orb_dirs(&c);
+    assert_ok(&c.dispatch("spawn", "amp-2", &snap), "spawn from snapshot");
+    let second = new_orb(&c, &before);
+    assert_eq!(
+        wait_marker(&second),
+        (false, id.clone()),
+        "booted from the snapshot"
+    );
+    eprintln!("amp-2 (snapshot known from the pause result): marker present {id}");
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
+
+    // Known from the agent's Hello after a restart.
+    c.kill_agent("agent-a");
+    wait_until(Duration::from_secs(20), "agent session ended", || {
+        c.connected_agents() == Some(0)
+    });
+    c.start_agent("agent-a", "");
+    c.wait_connected(1);
+    let before = orb_dirs(&c);
+    assert_ok(
+        &c.dispatch("spawn", "amp-3", &snap),
+        "spawn from snapshot after restart",
+    );
+    let third = new_orb(&c, &before);
+    assert_eq!(wait_marker(&third), (false, id.clone()));
+    eprintln!("amp-3 (snapshot known from Hello after an agent restart): marker present {id}");
+    assert_ok(&c.dispatch("pause", "amp-3", &[]), "pause 3");
+
+    // Gone from the host: the orb starts from the image.
+    for e in std::fs::read_dir(state(&c).join("projects")).unwrap() {
+        std::fs::remove_dir_all(e.unwrap().path()).unwrap();
+    }
+    let before = orb_dirs(&c);
+    let job = c.dispatch("spawn", "amp-4", &snap);
+    assert_ok(&job, "spawn with a vanished snapshot");
+    assert!(
+        job.stdout.contains("creating the disk from")
+            || job.stderr.contains("creating the disk from")
+    );
+    let fourth = new_orb(&c, &before);
+    let (created, other) = wait_marker(&fourth);
+    assert!(created && other != id, "a fresh disk from the image");
+    eprintln!("amp-4 (snapshot gone from the host): marker created {other}");
+}

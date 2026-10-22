@@ -257,7 +257,7 @@ impl Runtime for DockerRuntime {
     ) -> Result<(), RuntimeError> {
         let image = match source {
             StartSource::NewDisk(InitialDiskSource::Image { image_ref }) => Some(image_ref),
-            StartSource::NewDisk(InitialDiskSource::ProjectSnapshot(r)) => {
+            StartSource::NewDisk(InitialDiskSource::ProjectSnapshot { snapshot: r, .. }) => {
                 let image = snapshot_image(&r.key);
                 match bounded(ctx, self.docker.inspect_image(&image)).await? {
                     Ok(_) => Some(image),

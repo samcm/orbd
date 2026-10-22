@@ -1,0 +1,9 @@
+[Unit]
+Description=orbd test: disk identity marker
+
+[Service]
+ExecStart=/usr/local/bin/orbd-test-marker
+StandardOutput=file:/dev/ttyS0
+
+[Install]
+WantedBy=multi-user.target

@@ -20,8 +20,9 @@ use super::db::{self, PausePlan, Progress, Receipt, StartPlan};
 use super::{Shared, session};
 use crate::model::{
     Action, ActionResult, CheckpointFailurePolicy, CommandFailure, CommandOutcome, ExecutionTarget,
-    FailureCode, OperationId, OrbDefinition, OrbId, OrbState, PausePolicy, ProcessDisposition,
-    ProjectSnapshotKey, SnapshotDisposition, StableOrbState, StartKind, unix_ms_now,
+    FailureCode, InitialDiskSource, OperationId, OrbDefinition, OrbId, OrbState, PausePolicy,
+    ProcessDisposition, ProjectSnapshotKey, SnapshotDisposition, StableOrbState, StartKind,
+    unix_ms_now,
 };
 use crate::runtime::{
     BootstrapRequest, GuestError, LogStream, OpContext, Runtime, RuntimeError, RuntimeObservation,
@@ -650,8 +651,35 @@ impl Run {
                         .await?;
                 }
                 self.log("creating disk and booting");
-                let src = StartSource::NewDisk(self.orb().spec.initial_disk.clone());
-                if let Err(e) = self.rt.start(self.orb(), src, &self.ctx).await {
+                let mut result = self
+                    .rt
+                    .start(
+                        self.orb(),
+                        StartSource::NewDisk(self.orb().spec.initial_disk.clone()),
+                        &self.ctx,
+                    )
+                    .await;
+                // The coordinator placed this orb here for a project snapshot the host
+                // no longer has: start from the spawn's image instead of failing forever.
+                if let (
+                    Err(RuntimeError::NotFound(why)),
+                    InitialDiskSource::ProjectSnapshot { image_ref, .. },
+                ) = (&result, &self.orb().spec.initial_disk)
+                    && matches!(
+                        self.rt.inspect(orb_id).await,
+                        Ok(RuntimeObservation::Absent)
+                    )
+                {
+                    tracing::warn!(orb_id = %orb_id, %why, image_ref, "project snapshot missing; creating the disk from the image");
+                    self.log(&format!(
+                        "{why}; creating the disk from {image_ref} instead"
+                    ));
+                    let src = StartSource::NewDisk(InitialDiskSource::Image {
+                        image_ref: image_ref.clone(),
+                    });
+                    result = self.rt.start(self.orb(), src, &self.ctx).await;
+                }
+                if let Err(e) = result {
                     if matches!(
                         self.rt.inspect(orb_id).await,
                         Ok(RuntimeObservation::Absent)
@@ -813,6 +841,11 @@ impl Run {
             self.log("publishing project snapshot");
             match self.rt.clone_disk(self.orb(), &key, &self.ctx).await {
                 Ok(snapshot) => {
+                    let k = snapshot.key.clone();
+                    self.sh
+                        .db
+                        .call(move |c| db::record_project_snapshot(c, &k, unix_ms_now()))
+                        .await?;
                     crate::crash_point!("agent::pause::after_snapshot");
                     fin.snapshot = SnapshotDisposition::Published { snapshot };
                 }

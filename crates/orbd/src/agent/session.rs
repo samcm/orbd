@@ -79,6 +79,7 @@ pub(super) async fn run_loop(sh: &Arc<Shared>) {
 
 async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
     let epoch = sh.db.call(|c| db::highest_epoch(c)).await?;
+    let project_snapshot_keys = sh.db.call(|c| db::list_project_snapshots(c)).await?;
     let mut runtimes: Vec<_> = sh.runtimes.values().map(|r| r.capabilities()).collect();
     runtimes.sort_by_key(|c| c.kind.as_str());
     Ok(ev(pb::agent_event::Event::Hello(pb::Hello {
@@ -98,6 +99,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
             .collect(),
         capacity: Some(sh.capacity.into()),
         last_controller_epoch: epoch,
+        project_snapshot_keys,
     })))
 }
 
