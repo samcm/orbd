@@ -7,7 +7,7 @@
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile <context>
 
-FROM --platform=$BUILDPLATFORM debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS fetch
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS fetch
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
 # Runs on the agent host only (x86_64); see crates/orbd/src/image/rootfs.rs.
@@ -25,7 +25,7 @@ RUN case "$TARGETARCH" in amd64) p=linux-x64 ;; arm64) p=linux-arm64 ;; *) exit 
     && echo "$(curl -fsSL "$url/$v/$p-amp.sha256")  /amp" | sha256sum -c \
     && chmod 0755 /amp
 
-FROM debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS base
+FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
@@ -37,9 +37,15 @@ ENV PATH=/root/.amp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 FROM base AS base-arm64
 
 FROM base AS base-amd64
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils e2fsprogs \
-    && rm -rf /var/lib/apt/lists/*
+# QEMU from trixie-backports (orbd needs >= 9.0; trixie itself has 10.0). A new QEMU
+# build means sleeping orbs cold-boot once: checkpoints restore only on the exact binary.
+RUN printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
+        >/etc/apt/sources.list.d/backports.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends e2fsprogs \
+    && apt-get install -y --no-install-recommends -t trixie-backports qemu-system-x86 qemu-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && qemu-system-x86_64 --version
 COPY --from=fetch /umoci /usr/local/bin/umoci
 COPY amd64/bzImage /usr/share/orbd/bzImage
 COPY --chmod=0755 amd64/orbd-guest /usr/share/orbd/orbd-guest

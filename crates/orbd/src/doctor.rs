@@ -183,11 +183,9 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     }
 
     let mut r = Report { failed: false };
-    r.line(
-        first_line(&qemu, &["--version"]),
-        "qemu-system-x86_64",
-        true,
-    );
+    let qemu_check = first_line(&qemu, &["--version"])
+        .and_then(|l| crate::runtime::qemu::check_qemu_version(&l).map(|()| l));
+    r.line(qemu_check, "qemu-system-x86_64", true);
     r.line(first_line(&qemu_img, &["--version"]), "qemu-img", true);
     r.line(kvm(), "/dev/kvm", true);
     r.line(kernel(&kernel_path), "guest kernel", true);

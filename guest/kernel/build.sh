@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds orbd's pinned QEMU guest kernel: Linux 6.1 LTS, everything built in (no modules,
+# Builds orbd's pinned QEMU guest kernel: Linux 6.18 LTS, everything built in (no modules,
 # no initrd), booted with `root=/dev/vda`.
 #
 #   guest/kernel/build.sh [OUT_DIR]        (default: target/guest-kernel)
@@ -14,8 +14,8 @@
 # Set ORBD_KERNEL_CACHE to reuse the downloaded tarball (default: ~/.cache/orbd-kernel).
 set -euo pipefail
 
-KERNEL_VERSION=6.1.190
-KERNEL_SHA256=8aa50daca0412a3d0a61a87af3744f39773d40b3132635fb7bc9be652cdb7b0c
+KERNEL_VERSION=6.18.58
+KERNEL_SHA256=069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

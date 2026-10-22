@@ -1,6 +1,6 @@
 //! Opt-in QEMU/KVM gate tests: real VMs through a real coordinator, agent and
 //! `orbd dispatch`. Ignored by default (CI has no KVM). Run on a host with `/dev/kvm`,
-//! QEMU 7.2 and nested virtualization, one at a time:
+//! QEMU 9.0 or newer and nested virtualization, one at a time:
 //!
 //! ```sh
 //! guest/kernel/build.sh /tmp/k        # or any kernel with orbd's config
@@ -172,13 +172,19 @@ fn assert_continuous(orb: &Path) {
     );
 }
 
-fn checkpoint_files(orb: &Path) -> Vec<(String, u64)> {
+/// Memory files: (checkpoint directory, apparent size, allocated bytes).
+fn checkpoint_files(orb: &Path) -> Vec<(String, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(orb.join("checkpoints")) {
         for e in rd.flatten() {
             let mem = e.path().join("memory");
             if let Ok(m) = std::fs::metadata(&mem) {
-                out.push((e.file_name().to_string_lossy().into(), m.len()));
+                out.push((
+                    e.file_name().to_string_lossy().into(),
+                    m.len(),
+                    m.blocks() * 512,
+                ));
             }
         }
     }
@@ -215,8 +221,9 @@ fn sleep_preserves_processes_and_nested_guest() {
             "exactly one published checkpoint: {files:?}"
         );
         eprintln!(
-            "round {round}: sleep {sleep_time:?}, checkpoint {} = {} MiB for {MEMORY_MIB} MiB RAM",
+            "round {round}: sleep {sleep_time:?}, checkpoint {} = {} MiB written ({} MiB sparse file) for {MEMORY_MIB} MiB RAM",
             files[0].0,
+            files[0].2 >> 20,
             files[0].1 >> 20
         );
         assert!(files[0].1 < (MEMORY_MIB + 256) << 20);
@@ -291,7 +298,14 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
         let before = counts(&orb_dir(c));
         let mark = agent_log(c).len();
         c.kill_agent("agent-a");
-        c.start_agent("agent-a", &format!("{point}=return"));
+        // QEMU writes the memory file itself: slowed down, it is still writing when the
+        // agent dies right after starting the save.
+        let throttle = if point == "qemu::save::after_migrate" {
+            ";qemu::save::throttle=return(32)"
+        } else {
+            ""
+        };
+        c.start_agent("agent-a", &format!("{point}=return{throttle}"));
         c.wait_connected(1);
         let job = c.dispatch_bg(op, "amp-1", &[]);
         c.wait_agent_crash("agent-a", Duration::from_secs(120));
@@ -326,7 +340,8 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
 
     for point in [
         "qemu::save::after_stop",
-        "qemu::save::after_stream",
+        "qemu::save::after_migrate",
+        "qemu::save::after_manifest",
         "qemu::save::after_quit",
         "qemu::save::after_publish",
         "agent::pause::after_stop",
@@ -350,7 +365,11 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
     // Disk full mid-save under the cold-stop policy: the pause fails with processes
     // lost, the VM is shut down, and the next spawn cold-boots without replaying RAM.
     c.kill_agent("agent-a");
-    c.start_agent("agent-a", "qemu::save::write=8*off->return");
+    // QEMU fails a save that fills the disk; injected while it is still writing.
+    c.start_agent(
+        "agent-a",
+        "qemu::save::throttle=return(32);qemu::save::write=3*off->return",
+    );
     c.wait_connected(1);
     let job = c.dispatch("pause", "amp-1", &[]);
     assert_ne!(job.code, 0, "an injected ENOSPC must fail the pause");
@@ -454,7 +473,7 @@ fn graceful_agent_restart_keeps_running_orbs() {
     // Drain cut short: the first save is slowed down, the agent is killed mid-save and
     // every VMM dies with it.
     c.terminate_agent("agent-a", Duration::from_secs(300));
-    c.start_agent("agent-a", "qemu::save::throttle=return(500)");
+    c.start_agent("agent-a", "qemu::save::throttle=return(8)");
     c.wait_connected(1);
     assert_eq!(qemu_pids(c.root()).len(), 2);
     c.signal_agent("agent-a", "TERM");
