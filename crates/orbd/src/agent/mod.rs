@@ -17,7 +17,9 @@
 //! The fake runtime adds `fake::<method>::after_effect`.
 
 mod db;
+mod detect;
 mod executor;
+mod identity;
 mod logs;
 mod session;
 
@@ -42,6 +44,7 @@ pub(crate) struct SessionHandle {
 /// State shared by the session loop and the executors.
 pub(crate) struct Shared {
     pub config: AgentConfig,
+    pub identity: identity::Identity,
     pub db: db::Db,
     pub key: SecretKey,
     pub runtimes: HashMap<RuntimeKind, Arc<dyn Runtime>>,
@@ -104,13 +107,25 @@ fn acquire_lock(path: &std::path::Path) -> anyhow::Result<nix::fcntl::Flock<std:
 }
 
 /// Runs the agent until `shutdown` is cancelled. Running orbs survive agent exit.
-pub async fn run(config: AgentConfig, shutdown: CancellationToken) -> anyhow::Result<()> {
+/// `join` is the join token, used only until the agent is enrolled.
+pub async fn run(
+    mut config: AgentConfig,
+    join: Option<String>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.agent.state_dir)?;
     std::fs::create_dir_all(&config.agent.run_dir)?;
     let _lock = acquire_lock(&config.agent.run_dir.join("agent.lock"))?;
-    let key = SecretKey::load(&config.agent.secret_key_file)?;
+    let first_init = !config.db_path().exists();
+    let key = SecretKey::load_or_create(&config.agent.secret_key_file, first_init)?;
     let db = db::Db::open(&config.db_path())?;
-    let capacity = config.agent.capacity.to_resources()?;
+    let Some(identity) =
+        identity::Identity::establish(&config.agent.state_dir, join.as_deref(), &shutdown).await?
+    else {
+        return Ok(());
+    };
+    detect::runtime(&mut config).await?;
+    let capacity = detect::capacity(&config).await?;
 
     let mut runtimes: HashMap<RuntimeKind, Arc<dyn Runtime>> = HashMap::new();
     if let Some(fake) = &config.runtime.fake {
@@ -137,6 +152,7 @@ pub async fn run(config: AgentConfig, shutdown: CancellationToken) -> anyhow::Re
 
     let shared = Arc::new(Shared {
         config,
+        identity,
         db,
         key,
         runtimes,
@@ -150,9 +166,10 @@ pub async fn run(config: AgentConfig, shutdown: CancellationToken) -> anyhow::Re
         logs: Arc::new(logs::LogQueue::new(256)),
         tasks: TaskTracker::new(),
     });
-    tracing::info!(agent = %shared.config.agent.id, boot_id = %shared.boot_id, "agent starting");
+    tracing::info!(agent = %shared.identity.agent_id, boot_id = %shared.boot_id, "agent starting");
 
     executor::recover(&shared).await?;
+    tokio::spawn(identity::renew_loop(shared.clone()));
     session::run_loop(&shared).await;
 
     shutdown.cancel();

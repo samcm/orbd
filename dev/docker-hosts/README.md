@@ -40,18 +40,15 @@ dev/docker-hosts/hostctl wait 1
 
 ```sh
 cargo build --release -p orbd
-dev/docker-hosts/hostctl install-orbd 1 target/release/orbd agent.yaml \
-    agent.crt agent.key ca.crt secret.key
+dev/docker-hosts/hostctl install-orbd 1 target/release/orbd \
+    "$(target/release/orbd join-token orbd-host-1 --config orbd.yaml)"
 dev/docker-hosts/hostctl ssh 1 journalctl -fu orbd-agent
 ```
 
-This installs `/usr/local/bin/orbd`, `/etc/orbd/agent.yaml` and the extra files into
-`/etc/orbd/` (root, 0600), and (re)starts `orbd-agent.service`
-([orbd-agent.service](orbd-agent.service)), which provides `/var/lib/orbd` and
-`/run/orbd`. In `agent.yaml`, point the agent at the orb as
-`coordinator_url = "https://10.0.2.2:<port>"` (give the coordinator certificate a SAN the
-agent verifies, or set `coordinator_server_name`), use those state/run dirs and
-`[runtime.docker] dns_servers = ["1.1.1.1", "8.8.8.8"]`.
+This installs `/usr/local/bin/orbd` and the token (`/etc/orbd/agent.env`, 0600) and
+(re)starts `orbd-agent.service` ([orbd-agent.service](orbd-agent.service)). The agent
+detects Docker and its capacity. Give the coordinator `public_url:
+https://10.0.2.2:<port>`, the address guests reach this orb on.
 
 ### Talking to a host's dockerd from the orb
 

@@ -2,7 +2,13 @@
 //! (`orbd.control.v1.AgentControl`) and run orbs with their local runtimes.
 //! The gRPC protocol is this backend's private transport.
 //!
-//! Session model: one live session per authorised agent id. A new `Hello` replaces the
+//! Identity: the coordinator's built-in CA ([`crate::pki`]) issues every agent
+//! certificate. Agents enroll once with a single-use join token and renew over mTLS.
+//! The registry in the coordinator database decides who may connect: a session needs a
+//! certificate from the CA naming an active agent *and* the key recorded at enrollment.
+//! `orbd agent remove` revokes for good; the agent's orbs stay recorded on it.
+//!
+//! Session model: one live session per registered agent id. A new `Hello` replaces the
 //! old session. All control traffic to an agent goes through that session's own
 //! unbounded queue (control messages are small and are never queued behind anything;
 //! there is no outbound log traffic). Inbound, control events and log chunks reach the
@@ -12,7 +18,9 @@
 //! Registry state is kept for disconnected agents too: they remain candidates with
 //! `Availability::Unavailable` (a disconnect is not evidence their orbs stopped).
 
+pub mod admin;
 mod capabilities;
+mod registry;
 mod server;
 
 use super::{
@@ -20,18 +28,20 @@ use super::{
     CommandDelivery, CommandSecrets, ComputeBackend, LogChunk, OperationStatus, PlacementCandidate,
     PlacementRequest, ReconcilePage, ReconcileQuery,
 };
-use crate::config::coordinator::FleetBackendConfig;
+use crate::config::coordinator::{CoordinatorConfig, FLEET_BACKEND};
+use crate::coordinator::db::Db;
 use crate::model::wire;
 use crate::model::{
     AgentId, BackendCapabilities, BackendId, CommandKey, ExecutionTarget, Location, OperationId,
     Resources,
 };
+use crate::pki::Ca;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{PollNext, select_with_strategy};
 use orbd_proto::control::v1 as pb;
 use secrecy::ExposeSecret;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -54,9 +64,9 @@ struct Inner {
     id: BackendId,
     controller_epoch: u64,
     heartbeat_interval: Duration,
-    /// Authorised agents in configuration order.
-    agents: Vec<AgentId>,
-    authorised: HashSet<String>,
+    public_url: String,
+    ca: Ca,
+    db: Db,
     state: Mutex<State>,
     control_tx: mpsc::UnboundedSender<BackendEvent>,
     log_tx: mpsc::Sender<BackendEvent>,
@@ -65,14 +75,19 @@ struct Inner {
 
 #[derive(Default)]
 struct State {
-    agents: HashMap<AgentId, AgentSlot>,
+    /// Every registered agent, removed ones included.
+    agents: BTreeMap<AgentId, AgentSlot>,
     /// Operation id -> key, learned from submits and agent messages; needed because
     /// `LogChunk` carries only the operation id. Removed on acknowledge/reject.
     op_keys: HashMap<OperationId, CommandKey>,
 }
 
-#[derive(Default)]
 struct AgentSlot {
+    /// Registry record (mirrors the `agents` row).
+    key_sha256: String,
+    cert_not_after_ms: u64,
+    enrolled_ms: u64,
+    removed: bool,
     session: Option<Session>,
     hello: Option<pb::Hello>,
     heartbeat: Option<(pb::Heartbeat, Instant)>,
@@ -86,34 +101,53 @@ struct Session {
     pending_reconcile: HashMap<String, oneshot::Sender<pb::ReconcileResponse>>,
 }
 
+impl AgentSlot {
+    fn new(row: registry::AgentRow) -> Self {
+        Self {
+            key_sha256: row.key_sha256,
+            cert_not_after_ms: row.cert_not_after_ms,
+            enrolled_ms: row.enrolled_ms,
+            removed: row.removed,
+            session: None,
+            hello: None,
+            heartbeat: None,
+            unavailable_reason: String::new(),
+        }
+    }
+}
+
 impl FleetBackend {
+    /// Loads the registry and starts the AgentControl listener. The returned admin
+    /// service is for the local admin socket.
     pub async fn start(
-        config: &FleetBackendConfig,
+        config: &CoordinatorConfig,
+        ca: Ca,
+        db: Db,
         controller_epoch: u64,
         shutdown: CancellationToken,
-    ) -> anyhow::Result<BackendHandle> {
-        anyhow::ensure!(
-            config.heartbeat_interval_ms > 0,
-            "heartbeat_interval_ms must be > 0"
-        );
+    ) -> anyhow::Result<(BackendHandle, admin::AdminService)> {
+        let mut state = State::default();
+        for row in db.call(|c| registry::load(c)).await? {
+            state
+                .agents
+                .insert(AgentId::new(row.id.clone()), AgentSlot::new(row));
+        }
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (log_tx, log_rx) = mpsc::channel(LOG_CHANNEL_CAPACITY);
         let inner = Arc::new(Inner {
-            id: config.id.clone(),
+            id: BackendId::new(FLEET_BACKEND),
             controller_epoch,
             heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
-            agents: config.agents.iter().map(|a| a.id.clone()).collect(),
-            authorised: config
-                .agents
-                .iter()
-                .map(|a| a.id.as_str().to_owned())
-                .collect(),
-            state: Mutex::new(State::default()),
+            public_url: config.public_url.clone(),
+            ca,
+            db,
+            state: Mutex::new(state),
             control_tx,
             log_tx,
             shutdown: shutdown.clone(),
         });
         server::serve(inner.clone(), config).await?;
+        let admin = admin::AdminService(inner.clone());
         metrics::gauge!("orbd_fleet_connected_agents").set(0.0);
 
         // Control events always win over logs.
@@ -124,7 +158,7 @@ impl FleetBackend {
         )
         .boxed();
         let backend: Arc<dyn ComputeBackend> = Arc::new(FleetBackend { inner });
-        Ok(BackendHandle { backend, events })
+        Ok((BackendHandle { backend, events }, admin))
     }
 }
 
@@ -150,7 +184,7 @@ impl Inner {
             Location::Fleet {
                 backend_id,
                 agent_id,
-            } if backend_id == &self.id && self.authorised.contains(agent_id.as_str()) => {
+            } if backend_id == &self.id && self.lock().agents.contains_key(agent_id) => {
                 Ok(agent_id.clone())
             }
             other => Err(BackendError::Invalid(format!(
@@ -178,22 +212,27 @@ impl Inner {
         metrics::gauge!("orbd_fleet_connected_agents").set(n as f64);
     }
 
-    /// Installs a new session for `agent`, replacing any older one. Welcome is queued
-    /// before `Available` is emitted.
+    /// Installs a new session for `agent`, replacing any older one, if `key_sha256` is
+    /// the active agent's registered key. Welcome is queued before `Available` is
+    /// emitted.
     fn open_session(
         &self,
         agent: &AgentId,
+        key_sha256: &str,
         hello: pb::Hello,
-    ) -> (
+    ) -> Option<(
         Uuid,
         CancellationToken,
         mpsc::UnboundedReceiver<pb::CoordinatorEvent>,
-    ) {
+    )> {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let cancel = self.shutdown.child_token();
         let mut st = self.lock();
-        let slot = st.agents.entry(agent.clone()).or_default();
+        let slot = st
+            .agents
+            .get_mut(agent)
+            .filter(|s| !s.removed && s.key_sha256 == key_sha256)?;
         let replaced = slot.session.take();
         if let Some(old) = &replaced {
             // Cancels the old reader; dropping `old` closes its outbound stream.
@@ -223,7 +262,32 @@ impl Inner {
             availability: Availability::Available,
         });
         Self::update_connected_gauge(&st);
-        (id, cancel, rx)
+        Some((id, cancel, rx))
+    }
+
+    /// Revokes `agent` (durably first) and ends its live session.
+    async fn remove(&self, agent: &AgentId) -> anyhow::Result<bool> {
+        let id = agent.as_str().to_owned();
+        if !self.db.call(move |c| registry::remove(c, &id)).await? {
+            return Ok(false);
+        }
+        let mut st = self.lock();
+        if let Some(slot) = st.agents.get_mut(agent) {
+            slot.removed = true;
+            if let Some(old) = slot.session.take() {
+                old.cancel.cancel();
+                slot.unavailable_reason = "agent removed".into();
+                self.emit(BackendEvent::AvailabilityChanged {
+                    location: self.location(agent),
+                    availability: Availability::Unavailable {
+                        reason: slot.unavailable_reason.clone(),
+                    },
+                });
+            }
+        }
+        Self::update_connected_gauge(&st);
+        tracing::info!(%agent, "agent removed");
+        Ok(true)
     }
 
     /// Ends session `sid` if it is still the current one.
@@ -441,15 +505,19 @@ impl ComputeBackend for FleetBackend {
         let wire_kind: i32 = pb::RuntimeKind::from(runtime) as i32;
         let st = self.inner.lock();
         let mut out = Vec::new();
-        for agent in &self.inner.agents {
+        for (agent, slot) in &st.agents {
             if restrict.as_ref().is_some_and(|r| r != agent) {
                 continue;
             }
-            let slot = st.agents.get(agent);
+            // A removed agent's orbs stay there, unavailable; it gets no new ones.
+            if slot.removed && restrict.is_none() {
+                continue;
+            }
             let info = slot
-                .and_then(|s| s.hello.as_ref())
+                .hello
+                .as_ref()
                 .and_then(|h| h.runtimes.iter().find(|r| r.kind == wire_kind));
-            let (capabilities, ceiling) = match (info, slot.and_then(|s| s.hello.as_ref())) {
+            let (capabilities, ceiling) = match (info, slot.hello.as_ref()) {
                 (Some(info), Some(hello)) => (
                     capabilities::effective(runtime, info),
                     hello.capacity.map(Resources::from).unwrap_or_default(),
@@ -459,14 +527,19 @@ impl ComputeBackend for FleetBackend {
                 _ if restrict.is_some() => (capabilities::ceiling(runtime), Resources::default()),
                 _ => continue,
             };
-            let availability = if slot.is_some_and(|s| s.session.is_some()) {
+            let availability = if slot.removed {
+                Availability::Unavailable {
+                    reason: "agent removed".into(),
+                }
+            } else if slot.session.is_some() {
                 Availability::Available
+            } else if slot.unavailable_reason.is_empty() {
+                Availability::Unavailable {
+                    reason: "agent has not connected".into(),
+                }
             } else {
                 Availability::Unavailable {
-                    reason: slot
-                        .map(|s| s.unavailable_reason.clone())
-                        .filter(|r| !r.is_empty())
-                        .unwrap_or_else(|| "agent has not connected".into()),
+                    reason: slot.unavailable_reason.clone(),
                 }
             };
             out.push(PlacementCandidate {

@@ -50,6 +50,39 @@ impl SecretKey {
         Ok(Self::from_bytes(&bytes))
     }
 
+    /// Loads the key at `path`, first creating it (exclusively, mode 0600, fsynced) if
+    /// `first_init` says no state depends on a key yet. Once state exists a missing or
+    /// invalid key is an error: a new key would make every sealed payload unreadable.
+    pub fn load_or_create(path: &Path, first_init: bool) -> Result<Self, SecretError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let io = |source| SecretError::KeyFile {
+            path: path.display().to_string(),
+            source,
+        };
+        // Callers hold the state directory's process lock, so check-then-rename is safe;
+        // the temporary file keeps a crash from leaving a truncated key behind.
+        if first_init && !path.exists() {
+            let tmp = path.with_extension("tmp");
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(io)?;
+            f.write_all(Self::generate_hex().as_bytes()).map_err(io)?;
+            f.sync_all().map_err(io)?;
+            std::fs::rename(&tmp, path).map_err(io)?;
+            if let Some(dir) = path.parent() {
+                std::fs::File::open(dir)
+                    .and_then(|d| d.sync_all())
+                    .map_err(io)?;
+            }
+        }
+        Self::load(path)
+    }
+
     pub fn from_bytes(master: &[u8; 32]) -> Self {
         let derive = |label: &[u8]| {
             let mut h = Sha256::new();

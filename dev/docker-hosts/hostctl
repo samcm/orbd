@@ -293,24 +293,21 @@ cmd_docker_sock() {
 	printf 'unix://%s\n' "$sock"
 }
 
-# Copies an orbd binary, agent config and any extra files (certs, keys) into the guest
-# and (re)starts it as orbd-agent.service. Extra files land in /etc/orbd/ by basename.
+# Copies an orbd binary into the guest, saves a join token for it and (re)starts it as
+# orbd-agent.service.
 cmd_install_orbd() {
-	local n=${1:?usage: install-orbd N BINARY CONFIG [FILE...]} bin=${2:?binary} cfg=${3:?config}
-	shift 3
+	local n=${1:?usage: install-orbd N BINARY TOKEN} bin=${2:?binary} token=${3:?join token}
 	local host
 	host=$(name_of "$n")
 	local tmp=/tmp/orbd-install.$$
-	ssh -F "$SSH_CONFIG" "$host" "rm -rf $tmp && mkdir -p $tmp/files"
+	ssh -F "$SSH_CONFIG" "$host" "rm -rf $tmp && mkdir -p $tmp"
 	scp -q -F "$SSH_CONFIG" "$bin" "$host:$tmp/orbd"
-	scp -q -F "$SSH_CONFIG" "$cfg" "$host:$tmp/agent.yaml"
-	[[ $# -eq 0 ]] || scp -q -F "$SSH_CONFIG" "$@" "$host:$tmp/files/"
 	scp -q -F "$SSH_CONFIG" "$HERE/orbd-agent.service" "$host:$tmp/orbd-agent.service"
+	printf 'ORBD_JOIN=%s\n' "$token" | ssh -F "$SSH_CONFIG" "$host" "umask 077 && cat > $tmp/agent.env"
 	ssh -F "$SSH_CONFIG" "$host" "set -e
 		sudo install -m 0755 $tmp/orbd /usr/local/bin/orbd
 		sudo install -d -m 0700 /etc/orbd
-		sudo install -m 0600 $tmp/agent.yaml /etc/orbd/agent.yaml
-		for f in $tmp/files/*; do [ -e \"\$f\" ] && sudo install -m 0600 \"\$f\" /etc/orbd/; done
+		sudo install -m 0600 $tmp/agent.env /etc/orbd/agent.env
 		sudo install -m 0644 $tmp/orbd-agent.service /etc/systemd/system/orbd-agent.service
 		rm -rf $tmp
 		sudo systemctl daemon-reload
@@ -343,7 +340,7 @@ usage: $0 COMMAND
   stop N... | destroy N...    power off | power off and delete overlay
   ssh N [CMD...]              ssh into host N
   docker-sock N               forward host N's docker socket to the orb, print DOCKER_HOST
-  install-orbd N BIN CFG [F...]  install orbd + config (+ files into /etc/orbd), run as a service
+  install-orbd N BIN TOKEN    install orbd with a join token, run as a service
   status
 state: $STATE (ssh config: $SSH_CONFIG)
 EOF

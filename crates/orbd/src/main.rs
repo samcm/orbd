@@ -1,6 +1,8 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
+
+const DEFAULT_CONFIG: &str = "/etc/orbd/orbd.yaml";
 
 #[derive(Parser)]
 #[command(name = "orbd", version, about = "Self-hosted backend for Amp orbs")]
@@ -12,37 +14,97 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Args)]
+struct CoordinatorArgs {
+    /// Coordinator configuration.
+    #[arg(long, short, env = "ORBD_CONFIG", default_value = DEFAULT_CONFIG)]
+    config: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the coordinator (wraps one `amp orb provider` per offering).
-    Coordinator {
-        #[arg(long, short, env = "ORBD_CONFIG")]
-        config: PathBuf,
-    },
-    /// Run an agent on a compute host.
+    Coordinator(CoordinatorArgs),
+    /// Run an agent on a compute host (or manage agents: `orbd agent list|remove`).
+    #[command(args_conflicts_with_subcommands = true)]
     Agent {
-        #[arg(long, short, env = "ORBD_CONFIG")]
-        config: PathBuf,
+        #[command(subcommand)]
+        manage: Option<AgentCommand>,
+        #[command(flatten)]
+        run: AgentArgs,
+    },
+    /// Print a single-use join token for a new agent (run on the coordinator).
+    JoinToken {
+        /// Id for the new agent, e.g. `host-1`.
+        agent_id: String,
+        /// Validity in seconds.
+        #[arg(long, default_value_t = 3600)]
+        ttl_secs: u64,
+        #[command(flatten)]
+        coordinator: CoordinatorArgs,
     },
     /// Handle one Amp dispatch job from the environment (run by `amp orb provider`).
     Dispatch,
-    /// Print a new 32-byte secret key (hex) for `secret_key_file`.
-    GenKey,
     /// Check host prerequisites (QEMU, /dev/kvm, guest kernel, umoci, mkfs.ext4).
     Doctor {
         /// Agent config to take tool and asset paths from.
-        #[arg(long, short, env = "ORBD_CONFIG")]
+        #[arg(long, short, env = "ORBD_AGENT_CONFIG")]
         config: Option<PathBuf>,
-        /// Guest kernel (bzImage) to check.
+        /// Guest kernel (bzImage) to check [default: runtime.qemu.kernel, else
+        /// /usr/share/orbd/bzImage].
         #[arg(long)]
         kernel: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// List enrolled agents (run on the coordinator).
+    List(CoordinatorArgs),
+    /// Revoke an agent for good; its orbs stay recorded on it, unavailable.
+    Remove {
+        agent_id: String,
+        #[command(flatten)]
+        coordinator: CoordinatorArgs,
+    },
+}
+
+#[derive(Args)]
+struct AgentArgs {
+    /// Join token from `orbd join-token`; needed only for the first start.
+    #[arg(long, env = "ORBD_JOIN", hide_env_values = true)]
+    join: Option<String>,
+    #[arg(long, env = "ORBD_STATE_DIR", default_value = "/var/lib/orbd")]
+    state_dir: PathBuf,
+    /// DNS servers for orbs, comma-separated.
+    #[arg(long, env = "ORBD_DNS", value_delimiter = ',', default_values_t = orbd::config::agent::DEFAULT_DNS.map(String::from))]
+    dns: Vec<String>,
+    /// Overrides the detected vCPU ceiling.
+    #[arg(long, env = "ORBD_CAPACITY_VCPUS")]
+    capacity_vcpus: Option<u32>,
+    /// Overrides the detected memory ceiling.
+    #[arg(long, env = "ORBD_CAPACITY_MEMORY_MIB")]
+    capacity_memory_mib: Option<u64>,
+    /// Overrides the detected disk ceiling.
+    #[arg(long, env = "ORBD_CAPACITY_DISK_GIB")]
+    capacity_disk_gib: Option<u64>,
+    /// Prometheus listener, e.g. `127.0.0.1:9465`.
+    #[arg(long, env = "ORBD_METRICS_LISTEN")]
+    metrics_listen: Option<std::net::SocketAddr>,
+    /// Optional YAML with advanced runtime and image settings.
+    #[arg(long, short, env = "ORBD_AGENT_CONFIG")]
+    config: Option<PathBuf>,
+}
+
+fn admin_socket(args: &CoordinatorArgs) -> anyhow::Result<PathBuf> {
+    Ok(orbd::config::coordinator::CoordinatorConfig::load(&args.config)?.admin_socket())
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     orbd::configure_failpoints();
     let rt = tokio::runtime::Runtime::new()?;
+    use orbd::backend::fleet::admin;
     match cli.command {
         Command::Dispatch => {
             // Logs from the coordinator are forwarded verbatim; keep our own quiet.
@@ -53,24 +115,66 @@ fn main() -> anyhow::Result<()> {
             let ok = orbd::doctor::run(&orbd::doctor::DoctorOptions { config, kernel })?;
             std::process::exit(if ok { 0 } else { 1 });
         }
-        Command::GenKey => {
-            print!("{}", orbd::secrets::SecretKey::generate_hex());
+        Command::JoinToken {
+            agent_id,
+            ttl_secs,
+            coordinator,
+        } => {
+            let socket = admin_socket(&coordinator)?;
+            let ttl = std::time::Duration::from_secs(ttl_secs);
+            println!(
+                "{}",
+                rt.block_on(admin::cli_join_token(&socket, &agent_id, ttl))?
+            );
             Ok(())
         }
-        Command::Coordinator { config } => {
+        Command::Agent {
+            manage: Some(AgentCommand::List(coordinator)),
+            ..
+        } => {
+            print!(
+                "{}",
+                rt.block_on(admin::cli_list(&admin_socket(&coordinator)?))?
+            );
+            Ok(())
+        }
+        Command::Agent {
+            manage:
+                Some(AgentCommand::Remove {
+                    agent_id,
+                    coordinator,
+                }),
+            ..
+        } => rt.block_on(admin::cli_remove(&admin_socket(&coordinator)?, &agent_id)),
+        Command::Coordinator(args) => {
             orbd::telemetry::init_logging(cli.log_json);
-            let config = orbd::config::coordinator::CoordinatorConfig::load(&config)?;
+            let config = orbd::config::coordinator::CoordinatorConfig::load(&args.config)?;
             rt.block_on(async {
                 let shutdown = shutdown_on_signal();
                 orbd::coordinator::run(config, shutdown).await
             })
         }
-        Command::Agent { config } => {
+        Command::Agent {
+            manage: None,
+            run: a,
+        } => {
             orbd::telemetry::init_logging(cli.log_json);
-            let config = orbd::config::agent::AgentConfig::load(&config)?;
+            let mut config = match &a.config {
+                Some(p) => orbd::config::agent::AgentConfig::load(p)?,
+                None => Default::default(),
+            };
+            let mut s = orbd::config::agent::AgentSection::new(a.state_dir);
+            s.dns_servers = a.dns;
+            s.capacity = orbd::config::agent::CapacityOverrides {
+                vcpus: a.capacity_vcpus,
+                memory_mib: a.capacity_memory_mib,
+                disk_gib: a.capacity_disk_gib,
+            };
+            s.metrics_listen = a.metrics_listen;
+            config.agent = s;
             rt.block_on(async {
                 let shutdown = shutdown_on_signal();
-                orbd::agent::run(config, shutdown).await
+                orbd::agent::run(config, a.join, shutdown).await
             })
         }
     }

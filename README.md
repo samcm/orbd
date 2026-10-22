@@ -52,72 +52,41 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 
 ## Setup
 
-You need a coordinator host with the [Amp CLI](https://ampcode.com/docs) (glibc, x86_64
-or aarch64) and one or more agent hosts with the runtime you want (Docker for now).
-
-1. **Provider token.** In Amp's workspace settings, create an orb provider for each
-   offering and save its token to a file on the coordinator host.
-2. **Certificates.** Create a CA, a server certificate for the coordinator, and a client
-   certificate per agent whose CN (or DNS SAN) is the agent's id.
-3. **Secret keys.** `orbd gen-key > key` on each host, mode 0600.
-4. **Coordinator** — `orbd coordinator --config coordinator.yaml`:
+1. **Provider tokens.** In Amp's workspace settings, create an orb provider per offering
+   and save each token as `tokens/<offering>`.
+2. **Coordinator** (x86_64 or arm64), with `orbd.yaml`:
 
    ```yaml
-   coordinator:
-     state_dir: /var/lib/orbd
-     dispatch_socket: /run/orbd/dispatch.sock
-     secret_key_file: /etc/orbd/key
-     metrics_listen: 127.0.0.1:9464
-
-   amp_endpoints:
-     - id: amp
-       url: https://ampcode.com
-
-   backends:
-     - kind: agent_fleet
-       id: fleet
-       listen: 0.0.0.0:7443
-       tls:
-         certificate_file: /etc/orbd/server.pem
-         private_key_file: /etc/orbd/server.key
-         ca_file: /etc/orbd/ca.pem
-       agents:
-         - id: host-1
-
+   public_url: https://coordinator.example:7443   # agents dial this
    offerings:
      - id: docker-2vcpu-4gb
-       amp_endpoint: amp
-       provider_token_file: /etc/orbd/docker-2vcpu-4gb.token
-       backend: fleet
        runtime: docker
        resources: { vcpus: 2, memory_mib: 4096, disk_gib: 20 }
-       pause: { mode: disk_only }
+       provider_token_file: /etc/orbd/tokens/docker-2vcpu-4gb
    ```
 
-5. **Agent** — `orbd agent --config agent.yaml` on each host:
-
-   ```yaml
-   agent:
-     id: host-1
-     coordinator_url: https://coordinator.example:7443
-     state_dir: /var/lib/orbd
-     run_dir: /run/orbd
-     secret_key_file: /etc/orbd/key
-     capacity: { vcpus: 16, memory_mib: 32768, disk_gib: 500 }
-     tls:
-       certificate_file: /etc/orbd/host-1.pem
-       private_key_file: /etc/orbd/host-1.key
-       ca_file: /etc/orbd/ca.pem
-
-   runtime:
-     docker:
-       dns_servers: [1.1.1.1, 8.8.8.8]
-       # Amp's orb image is ~6 GB; spawns fail until it is pulled.
-       prewarm_images: [us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest]
+   ```sh
+   docker run -d --name orbd -p 7443:7443 -v orbd:/var/lib/orbd \
+     -v ./orbd.yaml:/etc/orbd/orbd.yaml -v ./tokens:/etc/orbd/tokens:ro \
+     ghcr.io/samcm/orbd coordinator
+   docker exec orbd orbd join-token host-1   # single use, valid for an hour
    ```
 
-Threads you create on that provider in Amp then run on your hosts. Prometheus metrics
-are on `metrics_listen`; `orbd doctor` checks a host's prerequisites.
+3. **Agents** (x86_64), one token each:
+
+   ```sh
+   docker run -d --privileged -v orbd-agent:/var/lib/orbd \
+     -v /var/run/docker.sock:/var/run/docker.sock \
+     -e ORBD_JOIN=<token> ghcr.io/samcm/orbd agent
+   ```
+
+Threads you create on that provider in Amp then run on your hosts.
+
+The coordinator creates its CA and keys in its volume on first start; keep that volume.
+Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
+`ORBD_CAPACITY_MEMORY_MIB`, `ORBD_CAPACITY_DISK_GIB`); orbs use DNS `1.1.1.1` and `9.9.9.9`
+(`ORBD_DNS`). `orbd agent list` and `orbd agent remove <id>` manage agents; a removed
+agent's orbs stay on it, unavailable. Stopping an agent's container stops its QEMU orbs.
 
 ## License
 

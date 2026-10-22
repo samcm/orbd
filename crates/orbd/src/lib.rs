@@ -14,6 +14,7 @@ pub mod coordinator;
 pub mod doctor;
 pub mod image;
 pub mod model;
+pub mod pki;
 pub mod runtime;
 pub mod secrets;
 pub mod telemetry;

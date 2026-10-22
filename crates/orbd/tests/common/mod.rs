@@ -1,6 +1,6 @@
-//! Process-level test cluster: a real `orbd coordinator`, real `orbd agent`s with the
-//! fake runtime, mTLS with throwaway certificates, and jobs run through `orbd dispatch`
-//! exactly as `amp orb provider` would run them.
+//! Process-level test cluster: a real `orbd coordinator` with its built-in CA, real
+//! `orbd agent`s with the fake runtime that enroll with `orbd join-token` tokens, and jobs
+//! run through `orbd dispatch` exactly as `amp orb provider` would run them.
 
 #![allow(dead_code)]
 
@@ -35,6 +35,9 @@ pub struct Cluster {
     metrics_port: u16,
     coordinator: Option<Child>,
     agents: BTreeMap<String, Option<Child>>,
+    /// Each agent's join token, passed on every start like a container's ORBD_JOIN.
+    tokens: BTreeMap<String, String>,
+    agent_orbs: u64,
 }
 
 pub struct Job {
@@ -44,120 +47,42 @@ pub struct Job {
 }
 
 impl Cluster {
-    /// Writes certificates and configs for a coordinator and the given agents, each
-    /// agent with room for `agent_orbs` orbs of the test offering.
+    /// Writes configs for a coordinator and the given agents, each agent with room for
+    /// `agent_orbs` orbs of the test offering.
     pub fn new(agent_ids: &[&str], agent_orbs: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let control_port = free_port();
         let metrics_port = free_port();
-
-        // PKI: one CA signs the coordinator (localhost) and every agent (CN = SAN = id).
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "orbd test CA");
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-        let issuer = rcgen::Issuer::new(ca_params, ca_key);
-        write(&root.join("pki/ca.pem"), ca_cert.pem());
-        let leaf = |name: &str| {
-            let key = rcgen::KeyPair::generate().unwrap();
-            let mut p = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
-            p.distinguished_name.push(rcgen::DnType::CommonName, name);
-            let cert = p.signed_by(&key, &issuer).unwrap();
-            write(&root.join(format!("pki/{name}.pem")), cert.pem());
-            write(&root.join(format!("pki/{name}.key")), key.serialize_pem());
-        };
-        leaf("localhost");
-        for a in agent_ids {
-            leaf(a);
-        }
         write(
-            &root.join("coordinator.key"),
-            orbd::secrets::SecretKey::generate_hex(),
-        );
-
-        let pki = root.join("pki");
-        let agents: String = agent_ids
-            .iter()
-            .map(|a| format!("      - id: {a}\n"))
-            .collect();
-        let coord = format!(
-            r#"coordinator:
-  state_dir: {root}/coordinator
-  dispatch_socket: {root}/coordinator/dispatch.sock
-  secret_key_file: {root}/coordinator.key
-  metrics_listen: 127.0.0.1:{metrics_port}
-
-amp_endpoints:
-  - id: amp
-    url: https://ampcode.com
-
-backends:
-  - kind: agent_fleet
-    id: fleet
-    listen: 127.0.0.1:{control_port}
-    heartbeat_interval_ms: 300
-    tls:
-      certificate_file: {pki}/localhost.pem
-      private_key_file: {pki}/localhost.key
-      ca_file: {pki}/ca.pem
-    agents:
-{agents}
+            &root.join("coordinator.yaml"),
+            format!(
+                r#"public_url: https://localhost:{control_port}
+listen: 127.0.0.1:{control_port}
+state_dir: {root}/coordinator
+metrics_listen: 127.0.0.1:{metrics_port}
+heartbeat_interval_ms: 300
 offerings:
   - id: {OFFERING}
-    amp_endpoint: amp
-    backend: fleet
     runtime: fake
     resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}
-    pause: {{ mode: memory_preserving, on_checkpoint_failure: cold_stop }}
 "#,
-            root = root.display(),
-            pki = pki.display(),
+                root = root.display(),
+            ),
         );
-        for a in agent_ids {
-            let agent_dir = root.join("agents").join(a);
-            write(
-                &agent_dir.join("secret.key"),
-                orbd::secrets::SecretKey::generate_hex(),
-            );
-            write(
-                &agent_dir.join("agent.yaml"),
-                format!(
-                    r#"agent:
-  id: {a}
-  coordinator_url: https://localhost:{control_port}
-  state_dir: {d}/state
-  run_dir: {d}/run
-  secret_key_file: {d}/secret.key
-  capacity: {{ vcpus: {cpus}, memory_mib: {mem}, disk_gib: {disk} }}
-  tls:
-    certificate_file: {pki}/{a}.pem
-    private_key_file: {pki}/{a}.key
-    ca_file: {pki}/ca.pem
-
-runtime:
-  fake:
-    memory_preserving_sleep: true
-"#,
-                    d = agent_dir.display(),
-                    pki = pki.display(),
-                    cpus = 2 * agent_orbs,
-                    mem = 2048 * agent_orbs,
-                    disk = 4 * agent_orbs,
-                ),
-            );
-        }
-        write(&root.join("coordinator.yaml"), coord);
-
+        // Only the fake runtime needs a file; everything else is flags and env.
+        write(
+            &root.join("agent.yaml"),
+            "runtime:\n  fake:\n    memory_preserving_sleep: true\n",
+        );
         Self {
             dir,
             control_port,
             metrics_port,
             coordinator: None,
             agents: agent_ids.iter().map(|a| (a.to_string(), None)).collect(),
+            tokens: BTreeMap::new(),
+            agent_orbs,
         }
     }
 
@@ -195,10 +120,14 @@ runtime:
             .unwrap()
     }
 
+    fn coordinator_config(&self) -> String {
+        self.root().join("coordinator.yaml").display().to_string()
+    }
+
     pub fn start_coordinator(&mut self, failpoints: &str) {
-        let cfg = self.root().join("coordinator.yaml");
+        let cfg = self.coordinator_config();
         let child = self.spawn_orbd(
-            &["coordinator", "--config", cfg.to_str().unwrap()],
+            &["coordinator", "--config", &cfg],
             "coordinator.log",
             failpoints,
         );
@@ -207,14 +136,70 @@ runtime:
         wait_until(Duration::from_secs(20), "dispatch socket", || sock.exists());
     }
 
+    /// Runs an admin command (`join-token`, `agent list|remove`) against the coordinator.
+    pub fn admin(&self, args: &[&str]) -> Job {
+        let out = Command::new(env!("CARGO_BIN_EXE_orbd"))
+            .args(args)
+            .args(["--config", &self.coordinator_config()])
+            .output()
+            .unwrap();
+        Job {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).trim().into(),
+            stderr: String::from_utf8_lossy(&out.stderr).into(),
+        }
+    }
+
+    pub fn join_token(&self, id: &str) -> String {
+        let j = self.admin(&["join-token", id]);
+        assert_ok(&j, "join-token");
+        j.stdout
+    }
+
+    /// An agent process for `id` with `token`, logging to `agent-<id>.log`.
+    pub fn agent_command(&self, id: &str, token: &str, failpoints: &str) -> Command {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root().join(format!("agent-{id}.log")))
+            .unwrap();
+        let state = self.root().join("agents").join(id).join("state");
+        let n = self.agent_orbs;
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_orbd"));
+        cmd.arg("agent")
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--config")
+            .arg(self.root().join("agent.yaml"))
+            .env("ORBD_JOIN", token)
+            .env("ORBD_CAPACITY_VCPUS", (2 * n).to_string())
+            .env("ORBD_CAPACITY_MEMORY_MIB", (2048 * n).to_string())
+            .env("ORBD_CAPACITY_DISK_GIB", (4 * n).to_string())
+            .env("RUST_LOG", "info,orbd=debug")
+            .env("FAILPOINTS", failpoints)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        cmd
+    }
+
+    /// Starts agent `id`, minting its join token on first start.
     pub fn start_agent(&mut self, id: &str, failpoints: &str) {
-        let cfg = self.root().join("agents").join(id).join("agent.yaml");
-        let child = self.spawn_orbd(
-            &["agent", "--config", cfg.to_str().unwrap()],
-            &format!("agent-{id}.log"),
-            failpoints,
-        );
+        if !self.tokens.contains_key(id) {
+            let token = self.join_token(id);
+            self.tokens.insert(id.to_string(), token);
+        }
+        let child = self
+            .agent_command(id, &self.tokens[id], failpoints)
+            .spawn()
+            .unwrap();
         self.agents.insert(id.to_string(), Some(child));
+    }
+
+    /// Starts an agent that is not part of the initial cluster, with a given token.
+    pub fn start_agent_with_token(&mut self, id: &str, token: &str) {
+        self.tokens.insert(id.to_string(), token.to_string());
+        self.start_agent(id, "");
     }
 
     /// Starts the coordinator and all agents and waits until every agent is connected.

@@ -1,39 +1,54 @@
-//! Coordinator configuration (`orbd coordinator --config coordinator.yaml`).
+//! Coordinator configuration (`orbd coordinator`, default `/etc/orbd/orbd.yaml`).
+//!
+//! Only `public_url` and `offerings` are required:
+//!
+//! ```yaml
+//! public_url: https://coordinator.example:7443
+//! offerings:
+//!   - id: qemu-4vcpu-8gb
+//!     runtime: qemu
+//!     resources: { vcpus: 4, memory_mib: 8192, disk_gib: 40 }
+//!     provider_token_file: /etc/orbd/tokens/qemu-4vcpu-8gb
+//! ```
+//!
+//! The coordinator serves one Amp endpoint and one agent fleet; pause policy and
+//! capability requirements follow from each offering's runtime.
 
-use super::{ConfigError, ResourcesConfig, TlsFiles, load_yaml};
+use super::{ConfigError, ResourcesConfig, load_yaml};
 use crate::model::{
-    AgentId, AmpEndpointId, BackendId, CapabilityRequirements, CheckpointFailurePolicy,
-    ExecutionTarget, NestedKvmRequirement, Offering, OfferingId, PausePolicy, RuntimeKind,
-    SnapshotRequirement, SnapshotScope, SpecTemplate,
+    AmpEndpointId, BackendId, CapabilityRequirements, CheckpointFailurePolicy, ExecutionTarget,
+    NestedKvmRequirement, Offering, OfferingId, PausePolicy, RuntimeKind, SnapshotRequirement,
+    SpecTemplate,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoordinatorConfig {
-    pub coordinator: CoordinatorSection,
-    #[serde(default)]
-    pub amp_endpoints: Vec<AmpEndpointConfig>,
-    #[serde(default)]
-    pub backends: Vec<BackendConfig>,
-    #[serde(default)]
-    pub offerings: Vec<OfferingConfig>,
-}
+/// Id of the single Amp endpoint (orb identity is scoped by it).
+pub const AMP_ENDPOINT: &str = "amp";
+/// Id of the single agent-fleet backend (recorded in every orb's location).
+pub const FLEET_BACKEND: &str = "fleet";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CoordinatorSection {
-    /// Holds `coordinator.sqlite`, its process lock and the generated dispatch wrapper.
+pub struct CoordinatorConfig {
+    /// URL agents dial, e.g. `https://coordinator.example:7443`. Join tokens carry it, and
+    /// its host is the name on the coordinator's certificate.
+    pub public_url: String,
+    /// AgentControl listener (TLS).
+    #[serde(default = "default_listen")]
+    pub listen: SocketAddr,
+    /// Database, keys, CA and the local dispatch/admin sockets.
+    #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    /// Local unix socket for `orbd dispatch`.
-    pub dispatch_socket: PathBuf,
-    /// 64 hex chars; seals persisted guest env and keys spawn fingerprints.
-    pub secret_key_file: PathBuf,
+    #[serde(default = "default_amp_url")]
+    pub amp_url: String,
     /// Prometheus listener, e.g. `127.0.0.1:9464`. Disabled when absent.
     pub metrics_listen: Option<SocketAddr>,
+    /// Heartbeat interval sent to agents in `Welcome`.
+    #[serde(default = "default_heartbeat_ms")]
+    pub heartbeat_interval_ms: u64,
     /// Executable the generated `orbd-dispatch` wrapper runs as `<exe> dispatch`.
     /// Defaults to the running orbd binary; set it to a stable path (e.g.
     /// `/usr/local/bin/orbd`) if the binary is replaced in place on upgrade.
@@ -45,6 +60,23 @@ pub struct CoordinatorSection {
     /// restarted onto a new version between jobs. The CLI never self-updates.
     #[serde(default = "default_amp_cli_update_interval")]
     pub amp_cli_update_interval_secs: u64,
+    pub offerings: Vec<OfferingConfig>,
+}
+
+fn default_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 7443))
+}
+
+pub(crate) fn default_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/orbd")
+}
+
+fn default_amp_url() -> String {
+    "https://ampcode.com".into()
+}
+
+fn default_heartbeat_ms() -> u64 {
+    5_000
 }
 
 fn default_amp_cli_update_interval() -> u64 {
@@ -57,115 +89,47 @@ fn default_amp_cli() -> PathBuf {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AmpEndpointConfig {
-    pub id: AmpEndpointId,
-    pub url: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BackendConfig {
-    AgentFleet(FleetBackendConfig),
-}
-
-impl BackendConfig {
-    pub fn id(&self) -> &BackendId {
-        match self {
-            Self::AgentFleet(f) => &f.id,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FleetBackendConfig {
-    pub id: BackendId,
-    /// AgentControl gRPC listener (mTLS).
-    pub listen: SocketAddr,
-    pub tls: TlsFiles,
-    /// Agents allowed to connect. Each agent's certificate must name its id
-    /// (subject CN or a DNS SAN).
-    #[serde(default)]
-    pub agents: Vec<AuthorizedAgent>,
-    /// Heartbeat interval sent to agents in `Welcome`.
-    #[serde(default = "default_heartbeat_ms")]
-    pub heartbeat_interval_ms: u64,
-}
-
-fn default_heartbeat_ms() -> u64 {
-    5_000
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorizedAgent {
-    pub id: AgentId,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OfferingConfig {
     pub id: OfferingId,
-    pub amp_endpoint: AmpEndpointId,
     /// `AMP_ORB_PROVIDER_TOKEN` for this offering's `amp orb provider` child.
     /// When absent the offering is served for local dispatch only (tests).
     pub provider_token_file: Option<PathBuf>,
-    pub backend: BackendId,
-    /// Fleet runtime.
     pub runtime: RuntimeKind,
     pub resources: ResourcesConfig,
-    pub pause: PauseConfig,
-    #[serde(default)]
-    pub require: RequireConfig,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PauseConfig {
-    DiskOnly,
-    MemoryPreserving {
-        on_checkpoint_failure: CheckpointFailurePolicy,
-    },
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequireConfig {
-    #[serde(default)]
-    pub release_compute_when_paused: bool,
-    #[serde(default)]
-    pub nested_kvm: NestedKvmRequirement,
-    #[serde(default)]
-    pub project_snapshots: Option<SnapshotScope>,
 }
 
 impl OfferingConfig {
+    /// Pause policy and requirements are what the runtime is for: VM runtimes keep
+    /// memory across sleep (falling back to a cold stop) and QEMU gives orbs `/dev/kvm`;
+    /// Docker sleeps to disk. Every fleet runtime releases compute while paused.
     pub fn to_offering(&self) -> Result<Offering, ConfigError> {
+        let pause_policy = match self.runtime {
+            RuntimeKind::Docker => PausePolicy::DiskOnly,
+            RuntimeKind::Qemu | RuntimeKind::Firecracker | RuntimeKind::Fake => {
+                PausePolicy::MemoryPreserving {
+                    on_failure: CheckpointFailurePolicy::ColdStop,
+                }
+            }
+        };
+        let nested_kvm = match self.runtime {
+            RuntimeKind::Qemu => NestedKvmRequirement::GuestDevice,
+            _ => NestedKvmRequirement::NotRequired,
+        };
         Ok(Offering {
             id: self.id.clone(),
-            amp_endpoint: self.amp_endpoint.clone(),
-            backend_id: self.backend.clone(),
+            amp_endpoint: AmpEndpointId::new(AMP_ENDPOINT),
+            backend_id: BackendId::new(FLEET_BACKEND),
             spec: SpecTemplate {
                 target: ExecutionTarget::Fleet {
                     runtime: self.runtime,
                 },
                 resources: self.resources.to_resources()?,
                 requirements: CapabilityRequirements {
-                    release_compute_when_paused: self.require.release_compute_when_paused,
-                    nested_kvm: self.require.nested_kvm,
-                    project_snapshots: match self.require.project_snapshots {
-                        None => SnapshotRequirement::NotRequired,
-                        Some(scope) => SnapshotRequirement::Required { scope },
-                    },
+                    release_compute_when_paused: true,
+                    nested_kvm,
+                    project_snapshots: SnapshotRequirement::NotRequired,
                 },
-                pause_policy: match self.pause {
-                    PauseConfig::DiskOnly => PausePolicy::DiskOnly,
-                    PauseConfig::MemoryPreserving {
-                        on_checkpoint_failure,
-                    } => PausePolicy::MemoryPreserving {
-                        on_failure: on_checkpoint_failure,
-                    },
-                },
+                pause_policy,
             },
         })
     }
@@ -178,35 +142,19 @@ impl CoordinatorConfig {
         Ok(cfg)
     }
 
-    /// Structural validation. Capability validation against backends happens when the
-    /// backends are constructed (see `coordinator`).
+    /// Structural validation. Capability validation against the backend happens when
+    /// it is constructed (see `coordinator`).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let inv = |m: String| Err(ConfigError::Invalid(m));
-        let mut seen = HashSet::new();
-        for e in &self.amp_endpoints {
-            if !seen.insert(e.id.as_str()) {
-                return inv(format!("duplicate amp_endpoint {}", e.id));
-            }
-        }
-        let mut backends = HashSet::new();
-        for b in &self.backends {
-            if !backends.insert(b.id().as_str()) {
-                return inv(format!("duplicate backend {}", b.id()));
-            }
+        crate::pki::url_host(&self.public_url)
+            .map_err(|e| ConfigError::Invalid(format!("public_url: {e}")))?;
+        if self.heartbeat_interval_ms == 0 {
+            return inv("heartbeat_interval_ms must be > 0".into());
         }
         let mut offerings = HashSet::new();
         for o in &self.offerings {
             if !offerings.insert(o.id.as_str()) {
                 return inv(format!("duplicate offering {}", o.id));
-            }
-            if !seen.contains(o.amp_endpoint.as_str()) {
-                return inv(format!(
-                    "offering {}: unknown amp_endpoint {}",
-                    o.id, o.amp_endpoint
-                ));
-            }
-            if !backends.contains(o.backend.as_str()) {
-                return inv(format!("offering {}: unknown backend {}", o.id, o.backend));
             }
             let r = o.resources;
             if r.vcpus == 0 || r.memory_mib == 0 || r.disk_gib == 0 {
@@ -222,6 +170,16 @@ impl CoordinatorConfig {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.coordinator.state_dir.join("coordinator.sqlite")
+        self.state_dir.join("coordinator.sqlite")
+    }
+
+    /// Local socket for `orbd dispatch`.
+    pub fn dispatch_socket(&self) -> PathBuf {
+        self.state_dir.join("dispatch.sock")
+    }
+
+    /// Local socket for `orbd join-token` and `orbd agent list/remove`.
+    pub fn admin_socket(&self) -> PathBuf {
+        self.state_dir.join("admin.sock")
     }
 }

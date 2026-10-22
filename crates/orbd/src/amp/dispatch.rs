@@ -130,7 +130,8 @@ fn build_job() -> Result<Job, String> {
     })
 }
 
-async fn connect(socket: &std::path::Path) -> Result<Channel, tonic::transport::Error> {
+/// A gRPC channel over a local unix socket.
+pub(crate) async fn connect(socket: &std::path::Path) -> Result<Channel, tonic::transport::Error> {
     let socket = socket.to_owned();
     // The URI is required by tonic but unused by the connector.
     Endpoint::from_static("http://orbd.invalid")

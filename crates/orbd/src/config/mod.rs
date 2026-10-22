@@ -1,6 +1,6 @@
-//! YAML configuration. Everything here is deployment input; the app ships no
-//! deployment-specific defaults (no hosts, tokens, offerings or budgets).
-//! Unknown fields are rejected. Units are normalised to exact integer bytes at load.
+//! YAML configuration. Defaults cover everything but the coordinator's `public_url` and
+//! offerings; agents need no file at all. Unknown fields are rejected. Units are
+//! normalised to exact integer bytes at load.
 
 pub mod agent;
 pub mod coordinator;
@@ -54,14 +54,4 @@ impl ResourcesConfig {
             disk_bytes: self.disk_gib.checked_mul(GIB).ok_or_else(bad)?,
         })
     }
-}
-
-/// Files for mutual TLS.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TlsFiles {
-    pub certificate_file: std::path::PathBuf,
-    pub private_key_file: std::path::PathBuf,
-    /// CA that signs the peer's certificate.
-    pub ca_file: std::path::PathBuf,
 }

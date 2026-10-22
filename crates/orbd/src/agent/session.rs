@@ -10,7 +10,6 @@ use crate::model::{
     StableOrbState, unix_ms_now,
 };
 use crate::secrets::PermittedGuestEnv;
-use anyhow::Context;
 use orbd_proto::CONTROL_PROTOCOL_VERSION;
 use orbd_proto::control::v1 as pb;
 use orbd_proto::control::v1::agent_control_client::AgentControlClient;
@@ -20,7 +19,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 // --- event builders ---------------------------------------------------------
 
@@ -79,47 +77,12 @@ pub(super) async fn run_loop(sh: &Arc<Shared>) {
     }
 }
 
-async fn make_channel(sh: &Shared) -> anyhow::Result<Channel> {
-    let a = &sh.config.agent;
-    let cert = tokio::fs::read(&a.tls.certificate_file)
-        .await
-        .context("reading client certificate")?;
-    let key = tokio::fs::read(&a.tls.private_key_file)
-        .await
-        .context("reading client private key")?;
-    let ca = tokio::fs::read(&a.tls.ca_file)
-        .await
-        .context("reading CA certificate")?;
-    let uri: tonic::transport::Uri = a.coordinator_url.parse().context("coordinator_url")?;
-    let server_name = match &a.coordinator_server_name {
-        Some(n) => n.clone(),
-        None => uri
-            .host()
-            .context("coordinator_url has no host")?
-            .to_owned(),
-    };
-    let tls = ClientTlsConfig::new()
-        .identity(Identity::from_pem(cert, key))
-        .ca_certificate(Certificate::from_pem(ca))
-        .domain_name(server_name);
-    let channel = Endpoint::from(uri)
-        .tls_config(tls)?
-        .connect_timeout(Duration::from_secs(5))
-        .tcp_nodelay(true)
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(true)
-        .connect()
-        .await?;
-    Ok(channel)
-}
-
 async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
     let epoch = sh.db.call(|c| db::highest_epoch(c)).await?;
     let mut runtimes: Vec<_> = sh.runtimes.values().map(|r| r.capabilities()).collect();
     runtimes.sort_by_key(|c| c.kind.as_str());
     Ok(ev(pb::agent_event::Event::Hello(pb::Hello {
-        agent_id: sh.config.agent.id.0.clone(),
+        agent_id: sh.identity.agent_id.0.clone(),
         boot_id: sh.boot_id.clone(),
         protocol_versions: vec![CONTROL_PROTOCOL_VERSION],
         runtimes: runtimes
@@ -153,7 +116,7 @@ fn heartbeat(sh: &Shared) -> pb::AgentEvent {
 async fn connect_once(sh: &Arc<Shared>, attempt: &mut u32) -> anyhow::Result<()> {
     let channel = tokio::select! {
         _ = sh.shutdown.cancelled() => return Ok(()),
-        c = make_channel(sh) => c?,
+        c = sh.identity.mtls_channel() => c?,
     };
     let mut client = AgentControlClient::new(channel);
     let (out_tx, out_rx) = mpsc::channel::<pb::AgentEvent>(4);

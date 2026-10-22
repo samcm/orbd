@@ -46,10 +46,13 @@ x509-parser.workspace = true
 oci-client.workspace = true
 rustls.workspace = true
 tar.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
+base64.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rcgen.workspace = true
 
 [features]
 # Enables `fail` failpoints (FAILPOINTS env var) for crash-recovery tests. Never in releases.

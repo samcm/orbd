@@ -13,8 +13,11 @@ pub struct Db {
     tx: std::sync::mpsc::Sender<Job>,
 }
 
-/// Schema migrations, applied in order; `PRAGMA user_version` records progress.
-const MIGRATIONS: &[&str] = &[r#"
+/// Bump on any schema change. There are no upgrade paths: a database with another
+/// version is refused (delete the state directory to start over).
+const SCHEMA_VERSION: i64 = 2;
+
+const SCHEMA: &str = r#"
 CREATE TABLE meta (
     key TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -109,7 +112,33 @@ CREATE TABLE secret_payloads (
     sealed BLOB NOT NULL,
     created_ms INTEGER NOT NULL
 );
-"#];
+
+-- Agent registry: the source of truth for which agents may connect. Removed agents stay
+-- as tombstones (their orbs keep referencing the id; the id is never reused).
+CREATE TABLE agents (
+    id TEXT PRIMARY KEY,
+    -- SHA-256 (hex) of the agent's public key; certificates for any other key are refused.
+    key_sha256 TEXT NOT NULL,
+    cert_not_after_ms INTEGER NOT NULL,
+    enrolled_ms INTEGER NOT NULL,
+    removed_ms INTEGER
+);
+
+-- Single-use join tokens. Only a hash of the secret is stored.
+CREATE TABLE join_tokens (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    secret_sha256 TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL,
+    revoked_ms INTEGER,
+    redeemed_ms INTEGER,
+    -- Set on redemption, so a retry with the same CSR gets the same certificate.
+    csr_sha256 TEXT,
+    cert_der BLOB
+);
+CREATE INDEX join_tokens_agent ON join_tokens (agent_id);
+"#;
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
@@ -150,17 +179,18 @@ impl Db {
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if current as usize > MIGRATIONS.len() {
-        bail!(
-            "database schema version {current} is newer than this orbd supports ({})",
-            MIGRATIONS.len()
-        );
+    match current {
+        SCHEMA_VERSION => Ok(()),
+        0 => {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            Ok(())
+        }
+        v => bail!(
+            "database schema version {v} is not {SCHEMA_VERSION} (this orbd); orbd has no \
+             upgrade path: delete the coordinator state directory to start over"
+        ),
     }
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
-        tx.commit()?;
-    }
-    Ok(())
 }
