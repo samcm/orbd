@@ -154,15 +154,17 @@ pub async fn run(
         runtimes.insert(RuntimeKind::Docker, Arc::new(rt));
     }
     if let Some(q) = &config.runtime.qemu {
-        let images: Arc<dyn crate::runtime::qemu::images::ImageProvider> = match &config.images {
-            Some(i) => Arc::new(
-                crate::image::ImageStore::open(i, &config.agent.state_dir)
-                    .map_err(|e| anyhow::anyhow!("image store: {e}"))?,
-            ),
-            None => Arc::new(crate::runtime::qemu::images::StaticImages(
-                q.static_images.clone(),
-            )),
-        };
+        let images: Arc<dyn crate::runtime::qemu::images::ImageProvider> =
+            match (&config.images, q.static_images.is_empty()) {
+                (_, false) => Arc::new(crate::runtime::qemu::images::StaticImages(
+                    q.static_images.clone(),
+                )),
+                (Some(i), true) => Arc::new(
+                    crate::image::ImageStore::open(i, &config.agent.state_dir)
+                        .map_err(|e| anyhow::anyhow!("image store: {e}"))?,
+                ),
+                (None, true) => anyhow::bail!("the qemu runtime needs `images` or static_images"),
+            };
         let rt = crate::runtime::qemu::QemuRuntime::new(
             q.clone(),
             &config.agent.state_dir,

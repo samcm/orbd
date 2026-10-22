@@ -5,7 +5,7 @@
 //! in `<state_dir>/runtime`; later starts use it or fail, so an agent never abandons its
 //! orbs because detection changed.
 
-use crate::config::agent::{AMP_ORB_IMAGE, AgentConfig, DockerRuntimeConfig};
+use crate::config::agent::{AMP_ORB_IMAGE, AgentConfig, DockerRuntimeConfig, QemuRuntimeConfig};
 use crate::model::{GIB, MIB, Resources, RuntimeKind};
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -48,7 +48,7 @@ async fn usable(kind: RuntimeKind) -> Result<(), String> {
 /// Fills in a runtime when the config names none, and the agent's DNS servers.
 pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     let r = &mut config.runtime;
-    if r.fake.is_none() && r.docker.is_none() {
+    if r.fake.is_none() && r.docker.is_none() && r.qemu.is_none() {
         let record = config.agent.state_dir.join("runtime");
         let kind = match std::fs::read_to_string(&record) {
             Ok(s) => {
@@ -78,11 +78,23 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
                     ..Default::default()
                 })
             }
-            other => bail!("the {} runtime is not in this build", other.as_str()),
+            RuntimeKind::Qemu => {
+                r.qemu = Some(QemuRuntimeConfig::default());
+                if let Some(images) = &mut config.images
+                    && images.prewarm.is_empty()
+                {
+                    images.prewarm.push(AMP_ORB_IMAGE.into());
+                }
+            }
+            other => bail!("the {} runtime is never detected", other.as_str()),
         }
     }
+    let r = &mut config.runtime;
     if let Some(d) = &mut r.docker {
         d.dns_servers = config.agent.dns_servers.clone();
+    }
+    if let Some(q) = &mut r.qemu {
+        q.dns_servers = config.agent.dns_servers.clone();
     }
     Ok(())
 }
@@ -95,9 +107,8 @@ fn parse_kind(s: &str) -> Option<RuntimeKind> {
 
 async fn detect() -> Result<RuntimeKind> {
     let qemu = qemu_usable();
-    // The QEMU runtime is not in this build yet; when it lands, `Ok` here returns Qemu.
     if qemu.is_ok() {
-        tracing::warn!("KVM and QEMU are usable but this build has no QEMU runtime");
+        return Ok(RuntimeKind::Qemu);
     }
     match usable(RuntimeKind::Docker).await {
         Ok(()) => Ok(RuntimeKind::Docker),

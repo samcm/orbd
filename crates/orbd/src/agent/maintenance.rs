@@ -4,7 +4,7 @@
 //! draining; in-flight operations are interrupted and stay accepted. Then every running
 //! orb whose runtime and offering preserve memory is checkpointed through its own
 //! executor (so it never races a spawn, pause or delete), smallest first, within
-//! `agent.shutdown_budget_secs`. A restore intent bound to the orb's command generation
+//! [`SHUTDOWN_BUDGET`]. A restore intent bound to the orb's command generation
 //! is recorded before each save; a save that does not complete clears it and records
 //! what is actually left (a cold-stopped disk, processes lost).
 //!
@@ -26,6 +26,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+/// How long a graceful stop may take. Give the process manager more, e.g.
+/// `docker stop -t 300` or compose `stop_grace_period: 300s`; a save cut off by the
+/// final SIGKILL is never published (the orb is reported stopped, processes lost).
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(280);
 /// Kept from the shutdown budget for cleanup after a failed save.
 const CLEANUP_RESERVE: Duration = Duration::from_secs(20);
 /// Per-orb budget for restoring after a restart.
@@ -49,7 +53,7 @@ pub(crate) enum Outcome {
 /// Graceful stop: stop admission, then checkpoint running orbs within the budget.
 pub(super) async fn drain(sh: &Arc<Shared>) {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(sh.config.agent.shutdown_budget_secs);
+    let deadline = started + SHUTDOWN_BUDGET;
     sh.draining.cancel();
     sh.send_control(super::session::heartbeat(sh));
     let defs = match sh.db.call(|c| db::list_orb_definitions(c)).await {
@@ -73,7 +77,7 @@ pub(super) async fn drain(sh: &Arc<Shared>) {
     orbs.sort_by_key(|d| d.spec.template.resources.memory_bytes);
     tracing::info!(
         candidates = orbs.len(),
-        budget_secs = sh.config.agent.shutdown_budget_secs,
+        budget_secs = SHUTDOWN_BUDGET.as_secs(),
         "draining: checkpointing running orbs, smallest first"
     );
     let (mut saved, mut failed, mut unchanged) = (0, Vec::new(), 0);

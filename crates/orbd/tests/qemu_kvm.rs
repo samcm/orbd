@@ -22,30 +22,21 @@ use std::time::{Duration, Instant};
 const IMAGE: &str = "example.invalid/amp-orb:latest";
 const MEMORY_MIB: u64 = 2048;
 
-fn cluster(on_checkpoint_failure: &str, cmdline_extra: &str, orbs: u64) -> Cluster {
+fn cluster(orbs: u64) -> Cluster {
     let kernel = std::env::var("ORBD_KVM_KERNEL").expect("set ORBD_KVM_KERNEL");
     let rootfs = std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS");
     Cluster::with_runtime(
         &["agent-a"],
-        &RuntimeSetup {
-            offering: "qemu-2vcpu-2gb".into(),
-            runtime: "qemu".into(),
-            vcpus: 2,
-            memory_mib: MEMORY_MIB,
-            disk_gib: 4,
-            on_checkpoint_failure: on_checkpoint_failure.into(),
-            agent_orbs: orbs,
-            agent_runtime: format!(
-                r#"  qemu:
+        orbs,
+        "qemu",
+        &format!(
+            r#"runtime:
+  qemu:
     kernel: {kernel}
-    kernel_cmdline: "console=ttyS0 root=/dev/vda rw {cmdline_extra}"
-    dns_servers: ["1.1.1.1"]
-    shutdown_grace_secs: 20
     static_images:
       - {{ image_ref: "{IMAGE}", rootfs: {rootfs} }}
 "#
-            ),
-        },
+        ),
     )
 }
 
@@ -189,7 +180,7 @@ fn checkpoint_files(orb: &Path) -> Vec<(String, u64)> {
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn sleep_preserves_processes_and_nested_guest() {
-    let mut c = cluster("cold_stop", "", 1);
+    let mut c = cluster(1);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
 
@@ -271,7 +262,7 @@ fn sleep_preserves_processes_and_nested_guest() {
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
-    let mut c = cluster("cold_stop", "", 1);
+    let mut c = cluster(1);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
@@ -397,7 +388,7 @@ fn line_count(orb: &Path, pat: &str) -> usize {
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn graceful_agent_restart_keeps_running_orbs() {
-    let mut c = cluster("cold_stop", "", 2);
+    let mut c = cluster(2);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");

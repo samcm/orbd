@@ -26,6 +26,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME: usize = 64 * 1024;
 const RETRY: Duration = Duration::from_millis(200);
+/// How long a spawn waits for the guest helper's first answer before failing bootstrap.
+const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Hello timeouts per connection: 1 s, doubling to 10 s. A Hello can be lost when a
 /// restored guest drops a connection it still held from before the save.
 const HELLO_ATTEMPT_MAX: Duration = Duration::from_secs(10);
@@ -313,9 +315,7 @@ impl GuestControl for QemuRuntime {
         let deadline = ctx.work_deadline;
         let started = Instant::now();
         // A guest that never answers is a bootstrap failure, not a spent budget.
-        let ready_by = (Instant::now()
-            + Duration::from_secs(self.config.guest_connect_timeout_secs))
-        .min(deadline);
+        let ready_by = (Instant::now() + GUEST_CONNECT_TIMEOUT).min(deadline);
         let ready = tokio::select! {
             _ = ctx.cancel.cancelled() => return Err(GuestError::Cancelled),
             r = open(&connector, ready_by) => r,
@@ -327,7 +327,7 @@ impl GuestControl for QemuRuntime {
             }
             let msg = format!(
                 "guest helper did not answer within {}s ({e}); console: {}",
-                self.config.guest_connect_timeout_secs,
+                GUEST_CONNECT_TIMEOUT.as_secs(),
                 super::log_tail(&self.orb_paths(orb.id).console_log)
             );
             log(ctx, &msg);

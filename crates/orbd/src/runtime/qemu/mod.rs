@@ -76,6 +76,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MACHINE: &str = "pc-q35-7.2";
 const QMP_TIMEOUT: Duration = Duration::from_secs(5);
 const PREPARE_SLEEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Orb's own kernel command line (guest contract in `guest/README.md`).
+const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw";
+/// How long a cold stop waits for a clean guest shutdown before quitting QEMU.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Memory saves at once on this host (disk bandwidth is the bottleneck).
+const CONCURRENT_SAVES: usize = 1;
 /// Checkpoint headroom beyond guest RAM (device state, ROMs, stream framing).
 const CHECKPOINT_MARGIN: u64 = 256 * MIB;
 const CHUNK: usize = 4 * 1024 * 1024;
@@ -233,7 +239,7 @@ impl QemuRuntime {
         let longest = qemu_run
             .join(OrbId(uuid::Uuid::nil()).to_string())
             .join("migrate-out.sock");
-        if longest.as_os_str().len() >= 100 {
+        if longest.as_os_str().len() >= 108 {
             return Err(other(
                 "run_dir",
                 &format!("{} is too long for unix socket paths", run_dir.display()),
@@ -273,16 +279,16 @@ impl QemuRuntime {
             model: field("model name"),
             flags_sha256: hex::encode(Sha256::digest(field("flags").as_bytes())),
         };
+        // Nested virtualization is on unless the loaded KVM module says it is off.
         let nested_kvm = Path::new("/dev/kvm").exists()
-            && ["kvm_amd", "kvm_intel"].iter().any(|m| {
+            && !["kvm_amd", "kvm_intel"].iter().any(|m| {
                 std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested"))
-                    .map(|v| matches!(v.trim(), "1" | "Y"))
-                    .unwrap_or(false)
+                    .is_ok_and(|v| matches!(v.trim(), "0" | "N"))
             });
         let direct_io = probe_direct_io(&state_dir.join("orbs"));
         tracing::info!(qemu = %qemu.version, cpu = %cpu.model, direct_io, nested_kvm, "qemu runtime ready");
         Ok(Self {
-            saves: tokio::sync::Semaphore::new(config.max_concurrent_saves),
+            saves: tokio::sync::Semaphore::new(CONCURRENT_SAVES),
             config,
             state_dir: state_dir.to_owned(),
             run_dir: run_dir.to_owned(),
@@ -629,8 +635,7 @@ impl QemuRuntime {
             &kernel.path.display().to_string(),
             "-append",
             &format!(
-                "{} systemd.machine_id={}",
-                self.config.kernel_cmdline,
+                "{KERNEL_CMDLINE} systemd.machine_id={}",
                 machine_id(recipe.orb)
             ),
             "-serial",
@@ -1250,7 +1255,7 @@ impl QemuRuntime {
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
         if status == "running" {
-            let grace = Instant::now() + Duration::from_secs(self.config.shutdown_grace_secs);
+            let grace = Instant::now() + SHUTDOWN_GRACE;
             let soft = grace.min(
                 deadline
                     .checked_sub(Duration::from_secs(5))

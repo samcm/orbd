@@ -102,16 +102,6 @@ pub struct AgentSection {
     /// Tailscale's 100.100.100.100 is unreachable from orbs.
     pub dns_servers: Vec<String>,
     pub metrics_listen: Option<SocketAddr>,
-    /// How long a graceful stop (SIGTERM) may take: running memory-preserving orbs are
-    /// checkpointed (smallest first) and restored at the next start. Give the process
-    /// manager a longer stop timeout, e.g. `docker stop -t 300` or compose
-    /// `stop_grace_period: 300s` for the default.
-    #[serde(default = "default_shutdown_budget_secs")]
-    pub shutdown_budget_secs: u64,
-}
-
-fn default_shutdown_budget_secs() -> u64 {
-    280
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
@@ -145,13 +135,13 @@ pub struct RuntimesConfig {
     pub qemu: Option<QemuRuntimeConfig>,
 }
 
-/// QEMU q35 VMs with nested KVM and memory-preserving sleep. The defaults match the
-/// agent container image, so `runtime: { qemu: {} }` is enough there.
+/// QEMU q35 VMs with nested KVM and memory-preserving sleep. Every field has a default
+/// matching orbd's container image, so a zero-config agent needs none of them.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QemuRuntimeConfig {
     /// `qemu-system-x86_64`; a bare name is looked up on PATH.
-    #[serde(default = "default_qemu_binary")]
+    #[serde(default = "default_qemu")]
     pub qemu: PathBuf,
     #[serde(default = "default_qemu_img")]
     pub qemu_img: PathBuf,
@@ -159,28 +149,29 @@ pub struct QemuRuntimeConfig {
     /// checkpoint: a replaced kernel makes sleeping orbs cold-boot on their next spawn.
     #[serde(default = "default_kernel")]
     pub kernel: PathBuf,
-    #[serde(default = "default_kernel_cmdline")]
-    pub kernel_cmdline: String,
-    /// DNS servers delivered to guests. Explicit: never the host's resolv.conf, which
-    /// may point at a local stub resolver the guest cannot use.
-    #[serde(default = "default_dns_servers")]
-    pub dns_servers: Vec<String>,
-    /// Memory saves running at once on this host.
-    #[serde(default = "default_concurrent_saves")]
-    pub max_concurrent_saves: usize,
-    /// How long a cold stop waits for a clean guest shutdown before killing QEMU.
-    #[serde(default = "default_shutdown_grace_secs")]
-    pub shutdown_grace_secs: u64,
-    /// How long a spawn waits for the guest helper to answer before failing bootstrap.
-    #[serde(default = "default_guest_connect_secs")]
-    pub guest_connect_timeout_secs: u64,
     /// Delegated cgroup v2 directory; each QEMU runs in `<cgroup_parent>/orbd-<orb>`,
     /// outside the agent's cgroup, so stopping the agent service leaves VMs running.
     pub cgroup_parent: Option<PathBuf>,
     /// Prebuilt raw ext4 root disks by image reference, used instead of the image
-    /// pipeline when `[images]` is not configured (development and KVM tests).
+    /// pipeline (development and KVM tests).
     #[serde(default)]
     pub static_images: Vec<QemuStaticImage>,
+    /// DNS servers delivered to guests (from `agent.dns_servers`).
+    #[serde(skip)]
+    pub dns_servers: Vec<String>,
+}
+
+impl Default for QemuRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            qemu: default_qemu(),
+            qemu_img: default_qemu_img(),
+            kernel: default_kernel(),
+            cgroup_parent: None,
+            static_images: Vec::new(),
+            dns_servers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -190,29 +181,14 @@ pub struct QemuStaticImage {
     pub rootfs: PathBuf,
 }
 
-fn default_qemu_binary() -> PathBuf {
+fn default_qemu() -> PathBuf {
     "qemu-system-x86_64".into()
 }
 fn default_qemu_img() -> PathBuf {
     "qemu-img".into()
 }
 fn default_kernel() -> PathBuf {
-    "/usr/share/orbd/bzImage".into()
-}
-fn default_dns_servers() -> Vec<String> {
-    vec!["1.1.1.1".into(), "8.8.8.8".into()]
-}
-fn default_kernel_cmdline() -> String {
-    "console=ttyS0 root=/dev/vda rw".into()
-}
-fn default_concurrent_saves() -> usize {
-    1
-}
-fn default_shutdown_grace_secs() -> u64 {
-    30
-}
-fn default_guest_connect_secs() -> u64 {
-    120
+    DEFAULT_GUEST_KERNEL.into()
 }
 
 /// Test runtime with durable fake state. Never enable in production.

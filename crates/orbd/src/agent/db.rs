@@ -56,14 +56,12 @@ impl Db {
     }
 }
 
-fn init(conn: &mut Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (
+/// Bump on any schema change; there is no upgrade path (greenfield).
+const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA: &str = "CREATE TABLE meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS receipts (
+         CREATE TABLE receipts (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             operation_id TEXT NOT NULL UNIQUE,
             orb_id TEXT NOT NULL,
@@ -80,19 +78,38 @@ fn init(conn: &mut Connection) -> rusqlite::Result<()> {
             outcome_json TEXT,
             completed_at_unix_ms INTEGER,
             acked INTEGER NOT NULL DEFAULT 0);
-         CREATE INDEX IF NOT EXISTS receipts_status ON receipts(status, acked);
-         CREATE TABLE IF NOT EXISTS tombstones (
+         CREATE INDEX receipts_status ON receipts(status, acked);
+         CREATE TABLE tombstones (
             operation_id TEXT PRIMARY KEY,
             orb_id TEXT NOT NULL,
             recorded_at_unix_ms INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS orbs (
+         CREATE TABLE orbs (
             orb_id TEXT PRIMARY KEY,
             highest_generation INTEGER NOT NULL,
             created INTEGER NOT NULL DEFAULT 0,
             last_state_json TEXT,
             next_checkpoint_generation INTEGER NOT NULL DEFAULT 1,
-            restore_json TEXT);",
-    )
+            restore_json TEXT);";
+
+fn init(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    match current {
+        SCHEMA_VERSION => Ok(()),
+        0 => {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            Ok(())
+        }
+        v => anyhow::bail!(
+            "agent database schema version {v} is not {SCHEMA_VERSION} (this orbd); orbd has \
+             no upgrade path: delete the agent state directory to start over"
+        ),
+    }
 }
 
 // --- records ----------------------------------------------------------------
