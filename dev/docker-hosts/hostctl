@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# Dev harness: Debian 12 QEMU/KVM VMs with dockerd and the Amp orb image, for running
+# `orbd agent` with the Docker runtime from an unprivileged orb (needs /dev/kvm, no
+# Docker daemon). See README.md.
+set -euo pipefail
+
+# --- pinned inputs --------------------------------------------------------------------
+DEBIAN_URL=https://cloud.debian.org/images/cloud/bookworm/20261021-2638/debian-12-genericcloud-amd64-20261021-2638.qcow2
+DEBIAN_SHA512=9f181877006e8d9ca4f4554eba8729a829936f0f7d1db5e77f69b1ef0f6bc372b4d46f3dae39b10d84f9131496c2cc1d449264f26577fe934a79de5a5512a3dd
+DOCKER_GPG_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+DOCKER_CE_VERSION=5:29.9.2-1~debian.12~bookworm
+CONTAINERD_VERSION=2.4.2-3~debian.12~bookworm
+ORB_IMAGE=${ORB_IMAGE:-us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest}
+
+# --- tunables -------------------------------------------------------------------------
+STATE=${ORBD_HOSTS_STATE:-$HOME/.cache/orbd-docker-hosts}
+VCPUS=${ORBD_HOST_VCPUS:-4}
+MEMORY=${ORBD_HOST_MEMORY:-8G}
+DISK=${ORBD_HOST_DISK:-80G}
+SSH_PORT_BASE=${ORBD_HOST_SSH_PORT_BASE:-2220} # host N listens on 127.0.0.1:$((BASE+N))
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CLOUD_IMG=$STATE/$(basename "$DEBIAN_URL")
+BASE=$STATE/base.qcow2
+KEY=$STATE/id_ed25519
+SSH_CONFIG=$STATE/ssh_config
+
+log() { printf '[hostctl] %s\n' "$*" >&2; }
+die() {
+	log "error: $*"
+	exit 1
+}
+need() { command -v "$1" >/dev/null || die "missing $1 (apt-get install qemu-system-x86 qemu-utils genisoimage)"; }
+
+check_host() {
+	need qemu-system-x86_64
+	need qemu-img
+	need genisoimage
+	[[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not readable and writable"
+	mkdir -p "$STATE"
+	[[ -f $KEY ]] || ssh-keygen -q -t ed25519 -N '' -C orbd-docker-hosts -f "$KEY"
+}
+
+valid_n() { [[ $1 =~ ^[1-9][0-9]?$ ]] || die "host number must be 1..99, got '$1'"; }
+name_of() { printf 'orbd-host-%s' "$1"; }
+disk_of() { printf '%s/%s.qcow2' "$STATE" "$(name_of "$1")"; }
+pid_of() { printf '%s/%s.pid' "$STATE" "$(name_of "$1")"; }
+port_of() { printf '%s' $((SSH_PORT_BASE + $1)); }
+
+running() {
+	local p
+	p=$(pid_of "$1")
+	[[ -f $p ]] && kill -0 "$(cat "$p")" 2>/dev/null
+}
+
+# NoCloud seed ISO from user-data at $2 for instance $1.
+make_seed() {
+	local name=$1 user_data=$2 out=$3 dir
+	dir=$(mktemp -d)
+	cp "$user_data" "$dir/user-data"
+	printf 'instance-id: %s\nlocal-hostname: %s\n' "$name" "$name" >"$dir/meta-data"
+	genisoimage -quiet -output "$out" -volid cidata -joliet -rock "$dir/user-data" "$dir/meta-data"
+	rm -rf "$dir"
+}
+
+ssh_keys_yaml() { printf '      - %s\n' "$(cat "$KEY.pub")"; }
+
+fetch_cloud_image() {
+	if [[ ! -f $CLOUD_IMG ]]; then
+		log "downloading $DEBIAN_URL"
+		curl -fSL --retry 3 -o "$CLOUD_IMG.part" "$DEBIAN_URL"
+		mv "$CLOUD_IMG.part" "$CLOUD_IMG"
+	fi
+	echo "$DEBIAN_SHA512  $CLOUD_IMG" | sha512sum --check --quiet || {
+		rm -f "$CLOUD_IMG"
+		die "checksum mismatch for $CLOUD_IMG (removed)"
+	}
+}
+
+qemu_common() {
+	# shellcheck disable=SC2054
+	QEMU_ARGS=(
+		-machine q35,accel=kvm -cpu host -smp "$VCPUS" -m "$MEMORY"
+		-nographic -nodefaults -serial "file:$1" -monitor none
+		-device virtio-rng-pci
+		-drive "file=$2,if=virtio,cache=unsafe,discard=unmap,detect-zeroes=unmap"
+		-drive "file=$3,if=virtio,media=cdrom,readonly=on"
+	)
+}
+
+# --- base disk ------------------------------------------------------------------------
+cmd_base() {
+	check_host
+	if [[ -f $STATE/base.ok ]]; then
+		log "base disk exists ($(cat "$STATE/base.ok")); delete $BASE and $STATE/base.ok to rebuild"
+		return
+	fi
+	fetch_cloud_image
+	rm -f "$BASE"
+	qemu-img create -q -f qcow2 -F qcow2 -b "$CLOUD_IMG" "$BASE" "$DISK"
+	local ud=$STATE/base-user-data
+	{
+		cat <<EOF
+#cloud-config
+users:
+  - default
+ssh_authorized_keys:
+$(ssh_keys_yaml)
+growpart: {mode: auto, devices: ["/"]}
+write_files:
+  - path: /etc/docker/daemon.json
+    content: |
+      {"log-driver": "local", "features": {"containerd-snapshotter": false}}
+  - path: /usr/local/sbin/orbd-base-setup
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y ca-certificates curl gnupg
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+      gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | grep -q '^fpr:*$DOCKER_GPG_FPR:'
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" >/etc/apt/sources.list.d/docker.list
+      apt-get update
+      apt-get install -y docker-ce=$DOCKER_CE_VERSION docker-ce-cli=$DOCKER_CE_VERSION containerd.io=$CONTAINERD_VERSION
+      apt-mark hold docker-ce docker-ce-cli containerd.io
+      usermod -aG docker debian
+      systemctl enable --now docker
+      docker pull $ORB_IMAGE
+      docker image inspect --format '{{.Id}} {{index .RepoDigests 0}}' $ORB_IMAGE >/var/lib/orbd-base-image
+      # Each host gets its own identity on first boot.
+      truncate -s 0 /etc/machine-id
+      rm -f /var/lib/dbus/machine-id
+      fstrim -av
+runcmd:
+  - [sh, -c, "if /usr/local/sbin/orbd-base-setup >/var/log/orbd-base-setup.log 2>&1; then echo ORBD_BASE_OK \$(cat /var/lib/orbd-base-image) >/dev/ttyS0; else echo ORBD_BASE_FAILED >/dev/ttyS0; tail -n 40 /var/log/orbd-base-setup.log >/dev/ttyS0; fi"]
+power_state: {mode: poweroff, condition: true, timeout: 30}
+EOF
+	} >"$ud"
+	make_seed orbd-base "$ud" "$STATE/base-seed.iso"
+	local console=$STATE/base-console.log
+	qemu_common "$console" "$BASE" "$STATE/base-seed.iso"
+	log "building base disk (docker $DOCKER_CE_VERSION + $ORB_IMAGE); console: $console"
+	timeout 3600 qemu-system-x86_64 "${QEMU_ARGS[@]}" -netdev user,id=n0 -device virtio-net-pci,netdev=n0 ||
+		die "base VM did not finish (see $console)"
+	local ok
+	ok=$(grep -a '^ORBD_BASE_OK' "$console" | tail -n1 || true)
+	[[ -n $ok ]] || die "base setup failed; tail of $console:
+$(tail -n 40 "$console")"
+	printf '%s\n' "${ok#ORBD_BASE_OK }" >"$STATE/base.ok"
+	log "base disk ready: $(cat "$STATE/base.ok")"
+}
+
+# --- hosts ----------------------------------------------------------------------------
+write_ssh_config() {
+	: >"$SSH_CONFIG"
+	local f n
+	for f in "$STATE"/orbd-host-*.qcow2; do
+		[[ -e $f ]] || continue
+		n=${f##*/orbd-host-}
+		n=${n%.qcow2}
+		cat >>"$SSH_CONFIG" <<EOF
+Host $(name_of "$n")
+    HostName 127.0.0.1
+    Port $(port_of "$n")
+    User debian
+    IdentityFile $KEY
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+EOF
+	done
+}
+
+prepare_host() {
+	local n=$1 name disk ud
+	name=$(name_of "$n")
+	disk=$(disk_of "$n")
+	[[ -f $STATE/base.ok ]] || die "no base disk; run: $0 base"
+	if [[ ! -f $disk ]]; then
+		qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" "$disk"
+		log "created $disk (overlay of base)"
+	fi
+	ud=$STATE/$name-user-data
+	cat >"$ud" <<EOF
+#cloud-config
+hostname: $name
+users:
+  - default
+ssh_authorized_keys:
+$(ssh_keys_yaml)
+EOF
+	make_seed "$name" "$ud" "$STATE/$name-seed.iso"
+	write_ssh_config
+	qemu_common "$STATE/$name-console.log" "$disk" "$STATE/$name-seed.iso"
+	# User-mode networking: the guest reaches this orb's loopback services at 10.0.2.2;
+	# only SSH is forwarded inwards (loopback only).
+	# shellcheck disable=SC2054
+	QEMU_ARGS+=(-name "$name"
+		-netdev "user,id=n0,hostname=$name,hostfwd=tcp:127.0.0.1:$(port_of "$n")-:22"
+		-device virtio-net-pci,netdev=n0)
+}
+
+# Foreground, for `amp orb service start` (survives Amp CLI restarts).
+cmd_run() {
+	local n=${1:?usage: run N}
+	valid_n "$n"
+	check_host
+	running "$n" && die "$(name_of "$n") is already running"
+	prepare_host "$n"
+	echo $$ >"$(pid_of "$n")"
+	exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
+}
+
+cmd_start() {
+	check_host
+	local n
+	for n in "$@"; do
+		valid_n "$n"
+		if running "$n"; then
+			log "$(name_of "$n") already running"
+			continue
+		fi
+		prepare_host "$n"
+		qemu-system-x86_64 "${QEMU_ARGS[@]}" -daemonize -pidfile "$(pid_of "$n")"
+		log "started $(name_of "$n") (ssh port $(port_of "$n"))"
+	done
+	for n in "$@"; do cmd_wait "$n"; done
+}
+
+cmd_wait() {
+	local n=${1:?usage: wait N}
+	for _ in $(seq 180); do
+		if ssh -F "$SSH_CONFIG" -o ConnectTimeout=2 "$(name_of "$n")" \
+			'cloud-init status --wait >/dev/null 2>&1; systemctl is-active --quiet docker' 2>/dev/null; then
+			log "$(name_of "$n") is up with docker"
+			return
+		fi
+		running "$n" || die "$(name_of "$n") exited (see $STATE/$(name_of "$n")-console.log)"
+		sleep 2
+	done
+	die "$(name_of "$n") did not come up"
+}
+
+cmd_stop() {
+	local n p
+	for n in "$@"; do
+		valid_n "$n"
+		running "$n" || continue
+		p=$(cat "$(pid_of "$n")")
+		ssh -F "$SSH_CONFIG" "$(name_of "$n")" sudo systemctl poweroff 2>/dev/null || true
+		for _ in $(seq 60); do
+			kill -0 "$p" 2>/dev/null || break
+			sleep 1
+		done
+		kill "$p" 2>/dev/null || true
+		rm -f "$(pid_of "$n")"
+		log "stopped $(name_of "$n")"
+	done
+}
+
+cmd_destroy() {
+	local n
+	for n in "$@"; do
+		valid_n "$n"
+		cmd_stop "$n"
+		rm -f "$(disk_of "$n")" "$STATE/$(name_of "$n")"-{seed.iso,user-data,console.log,docker.sock}
+		log "destroyed $(name_of "$n")"
+	done
+	write_ssh_config
+}
+
+cmd_ssh() {
+	local n=${1:?usage: ssh N [command...]}
+	shift
+	exec ssh -F "$SSH_CONFIG" "$(name_of "$n")" "$@"
+}
+
+# Forwards the guest's Docker socket to $STATE/orbd-host-N-docker.sock (for running a
+# runtime harness on the orb against the guest's dockerd).
+cmd_docker_sock() {
+	local n=${1:?usage: docker-sock N} sock
+	sock=$STATE/$(name_of "$n")-docker.sock
+	rm -f "$sock"
+	ssh -F "$SSH_CONFIG" -fNT -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+		-L "$sock:/var/run/docker.sock" "$(name_of "$n")"
+	printf 'unix://%s\n' "$sock"
+}
+
+# Copies an orbd binary, agent config and any extra files (certs, keys) into the guest
+# and (re)starts it as orbd-agent.service. Extra files land in /etc/orbd/ by basename.
+cmd_install_orbd() {
+	local n=${1:?usage: install-orbd N BINARY CONFIG [FILE...]} bin=${2:?binary} cfg=${3:?config}
+	shift 3
+	local host
+	host=$(name_of "$n")
+	local tmp=/tmp/orbd-install.$$
+	ssh -F "$SSH_CONFIG" "$host" "rm -rf $tmp && mkdir -p $tmp/files"
+	scp -q -F "$SSH_CONFIG" "$bin" "$host:$tmp/orbd"
+	scp -q -F "$SSH_CONFIG" "$cfg" "$host:$tmp/agent.toml"
+	[[ $# -eq 0 ]] || scp -q -F "$SSH_CONFIG" "$@" "$host:$tmp/files/"
+	scp -q -F "$SSH_CONFIG" "$HERE/orbd-agent.service" "$host:$tmp/orbd-agent.service"
+	ssh -F "$SSH_CONFIG" "$host" "set -e
+		sudo install -m 0755 $tmp/orbd /usr/local/bin/orbd
+		sudo install -d -m 0700 /etc/orbd
+		sudo install -m 0600 $tmp/agent.toml /etc/orbd/agent.toml
+		for f in $tmp/files/*; do [ -e \"\$f\" ] && sudo install -m 0600 \"\$f\" /etc/orbd/; done
+		sudo install -m 0644 $tmp/orbd-agent.service /etc/systemd/system/orbd-agent.service
+		rm -rf $tmp
+		sudo systemctl daemon-reload
+		sudo systemctl enable --quiet orbd-agent.service
+		sudo systemctl restart orbd-agent.service
+		systemctl --no-pager --lines=5 status orbd-agent.service || true"
+}
+
+cmd_status() {
+	local f n
+	for f in "$STATE"/orbd-host-*.qcow2; do
+		[[ -e $f ]] || continue
+		n=${f##*/orbd-host-}
+		n=${n%.qcow2}
+		if running "$n"; then
+			printf '%s running pid=%s ssh=127.0.0.1:%s\n' "$(name_of "$n")" "$(cat "$(pid_of "$n")")" "$(port_of "$n")"
+		else
+			printf '%s stopped\n' "$(name_of "$n")"
+		fi
+	done
+}
+
+usage() {
+	cat <<EOF
+usage: $0 COMMAND
+  base                        build the base disk (cloud image + docker + amp-orb image)
+  start N...                  boot hosts in the background and wait for docker
+  run N                       boot host N in the foreground (for amp orb service start)
+  wait N                      wait for host N's docker
+  stop N... | destroy N...    power off | power off and delete overlay
+  ssh N [CMD...]              ssh into host N
+  docker-sock N               forward host N's docker socket to the orb, print DOCKER_HOST
+  install-orbd N BIN CFG [F...]  install orbd + config (+ files into /etc/orbd), run as a service
+  status
+state: $STATE (ssh config: $SSH_CONFIG)
+EOF
+}
+
+cmd=${1:-}
+[[ -n $cmd ]] || {
+	usage
+	exit 1
+}
+shift
+case $cmd in
+base | run | start | wait | stop | destroy | ssh | status) "cmd_$cmd" "$@" ;;
+docker-sock) cmd_docker_sock "$@" ;;
+install-orbd) cmd_install_orbd "$@" ;;
+-h | --help | help) usage ;;
+*)
+	usage
+	exit 1
+	;;
+esac

@@ -1,0 +1,18 @@
+[Unit]
+Description=orbd agent (dev docker host)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/local/bin/orbd agent --config /etc/orbd/agent.toml
+Environment=RUST_LOG=info
+# Matches state_dir/run_dir = /var/lib/orbd, /run/orbd in agent.toml.
+StateDirectory=orbd
+RuntimeDirectory=orbd
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
