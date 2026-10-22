@@ -37,12 +37,16 @@ fn default_images() -> Option<ImagesConfig> {
         guest_helper: default_guest_helper(),
         umoci: default_umoci(),
         mkfs_ext4: default_mkfs_ext4(),
-        prewarm: Vec::new(),
+        prewarm: default_prewarm(),
         refresh_interval_secs: default_refresh_secs(),
     })
 }
 
-/// Amp's orb image; detected runtimes pull it at startup.
+fn default_prewarm() -> Vec<String> {
+    vec![AMP_ORB_IMAGE.into()]
+}
+
+/// Amp's orb image; agents prepare it at startup unless configured otherwise.
 pub const AMP_ORB_IMAGE: &str = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest";
 
 /// Where orbd's container image installs the guest kernel and `orbd-guest`.
@@ -63,8 +67,9 @@ pub struct ImagesConfig {
     #[serde(default = "default_mkfs_ext4")]
     pub mkfs_ext4: PathBuf,
     /// Images prepared in the background at startup, so the first spawn does not fail
-    /// with ImageNotReady while a multi-GB image is pulled and converted.
-    #[serde(default)]
+    /// with ImageNotReady while a multi-GB image is pulled and converted. Defaults to
+    /// Amp's orb image.
+    #[serde(default = "default_prewarm")]
     pub prewarm: Vec<String>,
     /// How often a tag (e.g. `:latest`) is resolved again; the previously prepared
     /// image keeps serving until the new digest is ready.
@@ -200,7 +205,7 @@ pub struct FakeRuntimeConfig {
     pub memory_preserving_sleep: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DockerRuntimeConfig {
     /// Docker API endpoint; defaults to the local socket.
@@ -211,9 +216,21 @@ pub struct DockerRuntimeConfig {
     /// Docker network for orb containers; defaults to Docker's bridge.
     pub network: Option<String>,
     /// Images pulled in the background at startup when missing, so the first spawn
-    /// does not fail with ImageNotReady while a multi-GB pull runs.
-    #[serde(default)]
+    /// does not fail with ImageNotReady while a multi-GB pull runs. Defaults to Amp's
+    /// orb image.
+    #[serde(default = "default_prewarm")]
     pub prewarm_images: Vec<String>,
+}
+
+impl Default for DockerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            docker_host: None,
+            dns_servers: Vec::new(),
+            network: None,
+            prewarm_images: default_prewarm(),
+        }
+    }
 }
 
 impl AgentConfig {

@@ -5,7 +5,7 @@
 //! in `<state_dir>/runtime`; later starts use it or fail, so an agent never abandons its
 //! orbs because detection changed.
 
-use crate::config::agent::{AMP_ORB_IMAGE, AgentConfig, DockerRuntimeConfig, QemuRuntimeConfig};
+use crate::config::agent::{AgentConfig, DockerRuntimeConfig, QemuRuntimeConfig};
 use crate::model::{GIB, MIB, Resources, RuntimeKind};
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -73,18 +73,10 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
         tracing::info!(runtime = kind.as_str(), "using detected runtime");
         match kind {
             RuntimeKind::Docker => {
-                r.docker = Some(DockerRuntimeConfig {
-                    prewarm_images: vec![AMP_ORB_IMAGE.into()],
-                    ..Default::default()
-                })
+                r.docker = Some(DockerRuntimeConfig::default());
             }
             RuntimeKind::Qemu => {
                 r.qemu = Some(QemuRuntimeConfig::default());
-                if let Some(images) = &mut config.images
-                    && images.prewarm.is_empty()
-                {
-                    images.prewarm.push(AMP_ORB_IMAGE.into());
-                }
             }
             other => bail!("the {} runtime is never detected", other.as_str()),
         }
