@@ -28,6 +28,15 @@ enum Command {
     Dispatch,
     /// Print a new 32-byte secret key (hex) for `secret_key_file`.
     GenKey,
+    /// Check host prerequisites (QEMU, /dev/kvm, guest kernel, umoci, mkfs.ext4).
+    Doctor {
+        /// Agent config to take tool and asset paths from.
+        #[arg(long, short, env = "ORBD_CONFIG")]
+        config: Option<PathBuf>,
+        /// Guest kernel (bzImage) to check.
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -39,6 +48,10 @@ fn main() -> anyhow::Result<()> {
             // Logs from the coordinator are forwarded verbatim; keep our own quiet.
             let code = rt.block_on(orbd::amp::dispatch::run_from_env());
             std::process::exit(code);
+        }
+        Command::Doctor { config, kernel } => {
+            let ok = orbd::doctor::run(&orbd::doctor::DoctorOptions { config, kernel })?;
+            std::process::exit(if ok { 0 } else { 1 });
         }
         Command::GenKey => {
             print!("{}", orbd::secrets::SecretKey::generate_hex());

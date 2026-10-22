@@ -11,6 +11,7 @@ pub mod amp;
 pub mod backend;
 pub mod config;
 pub mod coordinator;
+pub mod doctor;
 pub mod image;
 pub mod model;
 pub mod runtime;

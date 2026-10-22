@@ -57,3 +57,18 @@ jobs:
           path: target/${{ matrix.target }}/release/orbd
           if-no-files-found: error
           retention-days: 14
+      # The guest helper runs inside x86_64 orb VMs only.
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        name: Build orbd-guest
+        run: |
+          cargo zigbuild --locked --release -p orbd-guest --target ${{ matrix.target }}
+          bin=target/${{ matrix.target }}/release/orbd-guest
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          "$bin" --version
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: orbd-guest-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/orbd-guest
+          if-no-files-found: error
+          retention-days: 14

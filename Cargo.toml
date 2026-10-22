@@ -49,6 +49,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
+# Registry client for image preparation; TLS via rustls with the ring provider that
+# tonic already uses (one crypto provider).
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tar = { version = "0.4", default-features = false }
 nix = { version = "0.31", features = ["fs", "process", "signal", "user", "socket"] }
 rcgen = "0.14"
 x509-parser = "0.18"

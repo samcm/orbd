@@ -43,6 +43,9 @@ zeroize.workspace = true
 fail.workspace = true
 nix.workspace = true
 x509-parser.workspace = true
+oci-client.workspace = true
+rustls.workspace = true
+tar.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

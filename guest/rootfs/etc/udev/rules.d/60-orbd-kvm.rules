@@ -1,0 +1,3 @@
+# orbd: nested virtualization for the orb's user (orbd-guest also applies this at boot
+# for images without udev).
+KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"
