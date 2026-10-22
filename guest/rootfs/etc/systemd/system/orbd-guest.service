@@ -1,0 +1,20 @@
+[Unit]
+Description=orbd guest helper (host channel, credentials, clock, network)
+Documentation=https://github.com/samcm/orbd
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs.target
+Before=sysinit.target ssh.service sshd.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+# Grow the root filesystem, open /dev/kvm to the kvm group, reset identity on new orbs.
+ExecStartPre=-/usr/local/sbin/orbd-guest init
+ExecStart=/usr/local/sbin/orbd-guest serve
+Restart=always
+RestartSec=1
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=sysinit.target

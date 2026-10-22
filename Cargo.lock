@@ -1399,6 +1399,13 @@ dependencies = [
 [[package]]
 name = "orbd-guest"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "zeroize",
+]
 
 [[package]]
 name = "orbd-proto"
