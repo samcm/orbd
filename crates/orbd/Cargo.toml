@@ -11,6 +11,7 @@ rust-version.workspace = true
 orbd-proto.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+bollard.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
 clap.workspace = true

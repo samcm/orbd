@@ -61,6 +61,10 @@ pub struct DockerRuntimeConfig {
     pub dns_servers: Vec<String>,
     /// Docker network for orb containers; defaults to Docker's bridge.
     pub network: Option<String>,
+    /// Images pulled in the background at startup when missing, so the first spawn
+    /// does not fail with ImageNotReady while a multi-GB pull runs.
+    #[serde(default)]
+    pub prewarm_images: Vec<String>,
 }
 
 impl AgentConfig {
