@@ -108,7 +108,8 @@ jobs:
       matrix:
         suite: [qemu, firecracker, container]
     env:
-      ROOTFS: target/kvm-guest/rootfs.ext4
+      # Not under target/: the rust cache restores target/ over it.
+      ROOTFS: kvm-guest/rootfs.ext4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
