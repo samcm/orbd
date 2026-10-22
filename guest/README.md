@@ -21,9 +21,12 @@ depend on udev's `/dev/virtio-ports` links. The host connects, sends `Hello`, th
 `Wake`, `PrepareSleep`, `Shutdown`; replies carry the request id. A reply to a connection
 that has gone is dropped: reconnect, send `Hello` and read `last_generation`.
 
-At boot `orbd-guest init` grows `/` to the disk size, gives `/dev/kvm` to group `kvm`
-(0660, `user` is a member), adds `/etc/hosts` entries, and regenerates SSH host keys when
+At boot `orbd-guest init` grows `/` to the disk size, makes `/dev/kvm` root:kvm
+0666 like Amp-hosted orbs (Amp's agent runs without the kvm group; `user` is still a
+member), adds `/etc/hosts` entries, and regenerates SSH host keys when
 the disk boots as a new orb (first boot, or a new MAC). The image ships an empty `/etc/machine-id` (systemd
 generates one on first boot) with `/var/lib/dbus/machine-id` linked to it.
+`Wake` also names the guest after its orb (`hostname`: /etc/hostname, the live name and
+`/etc/hosts`), which renames project-snapshot clones on their first boot.
 `amp-headless.service` and `amp-headless-bootstrap.service` have a drop-in that keeps
 them down until `Wake` has delivered credentials (`/run/orbd-guest/credentials-ready`).

@@ -54,6 +54,9 @@ message Wake {
   repeated EnvVar permitted_env = 3;
   NetworkConfig network = 4;
   bool cold_boot = 5;
+  // The orb's name (an RFC 1123 label from Amp's orb id): /etc/hostname, the live
+  // hostname and /etc/hosts. Project-snapshot clones carry their source's name until set.
+  string hostname = 6;
 }
 
 message Shutdown {}

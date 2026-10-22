@@ -1,3 +1,4 @@
-# orbd: nested virtualization for the orb's user (orbd-guest also applies this at boot
-# for images without udev).
-KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"
+# orbd: nested virtualization for everyone in the orb, as on Amp-hosted orbs (orbd-guest
+# also applies this at boot for images without udev). 0666, not group-only: Amp's agent
+# runs with its own supplementary groups (no kvm), and the VM is single-tenant.
+KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"

@@ -21,6 +21,27 @@ use async_trait::async_trait;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+/// The orb's hostname: an RFC 1123 label from Amp's orb id (`[A-Za-z0-9._-]`), for
+/// prompts and logs.
+pub(crate) fn orb_hostname(orb: &OrbDefinition) -> String {
+    let h: String = orb
+        .identity
+        .amp_orb_id
+        .0
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect();
+    let h = h.trim_matches('-');
+    if h.is_empty() { "orb".into() } else { h.into() }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub kind: RuntimeKind,
