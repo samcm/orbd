@@ -8,7 +8,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use sha2::{Digest, Sha256};
 use std::path::Path;

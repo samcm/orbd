@@ -1,8 +1,11 @@
 name: dependabot auto-merge
 
-# Enables GitHub auto-merge on Dependabot patch and minor updates. The merge itself
-# happens only after the required `ci-ok` check passes (repository ruleset on main).
-# Major updates and anything that fails CI are left for a maintainer.
+# Enables GitHub auto-merge on Dependabot patch and minor updates, so they merge once the
+# required `ci-ok` check passes. Two guards, because `gh pr merge --auto` merges
+# immediately when nothing is required:
+# - main must have a required-status-check rule (otherwise nothing gates the merge);
+# - 0.x minor bumps (e.g. 0.9 -> 0.10) are breaking in Cargo and are left for a
+#   maintainer, like majors and anything that fails CI.
 on: pull_request
 
 permissions:
@@ -21,8 +24,30 @@ jobs:
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
-        run: gh pr merge --auto --merge "$PR_URL"
+      - name: Enable auto-merge when gated and non-breaking
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEPS: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *) echo "update type '$UPDATE_TYPE': leaving for a maintainer"; exit 0 ;;
+          esac
+          breaking=$(jq -r '[.[] | select((.prevVersion // "") | startswith("0."))
+            | select((.prevVersion | split(".")[1]) != ((.newVersion // "") | split(".")[1] // ""))
+            | .dependencyName] | join(" ")' <<<"$DEPS")
+          if [ -n "$breaking" ]; then
+            echo "0.x minor bump ($breaking) is breaking in Cargo: leaving for a maintainer"
+            exit 0
+          fi
+          required=$(gh api "repos/$REPO/rules/branches/$BASE" \
+            --jq '[.[] | select(.type == "required_status_checks")] | length')
+          if [ "$required" = 0 ]; then
+            echo "::warning::$BASE has no required status checks; not enabling auto-merge"
+            exit 0
+          fi
+          gh pr merge --auto --merge "$PR_URL"
