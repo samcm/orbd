@@ -107,7 +107,9 @@ fn coordinator_crash_resumes_the_same_operation() {
         );
         assert_eq!(s.bootstraps.len(), 1, "[{point}]");
 
-        // The orb remains usable afterwards.
+        // The orb remains usable afterwards, once the agent is back (a result committed
+        // before the crash is answered without it).
+        c.wait_connected(1);
         assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause after recovery");
     }
 }
