@@ -116,7 +116,10 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          test -w /dev/kvm
+          # trigger is asynchronous; without settle the check below can race it.
+          sudo udevadm settle
+          ls -l /dev/kvm || { echo "::error::This runner has no /dev/kvm"; exit 1; }
+          test -w /dev/kvm || { echo "::error::/dev/kvm is not writable after the udev rule"; exit 1; }
       # Orbs get /dev/kvm only if the runner's KVM nests. Without it the gates still run
       # but skip their nested-guest assertions (ORBD_KVM_NESTED=0).
       - name: Nested virtualization
