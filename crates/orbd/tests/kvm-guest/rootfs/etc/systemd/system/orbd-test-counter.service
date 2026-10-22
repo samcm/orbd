@@ -1,0 +1,9 @@
+[Unit]
+Description=orbd test: process counter
+
+[Service]
+ExecStart=/usr/local/bin/orbd-test-counter
+StandardOutput=file:/dev/ttyS0
+
+[Install]
+WantedBy=multi-user.target

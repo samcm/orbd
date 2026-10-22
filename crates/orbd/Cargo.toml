@@ -50,6 +50,7 @@ rcgen.workspace = true
 tokio-rustls.workspace = true
 base64.workspace = true
 time.workspace = true
+qapi.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

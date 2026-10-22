@@ -132,6 +132,67 @@ pub struct CapacityOverrides {
 pub struct RuntimesConfig {
     pub fake: Option<FakeRuntimeConfig>,
     pub docker: Option<DockerRuntimeConfig>,
+    pub qemu: Option<QemuRuntimeConfig>,
+}
+
+/// QEMU q35 VMs with nested KVM and memory-preserving sleep.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QemuRuntimeConfig {
+    /// `qemu-system-x86_64`.
+    #[serde(default = "default_qemu_binary")]
+    pub qemu: PathBuf,
+    #[serde(default = "default_qemu_img")]
+    pub qemu_img: PathBuf,
+    /// Guest kernel (bzImage, everything built in). Its digest is pinned in each
+    /// checkpoint; keep a replaced kernel at its old path until no orb sleeps on it.
+    pub kernel: PathBuf,
+    #[serde(default = "default_kernel_cmdline")]
+    pub kernel_cmdline: String,
+    /// DNS servers delivered to guests. Explicit: never the host's resolv.conf.
+    pub dns_servers: Vec<String>,
+    /// Memory saves running at once on this host.
+    #[serde(default = "default_concurrent_saves")]
+    pub max_concurrent_saves: usize,
+    /// How long a cold stop waits for a clean guest shutdown before killing QEMU.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+    /// How long a spawn waits for the guest helper to answer before failing bootstrap.
+    #[serde(default = "default_guest_connect_secs")]
+    pub guest_connect_timeout_secs: u64,
+    /// Delegated cgroup v2 directory; each QEMU runs in `<cgroup_parent>/orbd-<orb>`,
+    /// outside the agent's cgroup, so stopping the agent service leaves VMs running.
+    pub cgroup_parent: Option<PathBuf>,
+    /// Prebuilt raw ext4 root disks by image reference, used instead of the image
+    /// pipeline when `[images]` is not configured (development and KVM tests).
+    #[serde(default)]
+    pub static_images: Vec<QemuStaticImage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QemuStaticImage {
+    pub image_ref: String,
+    pub rootfs: PathBuf,
+}
+
+fn default_qemu_binary() -> PathBuf {
+    "/usr/bin/qemu-system-x86_64".into()
+}
+fn default_qemu_img() -> PathBuf {
+    "/usr/bin/qemu-img".into()
+}
+fn default_kernel_cmdline() -> String {
+    "console=ttyS0 root=/dev/vda rw".into()
+}
+fn default_concurrent_saves() -> usize {
+    1
+}
+fn default_shutdown_grace_secs() -> u64 {
+    30
+}
+fn default_guest_connect_secs() -> u64 {
+    120
 }
 
 /// Test runtime with durable fake state. Never enable in production.

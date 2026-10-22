@@ -143,6 +143,25 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("docker runtime: {e}"))?;
         runtimes.insert(RuntimeKind::Docker, Arc::new(rt));
     }
+    if let Some(q) = &config.runtime.qemu {
+        let images: Arc<dyn crate::runtime::qemu::images::ImageProvider> = match &config.images {
+            Some(i) => Arc::new(
+                crate::image::ImageStore::open(i, &config.agent.state_dir)
+                    .map_err(|e| anyhow::anyhow!("image store: {e}"))?,
+            ),
+            None => Arc::new(crate::runtime::qemu::images::StaticImages(
+                q.static_images.clone(),
+            )),
+        };
+        let rt = crate::runtime::qemu::QemuRuntime::new(
+            q.clone(),
+            &config.agent.state_dir,
+            &config.agent.run_dir,
+            images,
+        )
+        .map_err(|e| anyhow::anyhow!("qemu runtime: {e}"))?;
+        runtimes.insert(RuntimeKind::Qemu, Arc::new(rt));
+    }
 
     if let Some(addr) = config.agent.metrics_listen
         && let Err(e) = crate::telemetry::init_metrics(addr)

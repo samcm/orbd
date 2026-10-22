@@ -1,0 +1,7 @@
+#!/bin/sh
+# A nested KVM guest run as `user`; its own counter must survive the outer VM's sleep.
+qemu-system-x86_64 -enable-kvm -cpu host -m 96 -smp 1 -nodefaults -nographic \
+    -no-user-config -kernel /opt/l2/bzImage \
+    -drive file=/opt/l2/root.ext4,if=virtio,format=raw,readonly=on \
+    -append "console=ttyS0 root=/dev/vda ro init=/init quiet" -serial stdio 2>&1 |
+    sed -u 's/^/l2: /'

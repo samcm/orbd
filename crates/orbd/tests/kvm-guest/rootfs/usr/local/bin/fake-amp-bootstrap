@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for `amp orb bootstrap`: proves the credentials arrived, never prints them.
+echo "fake-amp-bootstrap: ORB_TOKEN has ${#ORB_TOKEN} chars"
+exec sleep infinity
