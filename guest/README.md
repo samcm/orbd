@@ -1,6 +1,6 @@
 # Guest assets for the QEMU runtime
 
-- `kernel/`: `build.sh` builds the pinned 6.1 LTS guest kernel (`bzImage`, final
+- `kernel/`: `build.sh` builds the pinned 6.18 LTS guest kernel (`bzImage`, final
   `config`, `bzImage.sha256`, `manifest.txt`) from `orbd.config`. Everything is built in:
   no modules, no initrd.
 - `rootfs/`: files the image pipeline (`crates/orbd/src/image/`) adds to Amp's image as

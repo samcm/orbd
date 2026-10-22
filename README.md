@@ -110,6 +110,11 @@ so give it time (`--stop-timeout 300`; under systemd, `KillMode=mixed` and
 `TimeoutStopSec=300`). Orb disk sizes must be at least Amp's image
 (~5 GiB).
 
+The image ships QEMU 11.0 (Debian 13 backports) and orbd's Linux 6.18 LTS guest kernel;
+an agent run outside it needs QEMU 9.0 or newer (`orbd doctor` checks). A sleeping orb
+wakes only on the QEMU, kernel and CPU it slept on, so after an upgrade it cold-boots
+once.
+
 ## License
 
 [MIT](LICENSE)

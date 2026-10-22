@@ -1,7 +1,7 @@
 //! Narrow QMP client. The pinned `qapi` crate provides the transport (greeting,
 //! capability negotiation, JSON framing, response matching); the commands and the
 //! response fields orbd reads are declared here, so schema drift between `qapi`'s
-//! generated types and the host's QEMU (7.2 on Debian 12) cannot break decoding.
+//! generated types and the host's QEMU (9.0 or newer) cannot break decoding.
 
 use qapi::futures::{QapiService, QmpStreamTokio};
 use serde::{Deserialize, Serialize};
@@ -62,14 +62,39 @@ struct MigrateCancel {}
 command!(MigrateCancel, "migrate_cancel", qapi::Empty);
 #[derive(Serialize)]
 struct Migrate {
-    uri: String,
+    channels: [Channel; 1],
 }
 command!(Migrate, "migrate", qapi::Empty);
 #[derive(Serialize)]
 struct MigrateIncoming {
-    uri: String,
+    channels: [Channel; 1],
 }
 command!(MigrateIncoming, "migrate-incoming", qapi::Empty);
+/// A `file` migration channel: structured, so the path needs no URI escaping.
+#[derive(Serialize)]
+struct Channel {
+    #[serde(rename = "channel-type")]
+    channel_type: &'static str,
+    addr: FileAddr,
+}
+#[derive(Serialize)]
+struct FileAddr {
+    transport: &'static str,
+    filename: String,
+    offset: u64,
+}
+impl Channel {
+    fn file(path: &Path) -> [Self; 1] {
+        [Self {
+            channel_type: "main",
+            addr: FileAddr {
+                transport: "file",
+                filename: path.display().to_string(),
+                offset: 0,
+            },
+        }]
+    }
+}
 
 #[derive(Serialize)]
 struct QueryStatus {}
@@ -124,32 +149,43 @@ struct SetCapabilities {
 }
 command!(SetCapabilities, "migrate-set-capabilities", qapi::Empty);
 
-#[derive(Serialize)]
-struct SetParameters {
-    #[serde(rename = "max-bandwidth")]
-    max_bandwidth: u64,
+/// The migration parameters orbd sets; `None` is left unset (and unread).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Parameters {
+    #[serde(rename = "max-bandwidth", skip_serializing_if = "Option::is_none")]
+    pub max_bandwidth: Option<u64>,
+    #[serde(rename = "multifd-channels", skip_serializing_if = "Option::is_none")]
+    pub multifd_channels: Option<u8>,
+    /// Only sent when on: QEMU 9.0 has no `direct-io`.
+    #[serde(rename = "direct-io", skip_serializing_if = "Option::is_none")]
+    pub direct_io: Option<bool>,
 }
-command!(SetParameters, "migrate-set-parameters", qapi::Empty);
+command!(Parameters, "migrate-set-parameters", qapi::Empty);
 
 #[derive(Serialize)]
 struct QueryParameters {}
 command!(QueryParameters, "query-migrate-parameters", Parameters);
-#[derive(Deserialize)]
-pub struct Parameters {
-    #[serde(default, rename = "max-bandwidth")]
-    pub max_bandwidth: Option<u64>,
+
+/// How a checkpoint's memory file is written; recorded in its manifest and applied
+/// again, on the loading QEMU, to read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMigration {
+    /// multifd channels writing and reading RAM in parallel (0: single channel).
+    pub multifd_channels: u8,
+    /// RAM pages bypass the page cache (needs multifd).
+    pub direct_io: bool,
 }
 
-/// Capabilities that must be off for a plain, self-contained memory stream: no
-/// compression or XBZRLE deltas, no auto-converge throttling, no postcopy or return
-/// path, single channel, and RAM always copied (`x-ignore-shared` off).
+/// Capabilities that must be off for a self-contained memory file: no compression or
+/// XBZRLE deltas, no auto-converge throttling, no postcopy or return path, and RAM
+/// always copied (`x-ignore-shared` off). `mapped-ram` is always on and `multifd` as
+/// [`FileMigration`] says.
 const OFF_CAPABILITIES: &[&str] = &[
     "xbzrle",
     "compress",
     "auto-converge",
     "postcopy-ram",
     "return-path",
-    "multifd",
     "x-ignore-shared",
     "release-ram",
     "block",
@@ -158,7 +194,8 @@ const OFF_CAPABILITIES: &[&str] = &[
     "postcopy-preempt",
     "pause-before-switchover",
     "late-block-activate",
-    "mapped-ram",
+    "switchover-ack",
+    "dirty-limit",
 ];
 
 impl Qmp {
@@ -217,14 +254,22 @@ impl Qmp {
         self.run(SystemPowerdown {}).await.map(drop)
     }
 
-    pub async fn migrate(&self, uri: &str) -> Result<(), QmpError> {
-        self.run(Migrate { uri: uri.into() }).await.map(drop)
+    /// Saves the VM into `path` (QEMU creates or truncates it).
+    pub async fn migrate_to_file(&self, path: &Path) -> Result<(), QmpError> {
+        self.run(Migrate {
+            channels: Channel::file(path),
+        })
+        .await
+        .map(drop)
     }
 
-    pub async fn migrate_incoming(&self, uri: &str) -> Result<(), QmpError> {
-        self.run(MigrateIncoming { uri: uri.into() })
-            .await
-            .map(drop)
+    /// Loads the VM from `path` (QEMU started with `-incoming defer`).
+    pub async fn migrate_incoming_file(&self, path: &Path) -> Result<(), QmpError> {
+        self.run(MigrateIncoming {
+            channels: Channel::file(path),
+        })
+        .await
+        .map(drop)
     }
 
     pub async fn migrate_cancel(&self) -> Result<(), QmpError> {
@@ -236,40 +281,66 @@ impl Qmp {
     }
 
     /// Applies orbd's migration settings on either side of a save/restore and checks
-    /// they took: unlimited bandwidth and every format-changing capability off.
-    pub async fn configure_migration(&self) -> Result<(), QmpError> {
+    /// they took: `mapped-ram` (and `multifd` if asked) on, every other format-changing
+    /// capability off, and `max_bandwidth` bytes/s (0: unlimited).
+    pub async fn configure_migration(
+        &self,
+        m: FileMigration,
+        max_bandwidth: u64,
+    ) -> Result<(), QmpError> {
+        let want = |name: &str| match name {
+            "mapped-ram" => Some(true),
+            "multifd" => Some(m.multifd_channels > 0),
+            n if OFF_CAPABILITIES.contains(&n) => Some(false),
+            _ => None,
+        };
         let current = self.run(QueryCapabilities {}).await?;
-        let to_clear: Vec<CapabilityState> = current
+        if !current.iter().any(|c| c.capability == "mapped-ram") {
+            return Err(QmpError::Command {
+                command: "query-migrate-capabilities",
+                desc: "this QEMU has no mapped-ram capability (needs QEMU 9.0 or newer)".into(),
+            });
+        }
+        let changes: Vec<CapabilityState> = current
             .iter()
-            .filter(|c| c.state && OFF_CAPABILITIES.contains(&c.capability.as_str()))
-            .map(|c| CapabilityState {
-                capability: c.capability.clone(),
-                state: false,
+            .filter_map(|c| {
+                let state = want(&c.capability)?;
+                (state != c.state).then(|| CapabilityState {
+                    capability: c.capability.clone(),
+                    state,
+                })
             })
             .collect();
-        if !to_clear.is_empty() {
+        if !changes.is_empty() {
             self.run(SetCapabilities {
-                capabilities: to_clear,
+                capabilities: changes,
             })
             .await?;
         }
-        // 0 disables rate limiting (QEMU's default is 128 MiB/s).
-        self.run(SetParameters { max_bandwidth: 0 }).await?;
+        let params = Parameters {
+            max_bandwidth: Some(max_bandwidth),
+            multifd_channels: (m.multifd_channels > 0).then_some(m.multifd_channels),
+            direct_io: m.direct_io.then_some(true),
+        };
+        self.run(params.clone()).await?;
         let caps = self.run(QueryCapabilities {}).await?;
-        let params = self.run(QueryParameters {}).await?;
         if let Some(c) = caps
             .iter()
-            .find(|c| c.state && OFF_CAPABILITIES.contains(&c.capability.as_str()))
+            .find(|c| want(&c.capability).is_some_and(|w| w != c.state))
         {
             return Err(QmpError::Command {
                 command: "migrate-set-capabilities",
-                desc: format!("{} is still enabled", c.capability),
+                desc: format!("{} is {}", c.capability, if c.state { "on" } else { "off" }),
             });
         }
-        if params.max_bandwidth != Some(0) {
+        let now = self.run(QueryParameters {}).await?;
+        if now.max_bandwidth != params.max_bandwidth
+            || now.direct_io.unwrap_or(false) != m.direct_io
+            || (m.multifd_channels > 0 && now.multifd_channels != params.multifd_channels)
+        {
             return Err(QmpError::Command {
                 command: "migrate-set-parameters",
-                desc: format!("max-bandwidth is {:?}", params.max_bandwidth),
+                desc: format!("wanted {params:?}, QEMU has {now:?}"),
             });
         }
         Ok(())
