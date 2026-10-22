@@ -51,7 +51,7 @@ pub struct FakeRuntimeConfig {
     pub memory_preserving_sleep: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DockerRuntimeConfig {
     /// Docker API endpoint; defaults to the local socket.

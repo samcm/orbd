@@ -122,8 +122,11 @@ pub async fn run(config: AgentConfig, shutdown: CancellationToken) -> anyhow::Re
             )),
         );
     }
-    if config.runtime.docker.is_some() {
-        anyhow::bail!("the docker runtime is not available in this build");
+    if let Some(docker) = &config.runtime.docker {
+        let rt = crate::runtime::docker::DockerRuntime::connect(docker.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("docker runtime: {e}"))?;
+        runtimes.insert(RuntimeKind::Docker, Arc::new(rt));
     }
 
     if let Some(addr) = config.agent.metrics_listen
