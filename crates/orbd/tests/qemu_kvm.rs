@@ -25,6 +25,9 @@ const MEMORY_MIB: u64 = 2048;
 fn cluster(orbs: u64) -> Cluster {
     let kernel = std::env::var("ORBD_KVM_KERNEL").expect("set ORBD_KVM_KERNEL");
     let rootfs = std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS");
+    if !nested() {
+        eprintln!("NOTICE: ORBD_KVM_NESTED=0: the nested KVM guest assertions are SKIPPED");
+    }
     Cluster::with_runtime(
         &["agent-a"],
         orbs,
@@ -120,13 +123,20 @@ fn samples(console: &str) -> (Vec<(u32, u64)>, Vec<u64>) {
     (counter, l2)
 }
 
+/// Whether the host's KVM nests, so the orb's nested guest runs. `ORBD_KVM_NESTED=0`
+/// (CI on a runner without nested virtualization) skips only the nested-guest checks.
+fn nested() -> bool {
+    std::env::var("ORBD_KVM_NESTED").map_or(true, |v| v != "0")
+}
+
 /// Waits until both counters advanced by at least two since `after`.
 fn wait_progress(orb: &Path, after: (usize, usize)) -> ((u32, u64), u64) {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let nested = nested();
     loop {
         let (counter, l2) = samples(&console(orb));
-        if counter.len() >= after.0 + 2 && l2.len() >= after.1 + 2 {
-            return (*counter.last().unwrap(), *l2.last().unwrap());
+        if counter.len() >= after.0 + 2 && (!nested || l2.len() >= after.1 + 2) {
+            return (*counter.last().unwrap(), l2.last().copied().unwrap_or(0));
         }
         assert!(
             Instant::now() < deadline,
