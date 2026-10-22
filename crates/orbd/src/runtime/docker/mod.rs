@@ -225,6 +225,13 @@ impl DockerRuntime {
     }
 }
 
+/// Local image repository for project snapshots.
+const SNAPSHOT_REPO: &str = "orbd-project-snapshot";
+
+fn snapshot_image(key: &ProjectSnapshotKey) -> String {
+    format!("{SNAPSHOT_REPO}:{}", key.as_str())
+}
+
 #[async_trait]
 impl Runtime for DockerRuntime {
     fn capabilities(&self) -> RuntimeCapabilities {
@@ -234,7 +241,7 @@ impl Runtime for DockerRuntime {
             memory_preserving_sleep: false,
             nested_kvm: false,
             nested_state_qualified: false,
-            project_snapshots: false,
+            project_snapshots: true,
         }
     }
 
@@ -250,10 +257,18 @@ impl Runtime for DockerRuntime {
     ) -> Result<(), RuntimeError> {
         let image = match source {
             StartSource::NewDisk(InitialDiskSource::Image { image_ref }) => Some(image_ref),
-            StartSource::NewDisk(InitialDiskSource::ProjectSnapshot(_)) => {
-                return Err(RuntimeError::Unsupported(
-                    "docker runtime has no project snapshots".into(),
-                ));
+            StartSource::NewDisk(InitialDiskSource::ProjectSnapshot(r)) => {
+                let image = snapshot_image(&r.key);
+                match bounded(ctx, self.docker.inspect_image(&image)).await? {
+                    Ok(_) => Some(image),
+                    Err(e) if is_not_found(&e) => {
+                        return Err(RuntimeError::NotFound(format!(
+                            "project snapshot {} is not on this host",
+                            r.key
+                        )));
+                    }
+                    Err(e) => return Err(docker_err(e)),
+                }
             }
             StartSource::MemoryCheckpoint(_) => {
                 return Err(RuntimeError::Unsupported(
@@ -271,7 +286,9 @@ impl Runtime for DockerRuntime {
                 )));
             }
             (None, Some(image)) => {
-                self.ensure_image(image, ctx).await?;
+                if !image.starts_with(SNAPSHOT_REPO) {
+                    self.ensure_image(image, ctx).await?;
+                }
                 self.create(orb, image, ctx).await?;
                 bounded(ctx, self.find(orb.id)).await??.ok_or_else(|| {
                     RuntimeError::Other(format!("{} vanished after create", container_name(orb.id)))
@@ -353,15 +370,47 @@ impl Runtime for DockerRuntime {
         ))
     }
 
+    /// Commits the stopped container to a local image `orbd-project-snapshot:<key>`.
+    /// The image is agent-local and secret-bearing (it holds the orb's files, including
+    /// its last bootstrap env); orbs started from it are re-bootstrapped with fresh
+    /// credentials.
     async fn clone_disk(
         &self,
-        _orb: &OrbDefinition,
-        _key: &ProjectSnapshotKey,
-        _ctx: &OpContext,
+        orb: &OrbDefinition,
+        key: &ProjectSnapshotKey,
+        ctx: &OpContext,
     ) -> Result<ProjectSnapshotRef, RuntimeError> {
-        Err(RuntimeError::Unsupported(
-            "docker runtime has no project snapshots".into(),
-        ))
+        let image = snapshot_image(key);
+        let done = ProjectSnapshotRef { key: key.clone() };
+        if bounded(ctx, self.docker.inspect_image(&image))
+            .await?
+            .is_ok()
+        {
+            return Ok(done);
+        }
+        match bounded(ctx, self.observe(orb.id)).await?? {
+            RuntimeObservation::Stopped { .. } => {}
+            other => {
+                return Err(RuntimeError::Other(format!(
+                    "snapshot needs a stopped orb, found {other:?}"
+                )));
+            }
+        }
+        log(ctx, &format!("committing project snapshot {key}"));
+        let opts = bollard::query_parameters::CommitContainerOptionsBuilder::new()
+            .container(&container_name(orb.id))
+            .repo(SNAPSHOT_REPO)
+            .tag(key.as_str())
+            .build();
+        bounded(
+            ctx,
+            self.docker
+                .commit_container(opts, bollard::models::ContainerConfig::default()),
+        )
+        .await?
+        .map_err(docker_err)?;
+        log(ctx, &format!("project snapshot {key} published"));
+        Ok(done)
     }
 
     async fn delete(&self, orb: OrbId, ctx: &OpContext) -> Result<(), RuntimeError> {

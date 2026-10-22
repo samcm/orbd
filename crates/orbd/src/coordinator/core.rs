@@ -474,13 +474,15 @@ impl Core {
     /// Decides what the head request does now that its orb has no open command.
     async fn start(&mut self, head: &Req) -> Result<Step> {
         let (ep, aid) = (head.amp_endpoint.clone(), head.amp_orb_id.clone());
-        let (orb, tomb) = self
+        let (mut orb, tomb) = self
             .db
             .call(move |c| {
-                Ok((
-                    store::get_orb_by_identity(c, ep.as_str(), aid.as_str())?,
-                    store::is_tombstoned(c, ep.as_str(), aid.as_str())?,
-                ))
+                let orb = store::get_orb_by_identity(c, ep.as_str(), aid.as_str())?;
+                let tomb = match &orb {
+                    Some(o) => store::is_tombstoned(c, o.id)?,
+                    None => false,
+                };
+                Ok((orb, tomb))
             })
             .await?;
         let Some(offering) = self.offerings.get(&head.offering_id).cloned() else {
@@ -540,12 +542,23 @@ impl Core {
                 }
             }
             ReqAction::Spawn { .. } => {
-                if tomb || state.is_some_and(|s| is_known(s, &StableOrbState::Deleted)) {
+                let deleted = state.is_some_and(|s| is_known(s, &StableOrbState::Deleted));
+                if deleted {
+                    // Amp resets an orb by deleting it and spawning the same ORB_ID again.
+                    // The deleted incarnation never runs again; the spawn creates a new
+                    // one (new internal id, fresh disk, fresh placement).
+                    let old = orb.take().expect("deleted orb exists");
+                    tracing::info!(orb = %old.id, amp_orb_id = %head.amp_orb_id, "spawn after delete: creating a new incarnation");
+                    self.db.call(move |c| store::retire_orb(c, old.id)).await?;
+                } else if tomb {
                     return self
                         .finish_refused(
                             head,
                             orb.as_ref(),
-                            refuse(FailureCode::OrbDeleted, "orb was deleted"),
+                            refuse(
+                                FailureCode::OrbDeleted,
+                                "orb is being deleted and its deletion has not completed",
+                            ),
                         )
                         .await;
                 }

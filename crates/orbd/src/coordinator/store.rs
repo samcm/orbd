@@ -133,7 +133,10 @@ pub fn bump_epoch(c: &mut Connection) -> Result<u64> {
 
 pub fn get_orb_by_identity(c: &Connection, ep: &str, orb: &str) -> Result<Option<OrbRecord>> {
     Ok(c.query_row(
-        &format!("SELECT {ORB_COLS} FROM orbs WHERE amp_endpoint = ?1 AND amp_orb_id = ?2"),
+        &format!(
+            "SELECT {ORB_COLS} FROM orbs WHERE amp_endpoint = ?1 AND amp_orb_id = ?2 \
+             AND retired_ms IS NULL"
+        ),
         params![ep, orb],
         orb_row,
     )
@@ -185,10 +188,19 @@ pub fn open_commands(c: &Connection) -> Result<Vec<(CmdRow, OrbRecord)>> {
     Ok(out)
 }
 
-pub fn is_tombstoned(c: &Connection, ep: &str, orb: &str) -> Result<bool> {
+/// Retires a deleted orb so a new incarnation can take its Amp id.
+pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
+    c.execute(
+        "UPDATE orbs SET retired_ms = ?2 WHERE id = ?1 AND retired_ms IS NULL",
+        params![orb.to_string(), crate::model::unix_ms_now() as i64],
+    )?;
+    Ok(())
+}
+
+pub fn is_tombstoned(c: &Connection, orb: OrbId) -> Result<bool> {
     Ok(c.query_row(
-        "SELECT 1 FROM delete_tombstones WHERE amp_endpoint = ?1 AND amp_orb_id = ?2",
-        params![ep, orb],
+        "SELECT 1 FROM delete_tombstones WHERE orb_id = ?1",
+        params![orb.to_string()],
         |_| Ok(()),
     )
     .optional()?

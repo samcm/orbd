@@ -4,10 +4,10 @@ mod common;
 use common::*;
 use std::time::{Duration, Instant};
 
-/// Spawn → pause (memory checkpoint) → spawn (restore) → delete, then a late spawn is
-/// refused by the delete tombstone. The orb token never reaches any log.
+/// Spawn → pause (memory checkpoint) → spawn (restore) → delete → spawn (new
+/// incarnation). The orb token never reaches any log.
 #[test]
-fn lifecycle_and_delete_tombstone() {
+fn lifecycle_and_reincarnation_after_delete() {
     let mut c = Cluster::new(&["agent-a"], 2);
     c.start_all();
 
@@ -57,18 +57,23 @@ fn lifecycle_and_delete_tombstone() {
     assert!(!s.disk && !s.running);
     assert_ok(&c.dispatch("delete", "amp-1", &[]), "repeated delete");
 
-    let late = c.dispatch("spawn", "amp-1", &[]);
+    // Amp resets an orb by deleting it and spawning the same ORB_ID again: that spawn
+    // gets a new orb with a fresh disk; the deleted one is never brought back.
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn after delete");
+    let orbs = c.fake_orbs("agent-a");
     assert_eq!(
-        late.code, 1,
-        "late spawn after delete must fail: {}",
-        late.stderr
+        orbs.len(),
+        2,
+        "spawn after delete must create a new incarnation"
     );
-    assert!(late.stderr.contains("OrbDeleted"), "{}", late.stderr);
-    assert_eq!(
-        c.only_orb("agent-a").counters.disk_creates,
-        1,
-        "delete must not be undone"
-    );
+    let old = orbs
+        .iter()
+        .find(|o| !o.disk)
+        .expect("deleted incarnation stays deleted");
+    assert_eq!(old.counters.disk_creates, 1);
+    let new = orbs.iter().find(|o| o.disk).unwrap();
+    assert!(new.running && new.bootstraps[0].cold_boot);
+    assert_eq!(new.counters.disk_creates, 1);
 
     assert!(
         !c.logs().contains(TOKEN),

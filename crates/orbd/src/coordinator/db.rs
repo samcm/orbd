@@ -32,8 +32,10 @@ CREATE TABLE orbs (
     observation_json TEXT NOT NULL,
     observation_generation INTEGER NOT NULL,
     created_ms INTEGER NOT NULL,
-    UNIQUE (amp_endpoint, amp_orb_id)
+    -- Set when a deleted orb is replaced by a new incarnation with the same Amp id.
+    retired_ms INTEGER
 );
+CREATE UNIQUE INDEX orbs_identity ON orbs (amp_endpoint, amp_orb_id) WHERE retired_ms IS NULL;
 CREATE TRIGGER orbs_identity_immutable
 BEFORE UPDATE OF id, amp_endpoint, amp_orb_id, offering_id, spec_json, spec_digest, location_json
 ON orbs
@@ -91,12 +93,13 @@ CREATE TABLE reservations (
 );
 CREATE INDEX reservations_pool ON reservations (backend_id, pool);
 
+-- One per orb incarnation: once deleted, that incarnation (its disk, its location) can
+-- never run again. A later spawn for the same Amp id creates a new incarnation.
 CREATE TABLE delete_tombstones (
     amp_endpoint TEXT NOT NULL,
     amp_orb_id TEXT NOT NULL,
-    orb_id TEXT NOT NULL,
-    created_ms INTEGER NOT NULL,
-    PRIMARY KEY (amp_endpoint, amp_orb_id)
+    orb_id TEXT PRIMARY KEY,
+    created_ms INTEGER NOT NULL
 );
 
 -- Sealed guest env. owner is an operation id, or an invocation id while the request
