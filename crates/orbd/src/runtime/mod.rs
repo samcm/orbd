@@ -107,6 +107,11 @@ pub trait Runtime: Send + Sync {
     async fn inspect(&self, orb: OrbId) -> Result<RuntimeObservation, RuntimeError>;
 
     /// Starts the orb. Must not return Ok until the VMM/container is running.
+    ///
+    /// `MemoryCheckpoint`: the runtime must durably mark the checkpoint consumed *before*
+    /// the restored guest can run or write its disk (e.g. load with vCPUs stopped, record
+    /// consumption, then resume), so a crash can never replay stale RAM against a newer
+    /// disk. "Consumed" keeps the files; `discard_checkpoint` deletes them later.
     async fn start(
         &self,
         orb: &OrbDefinition,
@@ -126,8 +131,7 @@ pub trait Runtime: Send + Sync {
     /// Stops the orb without saving memory (processes lost). Idempotent.
     async fn cold_stop(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError>;
 
-    /// Marks a checkpoint consumed before restored vCPUs can write the disk. Called by
-    /// the executor after a successful MemoryCheckpoint start is durably recorded.
+    /// Cleanup only: removes a checkpoint that `start` already consumed. Idempotent.
     async fn discard_checkpoint(
         &self,
         orb: OrbId,

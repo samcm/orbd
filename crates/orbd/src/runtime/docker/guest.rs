@@ -160,7 +160,8 @@ impl DockerRuntime {
         }
     }
 
-    /// True when systemd in the orb can load `unit` (it exists in the image).
+    /// False only when systemd reports the unit as `not-found` (absent from the image).
+    /// A masked or broken unit is a bootstrap failure, not a reason to fall back.
     async fn has_unit(&self, orb: OrbId, unit: &str, ctx: &OpContext) -> Result<bool, GuestError> {
         let out = self
             .guest_exec(
@@ -171,7 +172,11 @@ impl DockerRuntime {
                 ctx,
             )
             .await?;
-        Ok(out.stdout.trim() == "loaded")
+        match out.stdout.trim() {
+            "not-found" => Ok(false),
+            "loaded" => Ok(true),
+            other => Err(GuestError::BootstrapFailed(format!("{unit} is {other}"))),
+        }
     }
 
     async fn bootstrap_unit_state(

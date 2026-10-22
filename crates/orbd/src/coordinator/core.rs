@@ -529,13 +529,15 @@ impl Core {
                         .await;
                 }
             }
-            ReqAction::Pause { .. } => {
+            ReqAction::Pause { snapshot_id } => {
                 if orb.is_none() {
                     return self
                         .finish_plain(head, Status::Succeeded, "pause: orb does not exist")
                         .await;
                 }
-                if state.is_some_and(stopped) {
+                // A requested project snapshot still has to be published, so only a
+                // plain pause of a stopped orb is a no-op.
+                if snapshot_id.is_none() && state.is_some_and(stopped) {
                     return self
                         .finish_plain(head, Status::Succeeded, "pause: orb is already stopped")
                         .await;

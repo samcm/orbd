@@ -1,7 +1,13 @@
-// orbd guest protocol, version 1: host agent <-> `orbd-guest` inside a VM, over vsock.
+// orbd guest protocol, version 1: host agent <-> `orbd-guest` inside a VM.
 //
-// Deliberately narrow: there is no shell or exec RPC. Messages are length-prefixed
-// protobuf frames with a bounded maximum size.
+// Transport is a byte stream behind a connector: a virtio-serial port named
+// `org.orbd.control` for QEMU, Firecracker's vsock (unix socket + `CONNECT <port>`)
+// later. Messages are u32 big-endian length-prefixed protobuf frames, max 64 KiB.
+// Deliberately narrow: there is no shell or exec RPC.
+//
+// Every connection starts with Hello. Either side may see EOF/HUP at any time (e.g.
+// across a memory restore); the guest discards partial frames and reopens with bounded
+// backoff. The host, not the guest, decides cold vs warm (`Wake.cold_boot`).
 syntax = "proto3";
 
 package orbd.guest.v1;
@@ -14,6 +20,11 @@ message EnvVar {
 message NetworkConfig {
   repeated string dns_servers = 1;
   repeated string search_domains = 2;
+  // Static guest addressing on the single virtio-net interface (stable across sleep).
+  string mac = 3;
+  string ipv4_cidr = 4;     // e.g. 10.0.2.15/24
+  string ipv4_gateway = 5;
+  uint32 mtu = 6;
 }
 
 message HostMessage {
@@ -28,9 +39,14 @@ message HostMessage {
 
 message Hello {}
 
+// Before a memory save: sync filesystems, then ack. The host closes the channel after.
 message PrepareSleep {}
 
-// Delivered on cold boot and on every warm restore.
+// Delivered on every spawn (cold boot, warm restore, or already running). The guest
+// steps the wall clock, applies network/DNS, writes the env to the bootstrap env file
+// (0600, owner user), on cold boot stops a stale amp-headless.service, restarts
+// amp-headless-bootstrap.service (falling back to `amp orb bootstrap` only when that unit
+// is not-found, logged), waits until it stays up, and acks the generation.
 message Wake {
   uint64 generation = 1;
   int64 current_time_unix_ns = 2;
@@ -52,7 +68,10 @@ message GuestMessage {
 
 message HelloReply {
   string guest_version = 1;
+  // Highest Wake generation acked since this guest booted (survives memory restore).
   uint64 last_generation = 2;
+  // /proc/sys/kernel/random/boot_id (unchanged by memory restore).
+  string boot_id = 3;
 }
 
 message Ack {

@@ -244,6 +244,8 @@ impl Runtime for FakeRuntime {
                             cp.generation
                         )));
                     }
+                    // Consumed in the same durable write that makes it running.
+                    st.consumed.push(cp.generation);
                     st.counters.restores += 1;
                 }
                 StartSource::ExistingDiskColdBoot => {
