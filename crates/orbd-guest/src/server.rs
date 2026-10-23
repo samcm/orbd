@@ -1,9 +1,12 @@
 //! The `orbd.guest.v1` session loop: u32 big-endian length + protobuf frames (max
 //! 64 KiB). Hello is answered on the reading thread; Wake, PrepareSleep and Shutdown run
 //! one at a time on a worker so a long bootstrap never blocks Hello on a new connection.
+//! The protocol (greeting, acked Wake generations, sync before sleep, poweroff) is
+//! handled here; what Wake and Resync do is the [`Handler`]'s.
 
 use crate::proto::{
-    Ack, Error, GuestMessage, Hello, HelloReply, HostMessage, guest_message, host_message,
+    Ack, Error, GuestMessage, Hello, HelloReply, HostMessage, Resync, Wake, guest_message,
+    host_message,
 };
 use crate::transport::{Connector, Session};
 use prost::Message;
@@ -21,13 +24,23 @@ struct Shared {
     boot_id: String,
 }
 
+/// What the guest does for `Wake` and `Resync`. Runs on the worker thread, one request
+/// at a time; an `Err` is sent to the host as the request's error.
+pub trait Handler: Send + Sync + 'static {
+    /// Called once per Wake generation newer than the last acked one (a repeated
+    /// generation is acked without calling it again).
+    fn wake(&self, wake: &Wake) -> Result<(), String>;
+    fn resync(&self, resync: &Resync) -> Result<(), String>;
+}
+
 struct Job {
     request_id: u64,
     session: Arc<dyn Session>,
     body: host_message::Body,
 }
 
-pub fn serve(connector: &dyn Connector) -> ! {
+/// Serves the host on `connector` forever, one connection at a time.
+pub fn serve(connector: &dyn Connector, handler: Arc<dyn Handler>) -> ! {
     let shared = Arc::new(Shared {
         last_generation: AtomicU64::new(
             std::fs::read_to_string(GENERATION_FILE)
@@ -42,7 +55,7 @@ pub fn serve(connector: &dyn Connector) -> ! {
     });
     let (tx, rx) = mpsc::channel::<Job>();
     let worker_shared = shared.clone();
-    std::thread::spawn(move || worker(rx, &worker_shared));
+    std::thread::spawn(move || worker(rx, &worker_shared, &*handler));
 
     loop {
         let session = match connector.accept() {
@@ -143,7 +156,7 @@ fn run_session(
     }
 }
 
-fn worker(rx: mpsc::Receiver<Job>, shared: &Shared) {
+fn worker(rx: mpsc::Receiver<Job>, shared: &Shared, handler: &dyn Handler) {
     for mut job in rx {
         let result = match &job.body {
             host_message::Body::Wake(w) => {
@@ -157,7 +170,7 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared) {
                     // Already done for this generation (host retry after reconnect).
                     Ok(last)
                 } else {
-                    crate::wake::wake(w).map(|()| {
+                    handler.wake(w).map(|()| {
                         shared.last_generation.store(w.generation, Ordering::SeqCst);
                         let _ = std::fs::create_dir_all("/run/orbd-guest");
                         let _ = std::fs::write(GENERATION_FILE, w.generation.to_string());
@@ -172,9 +185,9 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared) {
                 log!("prepared for sleep (filesystems synced)");
                 Ok(shared.last_generation.load(Ordering::SeqCst))
             }
-            host_message::Body::Resync(r) => {
-                crate::wake::resync(r).map(|()| shared.last_generation.load(Ordering::SeqCst))
-            }
+            host_message::Body::Resync(r) => handler
+                .resync(r)
+                .map(|()| shared.last_generation.load(Ordering::SeqCst)),
             host_message::Body::Shutdown(_) => {
                 log!("shutdown requested");
                 // SAFETY: as above.

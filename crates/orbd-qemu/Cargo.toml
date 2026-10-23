@@ -1,0 +1,27 @@
+[package]
+name = "orbd-qemu"
+description = "QEMU/KVM launch, QMP client and file-based save/load for orbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbd-vm.workspace = true
+fail.workspace = true
+futures.workspace = true
+nix.workspace = true
+qapi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# `fail` failpoints for crash-recovery tests (see `migration`). Never in releases.
+failpoints = ["fail/failpoints", "orbd-vm/failpoints"]

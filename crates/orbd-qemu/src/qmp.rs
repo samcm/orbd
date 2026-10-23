@@ -1,16 +1,19 @@
 //! Narrow QMP client. The pinned `qapi` crate provides the transport (greeting,
 //! capability negotiation, JSON framing, response matching); the commands and the
-//! response fields orbd reads are declared here, so schema drift between `qapi`'s
-//! generated types and the host's QEMU (9.0 or newer) cannot break decoding.
+//! response fields this client reads are declared here, so schema drift between
+//! `qapi`'s generated types and the host's QEMU (9.0 or newer) cannot break decoding.
 
-use qapi::futures::{QapiService, QmpStreamTokio};
+use futures::StreamExt;
+use qapi::futures::{QapiEvents, QapiService, QmpStreamTokio};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::WriteHalf;
+use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 
 type Writer = QmpStreamTokio<WriteHalf<UnixStream>>;
+type Reader = QmpStreamTokio<ReadHalf<UnixStream>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum QmpError {
@@ -96,6 +99,18 @@ impl Channel {
     }
 }
 
+/// `blockdev-add` with QEMU's `BlockdevOptions` as JSON (a union too wide to type here).
+#[derive(Serialize)]
+#[serde(transparent)]
+struct BlockdevAdd(serde_json::Value);
+command!(BlockdevAdd, "blockdev-add", qapi::Empty);
+#[derive(Serialize)]
+struct BlockdevSnapshot {
+    node: String,
+    overlay: String,
+}
+command!(BlockdevSnapshot, "blockdev-snapshot", qapi::Empty);
+
 #[derive(Serialize)]
 struct QueryStatus {}
 command!(QueryStatus, "query-status", StatusInfo);
@@ -149,7 +164,7 @@ struct SetCapabilities {
 }
 command!(SetCapabilities, "migrate-set-capabilities", qapi::Empty);
 
-/// The migration parameters orbd sets; `None` is left unset (and unread).
+/// The migration parameters this client sets; `None` is left unset (and unread).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Parameters {
     #[serde(rename = "max-bandwidth", skip_serializing_if = "Option::is_none")]
@@ -198,14 +213,41 @@ const OFF_CAPABILITIES: &[&str] = &[
     "dirty-limit",
 ];
 
+/// A `MIGRATION` event: the migration's new `status` (QEMU's `MigrationStatus`, e.g.
+/// `active`, `completed`, `failed`). QEMU sends it only while the `events` migration
+/// capability is on ([`Qmp::enable_migration_events`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationEvent {
+    pub status: String,
+}
+
 impl Qmp {
-    /// Connects and negotiates, bounded by `timeout`.
+    /// Connects and negotiates, bounded by `timeout`. Events are discarded.
     pub async fn connect(path: &Path, timeout: Duration) -> Result<Self, QmpError> {
         let fut = async {
             let neg = QmpStreamTokio::open_uds(path).await?;
             let stream = neg.negotiate().await?;
             let (service, events) = stream.spawn_tokio();
             Ok::<_, std::io::Error>(Self { service, events })
+        };
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(r) => Ok(r?),
+            Err(_) => Err(QmpError::Timeout),
+        }
+    }
+
+    /// Like [`Qmp::connect`], and delivers this session's `MIGRATION` events. Other
+    /// events are discarded; the receiver ends when the session does.
+    pub async fn connect_with_events(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<MigrationEvent>), QmpError> {
+        let fut = async {
+            let neg = QmpStreamTokio::open_uds(path).await?;
+            let (service, events) = neg.negotiate().await?.into_parts();
+            let (tx, rx) = mpsc::unbounded_channel();
+            let events = tokio::spawn(forward_events(events, tx));
+            Ok::<_, std::io::Error>((Self { service, events }, rx))
         };
         match tokio::time::timeout(timeout, fut).await {
             Ok(r) => Ok(r?),
@@ -280,7 +322,41 @@ impl Qmp {
         self.run(QueryMigrate {}).await
     }
 
-    /// Applies orbd's migration settings on either side of a save/restore and checks
+    /// Every migration capability this QEMU knows, with its state.
+    pub async fn query_migrate_capabilities(&self) -> Result<Vec<CapabilityState>, QmpError> {
+        self.run(QueryCapabilities {}).await
+    }
+
+    /// Turns on the `events` capability, so QEMU sends `MIGRATION` events (see
+    /// [`Qmp::connect_with_events`]). It does not change the migration stream.
+    pub async fn enable_migration_events(&self) -> Result<(), QmpError> {
+        self.run(SetCapabilities {
+            capabilities: vec![CapabilityState {
+                capability: "events".into(),
+                state: true,
+            }],
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Adds a block node; `options` is QEMU's `BlockdevOptions` object.
+    pub async fn blockdev_add(&self, options: serde_json::Value) -> Result<(), QmpError> {
+        self.run(BlockdevAdd(options)).await.map(drop)
+    }
+
+    /// Makes the node `overlay` (added without a backing file) the active layer over
+    /// `node`, which becomes its read-only backing.
+    pub async fn blockdev_snapshot(&self, node: &str, overlay: &str) -> Result<(), QmpError> {
+        self.run(BlockdevSnapshot {
+            node: node.into(),
+            overlay: overlay.into(),
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Applies file-migration settings on either side of a save/restore and checks
     /// they took: `mapped-ram` (and `multifd` if asked) on, every other format-changing
     /// capability off, and `max_bandwidth` bytes/s (0: unlimited).
     pub async fn configure_migration(
@@ -344,5 +420,77 @@ impl Qmp {
             });
         }
         Ok(())
+    }
+}
+
+/// Reads the session's messages: responses complete their commands inside `qapi`;
+/// `MIGRATION` events are forwarded, even when nobody listens any more.
+async fn forward_events(mut events: QapiEvents<Reader>, tx: mpsc::UnboundedSender<MigrationEvent>) {
+    // Ends this stream when the service drops, as `spawn_tokio` does.
+    if events.release().is_err() {
+        return;
+    }
+    while let Some(Ok(event)) = events.next().await {
+        if let qapi::qmp::Event::MIGRATION { data, .. } = event
+            && let Ok(serde_json::Value::String(status)) = serde_json::to_value(data.status)
+        {
+            let _ = tx.send(MigrationEvent { status });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// A QMP server that answers every command with `{}` and sends a `MIGRATION` event
+    /// before answering `blockdev-snapshot`; returns that command's arguments.
+    async fn fake_qemu(listener: tokio::net::UnixListener) -> serde_json::Value {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(
+            br#"{"QMP":{"version":{"qemu":{"major":9,"minor":2,"micro":0},"package":""},"capabilities":[]}}
+"#,
+        )
+        .await
+        .unwrap();
+        let mut lines = BufReader::new(r).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let cmd: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if cmd["execute"] == "blockdev-snapshot" {
+                w.write_all(
+                    br#"{"event":"MIGRATION","data":{"status":"completed"},"timestamp":{"seconds":1,"microseconds":0}}
+"#,
+                )
+                .await
+                .unwrap();
+                w.write_all(b"{\"return\":{}}\n").await.unwrap();
+                return cmd["arguments"].clone();
+            }
+            w.write_all(b"{\"return\":{}}\n").await.unwrap();
+        }
+        panic!("no blockdev-snapshot");
+    }
+
+    #[tokio::test]
+    async fn events_arrive_while_commands_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        let server = tokio::spawn(fake_qemu(tokio::net::UnixListener::bind(&path).unwrap()));
+        let (qmp, mut events) = Qmp::connect_with_events(&path, Duration::from_secs(5))
+            .await
+            .unwrap();
+        qmp.blockdev_snapshot("disk0", "snap1").await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            serde_json::json!({"node": "disk0", "overlay": "snap1"})
+        );
+        assert_eq!(
+            events.recv().await,
+            Some(MigrationEvent {
+                status: "completed".into()
+            })
+        );
     }
 }

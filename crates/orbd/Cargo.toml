@@ -9,7 +9,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-orbd-proto.workspace = true
+orbd-proto = { workspace = true, features = ["control"] }
+orbd-vm.workspace = true
+orbd-qemu.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bollard.workspace = true
@@ -52,11 +54,10 @@ rcgen.workspace = true
 tokio-rustls.workspace = true
 base64.workspace = true
 time.workspace = true
-qapi.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [features]
 # Enables `fail` failpoints (FAILPOINTS env var) for crash-recovery tests. Never in releases.
-failpoints = ["fail/failpoints"]
+failpoints = ["fail/failpoints", "orbd-vm/failpoints", "orbd-qemu/failpoints"]

@@ -6,6 +6,15 @@ use serde::de::DeserializeOwned;
 use std::io::Write;
 use std::path::Path;
 
+/// `mkdir -p` with mode 0700 for the directories it creates.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }

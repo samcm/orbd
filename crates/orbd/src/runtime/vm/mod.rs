@@ -4,11 +4,12 @@
 //! interprets its VMM.
 
 pub mod checkpoints;
-pub mod fsutil;
 pub mod guest;
 pub mod images;
 pub mod net;
-pub mod process;
+
+pub use orbd_vm::fsutil::{self, create_private_dir};
+pub use orbd_vm::process;
 
 use super::{LogStream, OpContext, RuntimeError};
 use crate::model::{OrbId, ProjectSnapshotKey};
@@ -56,14 +57,6 @@ pub fn on_path(program: &Path) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|d| d.join(program))
         .find(|p| p.is_file())
-}
-
-pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
 }
 
 /// Stable per-orb systemd machine id (project-snapshot clones get their own).

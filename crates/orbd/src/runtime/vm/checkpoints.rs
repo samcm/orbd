@@ -1,58 +1,55 @@
-//! An orb's memory checkpoints on disk, the same for every VM runtime:
+//! An orb's memory checkpoints on disk, the same for every VM runtime: a
+//! [`CheckpointStore`] named by generation, plus orbd's consume-once rule.
 //!
 //! ```text
 //! checkpoints/<gen>/       published: the VMM's files, manifest.json[, consumed]
 //! checkpoints/<gen>.tmp/   save in progress (complete once manifest.json exists)
 //! ```
 //!
-//! Publication is one fsynced rename. A checkpoint is consumed (durably, an empty
-//! `consumed` file) before a restored guest can run, and never restored again. Files are
-//! only ever created fresh, renamed and unlinked, never reopened for writing: a lazily
-//! restored Firecracker maps its memory file for life, and an unlinked file stays valid
-//! for the process that maps it.
+//! A checkpoint is consumed (durably, an empty `consumed` file) before a restored guest
+//! can run, and never restored again: the guest's disk moves on from that point.
 
-use super::fsutil::{fsync_dir, remove_via_trash, rename_durable, write_atomic};
-use super::{create_private_dir, io_err};
+use super::fsutil::write_atomic;
+use super::io_err;
 use crate::model::OrbId;
 use crate::runtime::RuntimeError;
+use orbd_vm::checkpoint::CheckpointStore;
 use std::path::{Path, PathBuf};
 
-pub const MANIFEST: &str = "manifest.json";
+pub use orbd_vm::checkpoint::MANIFEST;
 
 pub struct Checkpoints {
     pub orb: OrbId,
-    dir: PathBuf,
-    trash: PathBuf,
+    store: CheckpointStore,
 }
 
 impl Checkpoints {
     pub fn new(orb: OrbId, dir: PathBuf, trash: PathBuf) -> Self {
-        Self { orb, dir, trash }
+        Self {
+            orb,
+            store: CheckpointStore::new(dir, trash),
+        }
     }
 
     /// A published checkpoint's directory.
     pub fn published(&self, generation: u64) -> PathBuf {
-        self.dir.join(generation.to_string())
+        self.store.published(&generation.to_string())
     }
 
     /// A save in progress.
     pub fn tmp(&self, generation: u64) -> PathBuf {
-        self.dir.join(format!("{generation}.tmp"))
+        self.store.tmp(&generation.to_string())
     }
 
     /// Published generations (with their consumed flag) and in-progress generations.
     pub fn list(&self) -> (Vec<(u64, bool)>, Vec<u64>) {
-        let (mut published, mut tmp) = (Vec::new(), Vec::new());
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if let Some(g) = name.strip_suffix(".tmp").and_then(|g| g.parse().ok()) {
-                    tmp.push(g);
-                } else if let Ok(g) = name.parse::<u64>() {
-                    published.push((g, e.path().join("consumed").exists()));
-                }
-            }
-        }
+        let (published, tmp) = self.store.list();
+        let mut published: Vec<(u64, bool)> = published
+            .iter()
+            .filter_map(|n| n.parse().ok())
+            .map(|g| (g, self.published(g).join("consumed").exists()))
+            .collect();
+        let mut tmp: Vec<u64> = tmp.iter().filter_map(|n| n.parse().ok()).collect();
         published.sort_unstable();
         tmp.sort_unstable();
         (published, tmp)
@@ -64,7 +61,7 @@ impl Checkpoints {
             .1
             .into_iter()
             .rev()
-            .find(|g| self.tmp(*g).join(MANIFEST).exists())
+            .find(|g| self.store.tmp_is_complete(&g.to_string()))
     }
 
     /// Consumed: marked so, or already discarded (only consumed checkpoints are).
@@ -97,11 +94,13 @@ impl Checkpoints {
     /// for the VMM that restored from it.
     pub fn discard(&self, generation: u64) -> Result<(), RuntimeError> {
         self.consume(generation)?;
-        remove_via_trash(&self.published(generation), &self.trash).map_err(io_err)
+        self.store.discard(&generation.to_string()).map_err(io_err)
     }
 
     pub fn discard_tmp(&self, generation: u64) -> Result<(), RuntimeError> {
-        remove_via_trash(&self.tmp(generation), &self.trash).map_err(io_err)
+        self.store
+            .discard_tmp(&generation.to_string())
+            .map_err(io_err)
     }
 
     pub fn discard_tmps(&self) -> Result<(), RuntimeError> {
@@ -115,23 +114,15 @@ impl Checkpoints {
     /// A new, empty, private `<gen>.tmp` for a save (a leftover one is discarded first),
     /// durably linked into the checkpoints directory.
     pub fn fresh_tmp(&self, generation: u64) -> Result<PathBuf, RuntimeError> {
-        let tmp = self.tmp(generation);
-        self.discard_tmp(generation)?;
-        create_private_dir(&tmp).map_err(io_err)?;
-        fsync_dir(&self.dir).map_err(io_err)?;
-        Ok(tmp)
+        self.store
+            .fresh_tmp(&generation.to_string())
+            .map_err(io_err)
     }
 
     /// Renames a complete `.tmp` checkpoint into place (the publication boundary).
     /// Generations are never reused, so an existing destination is a bug.
     pub fn publish(&self, generation: u64) -> Result<(), RuntimeError> {
-        let dest = self.published(generation);
-        if dest.exists() {
-            return Err(RuntimeError::Other(format!(
-                "checkpoint {generation} is already published"
-            )));
-        }
-        rename_durable(&self.tmp(generation), &dest).map_err(io_err)
+        self.store.publish(&generation.to_string()).map_err(io_err)
     }
 
     /// With no VMM running: publishes complete saves, discards partial ones, consumes
@@ -144,7 +135,7 @@ impl Checkpoints {
     ) -> Result<Option<u64>, RuntimeError> {
         let orb = self.orb;
         for g in self.list().1 {
-            if self.tmp(g).join(MANIFEST).exists() {
+            if self.store.tmp_is_complete(&g.to_string()) {
                 tracing::warn!(orb = %orb, generation = g, "publishing a complete checkpoint left by an interrupted save");
                 self.publish(g)?;
             } else {
