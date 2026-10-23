@@ -1,0 +1,23 @@
+[package]
+name = "orbd-vm"
+description = "VMM host plumbing shared by orbd's VM runtimes: durable files, process supervision, checkpoint directories"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fail.workspace = true
+hex.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[features]
+# `fail` failpoints for crash-recovery tests (see `process::spawn`). Never in releases.
+failpoints = ["fail/failpoints"]

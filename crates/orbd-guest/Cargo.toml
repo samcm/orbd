@@ -9,10 +9,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+orbd-proto.workspace = true
 libc = "0.2"
 prost.workspace = true
 zeroize.workspace = true
-
-[build-dependencies]
-prost-build = "0.14"
-protoc-bin-vendored.workspace = true

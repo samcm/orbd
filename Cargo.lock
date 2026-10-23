@@ -1793,8 +1793,9 @@ dependencies = [
  "nix",
  "oci-client",
  "orbd-proto",
+ "orbd-qemu",
+ "orbd-vm",
  "prost",
- "qapi",
  "rand 0.10.3",
  "rcgen",
  "rusqlite",
@@ -1826,9 +1827,8 @@ name = "orbd-guest"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "orbd-proto",
  "prost",
- "prost-build",
- "protoc-bin-vendored",
  "zeroize",
 ]
 
@@ -1837,10 +1837,41 @@ name = "orbd-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "prost-build",
  "protoc-bin-vendored",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "orbd-qemu"
+version = "0.1.0"
+dependencies = [
+ "fail",
+ "futures",
+ "nix",
+ "orbd-vm",
+ "qapi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "orbd-vm"
+version = "0.1.0"
+dependencies = [
+ "fail",
+ "hex",
+ "nix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

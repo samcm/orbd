@@ -1,20 +1,20 @@
 //! VMM process supervision: a one-shot launcher (fork → new session → optional cgroup
 //! move → optional network namespace → exec of a foreground VMM), durable launch
-//! records, and validated adoption of VMMs that outlived an earlier agent process.
+//! records, and validated adoption of VMMs that outlived an earlier supervisor process.
 //!
-//! A VMM is never daemonized and never a long-lived child that the agent must keep
+//! A VMM is never daemonized and never a long-lived child that the supervisor must keep
 //! reaping: the spawned `Child` handle is dropped at once (reaped in the background if
-//! it exits while this agent lives) and every later wait goes through a pidfd, the same
-//! for launched and adopted processes. A process is accepted as an orb's VMM only if the
-//! host boot id, `/proc/<pid>` start time and the launch marker in its argv match the
-//! launch record (and the VMM's own API then reports the same marker).
+//! it exits while the supervisor lives) and every later wait goes through a pidfd, the
+//! same for launched and adopted processes. A process is accepted as a VM's VMM only if
+//! the host boot id, `/proc/<pid>` start time and the launch marker in its argv match
+//! the launch record (and the VMM's own API then reports the same marker).
 //!
-//! Production placement: VMMs must not live in the agent service's cgroup, or a service
-//! stop kills every orb. Under systemd use `KillMode=process` or set the runtime's
-//! `cgroup_parent` to a delegated cgroup v2 directory; the launcher moves each VMM into
-//! `<cgroup_parent>/orbd-<orb>` before exec.
+//! Production placement: VMMs must not live in the supervisor service's cgroup, or a
+//! service stop kills every VM. Under systemd use `KillMode=process` or pass a
+//! delegated cgroup v2 directory as [`Spawn::cgroup`]; the launcher moves the VMM into
+//! it before exec.
 
-use super::fsutil::{read_json, write_json_atomic};
+use crate::fsutil::{read_json, write_json_atomic};
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -71,9 +71,9 @@ pub enum LaunchKind {
     Restore { generation: u64 },
 }
 
-/// Durable pre-launch intent (`<run>/<runtime>/<orb>/launch.json`), written before
-/// exec and completed with pid and start time after it. `config` is the runtime's
-/// guest-visible machine definition.
+/// Durable pre-launch intent (a `launch.json` per VM), written before exec and
+/// completed with pid and start time after it. `config` is the guest-visible machine
+/// definition.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaunchRecord<C> {
     pub nonce: String,
@@ -137,7 +137,7 @@ impl Process {
 
     /// Adopts the VMM described by `record` and recognised by `marker` (a unique
     /// string in its argv), if it is still the same process. Without a recorded pid
-    /// (the agent died right after exec) the pid comes from `pidfile` or a `/proc` scan.
+    /// (the supervisor died right after exec) the pid comes from `pidfile` or a `/proc` scan.
     pub fn adopt<C>(
         record: &LaunchRecord<C>,
         marker: &str,
@@ -235,7 +235,7 @@ fn find_by_marker(marker: &str) -> Option<i32> {
 pub struct Spawn<'a, C> {
     pub program: &'a Path,
     pub args: Vec<String>,
-    /// Receives the VMM's stdout (Firecracker: the guest's serial console).
+    /// Receives the VMM's stdout.
     pub stdout: &'a Path,
     pub stderr: &'a Path,
     pub record_path: &'a Path,
@@ -299,10 +299,10 @@ pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchR
     }
     let child = cmd.spawn()?;
     let pid = child.id() as i32;
-    crate::crash_point!("vm::launch::after_exec");
+    fail::fail_point!("vm::launch::after_exec", |_| std::process::abort());
     let proc = Process::open(pid).ok_or_else(|| std::io::Error::other("pidfd_open failed"))?;
     // Not waited here: a std Child never reaps on drop, so reap it on a detached thread
-    // only while this agent lives; afterwards init (or the subreaper) does.
+    // only while this supervisor lives; afterwards init (or the subreaper) does.
     std::thread::spawn(move || {
         let mut child = child;
         let _ = child.wait();

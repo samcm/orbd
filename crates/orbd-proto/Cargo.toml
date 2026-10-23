@@ -10,9 +10,16 @@ publish.workspace = true
 
 [dependencies]
 prost.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 
 [build-dependencies]
-tonic-prost-build.workspace = true
+prost-build.workspace = true
+tonic-prost-build = { workspace = true, optional = true }
 protoc-bin-vendored.workspace = true
+
+[features]
+default = ["control"]
+# The control plane's gRPC services. Without it only the guest protocol is built (plain
+# prost), small enough for static guest binaries.
+control = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build"]

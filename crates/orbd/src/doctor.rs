@@ -186,7 +186,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
 
     let mut r = Report { failed: false };
     let qemu_check = first_line(&qemu, &["--version"])
-        .and_then(|l| crate::runtime::qemu::check_qemu_version(&l).map(|()| l));
+        .and_then(|l| orbd_qemu::probe::check_qemu_version(&l).map(|()| l));
     r.line(qemu_check, "qemu-system-x86_64", true);
     r.line(first_line(&qemu_img, &["--version"]), "qemu-img", true);
     // Firecracker orbs only (and their networking).

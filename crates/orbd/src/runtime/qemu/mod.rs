@@ -40,7 +40,6 @@
 //! `qemu::save::throttle=return(<MiB/s>)` caps the save's bandwidth.
 
 mod guest;
-mod qmp;
 
 use super::vm::checkpoints::{Checkpoints, MANIFEST};
 use super::vm::fsutil::{
@@ -65,14 +64,15 @@ use crate::model::{
     RuntimeKind, SleepCheckpointRef, unix_ms_now,
 };
 use async_trait::async_trait;
-use qmp::{FileMigration, Qmp};
+use orbd_qemu::launch::{self, DEFAULT_CPU_MODEL, HostFiles, LaunchConfig, LaunchRecord, Machine};
+use orbd_qemu::migration::{self, MigrationError};
+use orbd_qemu::probe::{self, check_qemu_version, q35_machine};
+use orbd_qemu::qmp::{self, FileMigration, Qmp};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Oldest QEMU with file migration and `mapped-ram`.
-const MIN_QEMU: (u32, u32) = (9, 0);
 /// Memory files are written and read in place (`mapped-ram`) by 8 multifd threads,
 /// bypassing the page cache. Measured on a Ryzen 7940HS: about 2.2 GB/s save and 4.9 GB/s
 /// restore with 4 GiB dirty, against 1.5 and 3.3 GB/s for 4 channels through the cache.
@@ -91,23 +91,13 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const CHECKPOINT_MARGIN: u64 = 256 * MIB;
 const POLL: Duration = Duration::from_millis(100);
 
-/// Everything that defines the guest-visible machine of one launch. A checkpoint's
-/// manifest stores the config it was saved from; restore relaunches with it verbatim.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct LaunchConfig {
-    qemu: VmmIdentity,
-    cpu: CpuIdentity,
-    kernel: KernelIdentity,
-    /// Machine, CPU, memory, kernel and device arguments with fixed ids. Host-side
-    /// plumbing (chardev backends, block files, sockets, pidfile, name) is not included.
-    machine_args: Vec<String>,
-}
-
-type LaunchRecord = process::LaunchRecord<LaunchConfig>;
-
 /// The `-name` value carrying the launch nonce; matched in `/proc/<pid>/cmdline` and QMP.
 fn launch_name(orb: OrbId, record: &LaunchRecord) -> String {
-    format!("orbd-{orb}.{}", record.nonce)
+    launch::name(&name_prefix(orb), record)
+}
+
+fn name_prefix(orb: OrbId) -> String {
+    format!("orbd-{orb}")
 }
 
 /// Immutable per-orb recipe, written once with the disk.
@@ -277,16 +267,8 @@ impl QemuRuntime {
         }
         let qemu_path = on_path(&config.qemu)
             .ok_or_else(|| other("qemu", &format!("{} not found", config.qemu.display())))?;
-        let out = std::process::Command::new(&qemu_path)
-            .arg("--version")
-            .output()
+        let version = probe::qemu_version(&qemu_path)
             .map_err(|e| other(&qemu_path.display().to_string(), &e))?;
-        let version = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
         check_qemu_version(&version).map_err(|e| other("qemu", &e))?;
         let machine = q35_machine(&qemu_path).map_err(|e| other("qemu", &e))?;
         let qemu = VmmIdentity {
@@ -296,12 +278,8 @@ impl QemuRuntime {
         };
         let cpu = CpuIdentity::host();
         // Nested virtualization is on unless the loaded KVM module says it is off.
-        let nested_kvm = Path::new("/dev/kvm").exists()
-            && !["kvm_amd", "kvm_intel"].iter().any(|m| {
-                std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested"))
-                    .is_ok_and(|v| matches!(v.trim(), "0" | "N"))
-            });
-        let direct_io = probe_direct_io(&state_dir.join("orbs"));
+        let nested_kvm = probe::nested_kvm();
+        let direct_io = probe::direct_io(&state_dir.join("orbs"));
         let migration = FileMigration {
             direct_io: MIGRATION.direct_io && direct_io,
             ..MIGRATION
@@ -541,95 +519,25 @@ impl QemuRuntime {
             path: self.config.kernel.clone(),
             sha256: file_digest(&self.config.kernel, "kernel")?,
         };
-        let mut a: Vec<String> = [
-            "-machine",
-            &format!("{},accel=kvm", self.machine),
-            "-cpu",
-            "host",
-            "-smp",
-            &recipe.vcpus.to_string(),
-            "-m",
-            &format!("{}M", recipe.memory_bytes / MIB),
-            "-kernel",
-            &kernel.path.display().to_string(),
-            "-append",
-            &format!(
+        let machine_args = Machine {
+            machine_type: &self.machine,
+            cpu_model: DEFAULT_CPU_MODEL,
+            vcpus: recipe.vcpus,
+            memory_mib: recipe.memory_bytes / MIB,
+            kernel: &kernel.path,
+            kernel_cmdline: &format!(
                 "{KERNEL_CMDLINE} systemd.machine_id={}",
                 machine_id(recipe.orb)
             ),
-            "-serial",
-            "chardev:serial0",
-            "-device",
-            "virtio-serial-pci,id=guestbus",
-            "-device",
-            "virtserialport,id=guestctl,bus=guestbus.0,nr=1,chardev=guest,name=org.orbd.control",
-            "-device",
-            "virtio-blk-pci,id=disk0dev,drive=disk0",
-        ]
-        .map(String::from)
-        .into();
-        a.extend(recipe.net.qemu_args());
-        a.extend(
-            [
-                "-device",
-                "virtio-balloon-pci,id=balloon0,free-page-reporting=on",
-            ]
-            .map(String::from),
-        );
+            net_args: recipe.net.qemu_args(),
+        }
+        .args();
         Ok(LaunchConfig {
             qemu: self.qemu.clone(),
             cpu: self.cpu.clone(),
             kernel,
-            machine_args: a,
+            machine_args,
         })
-    }
-
-    /// Host-side plumbing for one launch (not part of the guest-visible machine).
-    fn host_args(&self, orb: OrbId, record: &LaunchRecord) -> Vec<String> {
-        let op = self.orb_paths(orb);
-        let rp = self.run_paths(orb);
-        let esc = |p: &Path| p.display().to_string().replace(',', ",,");
-        let file = serde_json::json!({
-            "driver": "file",
-            "filename": op.disk,
-            "aio": if self.direct_io { "native" } else { "threads" },
-            "cache": { "direct": self.direct_io },
-        });
-        let blockdev = serde_json::json!({
-            "driver": "qcow2",
-            "node-name": "disk0",
-            "discard": "unmap",
-            "cache": { "direct": self.direct_io },
-            "file": file,
-        });
-        let mut a = vec![
-            "-name".into(),
-            format!("guest={},debug-threads=on", launch_name(orb, record)),
-            "-nodefaults".into(),
-            "-no-user-config".into(),
-            "-nographic".into(),
-            "-sandbox".into(),
-            "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny".into(),
-            "-pidfile".into(),
-            rp.pidfile.display().to_string(),
-            "-chardev".into(),
-            format!("socket,id=qmp,path={},server=on,wait=off", esc(&rp.qmp)),
-            "-mon".into(),
-            "chardev=qmp,mode=control".into(),
-            "-chardev".into(),
-            format!(
-                "socket,id=guest,path={},server=on,wait=off",
-                esc(&rp.guest_sock)
-            ),
-            "-chardev".into(),
-            format!("file,id=serial0,path={},append=on", esc(&op.console_log)),
-            "-blockdev".into(),
-            blockdev.to_string(),
-        ];
-        if let LaunchKind::Restore { .. } = record.kind {
-            a.extend(["-S", "-incoming", "defer"].map(String::from));
-        }
-        a
     }
 
     /// Starts QEMU and waits until its QMP socket answers as this launch.
@@ -643,45 +551,43 @@ impl QemuRuntime {
         let rp = self.run_paths(orb);
         self.clear_run(orb);
         create_private_dir(&rp.dir).map_err(io_err)?;
-        let record = LaunchRecord::new(kind, config);
-        let mut args = self.host_args(orb, &record);
-        args.extend(record.config.machine_args.iter().cloned());
         let op = self.orb_paths(orb);
-        let (proc, record) = process::spawn(process::Spawn {
-            program: &record.config.qemu.path.clone(),
-            args,
-            stdout: &op.qemu_log,
-            stderr: &op.qemu_log,
+        let prefix = name_prefix(orb);
+        let (proc, record) = launch::spawn(launch::Launch {
+            record: LaunchRecord::new(kind, config),
+            name_prefix: &prefix,
+            files: HostFiles {
+                pidfile: &rp.pidfile,
+                qmp: &rp.qmp,
+                guest_sock: &rp.guest_sock,
+                console_log: &op.console_log,
+                disk: &op.disk,
+            },
+            direct_io: self.direct_io,
+            log: &op.qemu_log,
             record_path: &rp.launch,
-            record,
             cgroup: self.cgroup_dir(orb),
             netns: self.read_recipe(orb)?.net.netns_path(),
         })
         .map_err(|e| RuntimeError::Other(format!("launching QEMU: {e}")))?;
         log(ctx, &format!("QEMU started (pid {})", proc.pid));
         let expected = launch_name(orb, &record);
-        let ready_by = Instant::now() + Duration::from_secs(30);
-        loop {
-            if !proc.is_alive() {
-                return Err(RuntimeError::Other(format!(
-                    "QEMU exited during start: {}",
-                    log_tail(&op.qemu_log)
-                )));
-            }
-            if let Ok(q) = Qmp::connect(&rp.qmp, Duration::from_secs(1)).await
-                && q.name().await.ok().flatten().as_deref() == Some(expected.as_str())
-            {
-                return Ok(proc);
-            }
-            if Instant::now() >= ready_by {
+        let ready = launch::wait_ready(&proc, &rp.qmp, &expected, Duration::from_secs(30), POLL);
+        match bounded(ctx, ready).await {
+            Ok(Ok(())) => Ok(proc),
+            Ok(Err(launch::ReadyError::Exited)) => Err(RuntimeError::Other(format!(
+                "QEMU exited during start: {}",
+                log_tail(&op.qemu_log)
+            ))),
+            Ok(Err(launch::ReadyError::Timeout)) => {
                 proc.kill_and_wait(Duration::from_secs(5)).await;
-                return Err(RuntimeError::Other(
+                Err(RuntimeError::Other(
                     "QEMU did not open its QMP socket within 30s".into(),
-                ));
+                ))
             }
-            if let Err(e) = bounded(ctx, tokio::time::sleep(POLL)).await {
+            Err(e) => {
                 proc.kill_and_wait(Duration::from_secs(5)).await;
-                return Err(e);
+                Err(e)
             }
         }
     }
@@ -847,61 +753,35 @@ impl QemuRuntime {
         crate::crash_point!("qemu::save::after_stop");
 
         let tmp = self.checkpoints(orb).fresh_tmp(generation)?;
-        // Created private here; QEMU reopens it (O_TRUNC) and writes it in place.
         let memory = tmp.join("memory");
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&memory)
-                .map_err(io_err)?
-        };
-        bounded(ctx, qmp.migrate_to_file(&memory))
-            .await?
-            .map_err(qmp_err)?;
-        crate::crash_point!("qemu::save::after_migrate");
         let mut next_log = 512 * MIB;
-        let info = loop {
-            let info = bounded(ctx, qmp.query_migrate()).await?.map_err(qmp_err)?;
-            match info.status.as_deref() {
-                Some("completed") => break info,
-                Some("failed" | "cancelled") => {
-                    return Err(RuntimeError::CheckpointFailed(format!(
-                        "migration {}: {}",
-                        info.status.unwrap_or_default(),
-                        info.error_desc.unwrap_or_default()
-                    )));
-                }
-                _ => {
-                    inject_write_fault()?;
-                    let done = info.ram.map_or(0, |r| r.transferred);
-                    if done >= next_log {
-                        log(ctx, &format!("checkpoint: {} MiB written", done / MIB));
-                        next_log = (done / (512 * MIB) + 1) * 512 * MIB;
-                    }
-                    bounded(ctx, tokio::time::sleep(POLL)).await?;
-                }
+        let progress = |info: &qmp::MigrationInfo| {
+            inject_write_fault()?;
+            let done = info.ram.as_ref().map_or(0, |r| r.transferred);
+            if done >= next_log {
+                log(ctx, &format!("checkpoint: {} MiB written", done / MIB));
+                next_log = (done / (512 * MIB) + 1) * 512 * MIB;
             }
+            Ok(())
         };
-        let status = bounded(ctx, qmp.status()).await?.map_err(qmp_err)?;
-        if status != "postmigrate" {
-            return Err(RuntimeError::CheckpointFailed(format!(
-                "QEMU is {status} after migration"
-            )));
-        }
-        let fsync = |e: std::io::Error| {
-            RuntimeError::CheckpointFailed(format!("fsync {}: {e}", memory.display()))
-        };
-        let synced = tokio::task::spawn_blocking(move || {
-            file.sync_all()?;
-            file.metadata().map(|m| m.len())
-        });
-        let bytes = bounded(ctx, synced)
+        let saved = bounded(ctx, migration::save_to_file(&qmp, &memory, POLL, progress))
             .await?
-            .map_err(|e| RuntimeError::Other(e.to_string()))?
-            .map_err(fsync)?;
+            .map_err(|e| match e {
+                MigrationError::Qmp(e) => qmp_err(e),
+                MigrationError::Io(e) => io_err(e),
+                MigrationError::Failed { status, desc } => {
+                    RuntimeError::CheckpointFailed(format!("migration {status}: {desc}"))
+                }
+                MigrationError::UnexpectedStatus(status) => {
+                    RuntimeError::CheckpointFailed(format!("QEMU is {status} after migration"))
+                }
+                MigrationError::Fsync(e) => {
+                    RuntimeError::CheckpointFailed(format!("fsync {}: {e}", memory.display()))
+                }
+                MigrationError::Aborted(why) => RuntimeError::CheckpointFailed(why),
+                other => RuntimeError::Other(other.to_string()),
+            })?;
+        let (info, bytes) = (saved.info, saved.bytes);
         let manifest = CheckpointManifest {
             orb,
             generation,
@@ -1082,42 +962,26 @@ impl QemuRuntime {
         &self,
         orb: OrbId,
         memory: &Path,
-        migration: FileMigration,
+        file_migration: FileMigration,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
         let qmp = self.qmp(orb).await?;
-        bounded(ctx, qmp.configure_migration(migration, 0))
-            .await?
-            .map_err(qmp_err)?;
-        bounded(ctx, qmp.migrate_incoming_file(memory))
-            .await?
-            .map_err(qmp_err)?;
-        loop {
-            let info = bounded(ctx, qmp.query_migrate()).await?.map_err(qmp_err)?;
-            match info.status.as_deref() {
-                Some("completed") => break,
-                Some("failed" | "cancelled") => {
-                    return Err(RuntimeError::CheckpointIncompatible(format!(
-                        "QEMU could not load the checkpoint: {} {}",
-                        info.error_desc.unwrap_or_default(),
-                        log_tail(&self.orb_paths(orb).qemu_log)
-                    )));
-                }
-                _ => bounded(ctx, tokio::time::sleep(POLL)).await?,
+        bounded(
+            ctx,
+            migration::load_from_file(&qmp, memory, file_migration, POLL),
+        )
+        .await?
+        .map_err(|e| match e {
+            MigrationError::Failed { desc, .. } => RuntimeError::CheckpointIncompatible(format!(
+                "QEMU could not load the checkpoint: {desc} {}",
+                log_tail(&self.orb_paths(orb).qemu_log)
+            )),
+            MigrationError::UnexpectedStatus(status) => {
+                RuntimeError::Other(format!("QEMU is {status} after loading"))
             }
-        }
-        loop {
-            let status = bounded(ctx, qmp.status()).await?.map_err(qmp_err)?;
-            match status.as_str() {
-                "paused" | "postmigrate" | "prelaunch" => return Ok(()),
-                "inmigrate" => bounded(ctx, tokio::time::sleep(POLL)).await?,
-                other => {
-                    return Err(RuntimeError::Other(format!(
-                        "QEMU is {other} after loading"
-                    )));
-                }
-            }
-        }
+            MigrationError::Qmp(e) => qmp_err(e),
+            other => RuntimeError::Other(other.to_string()),
+        })
     }
 
     // --- stop -------------------------------------------------------------------
@@ -1429,53 +1293,12 @@ impl Runtime for QemuRuntime {
 /// Cancels an outgoing migration that is still running and waits (up to 30 s) until
 /// it stopped.
 async fn cancel_migration(qmp: &Qmp) -> Result<(), RuntimeError> {
-    const ACTIVE: &[&str] = &["setup", "active", "device", "pre-switchover", "cancelling"];
-    let active = || async {
-        let info = qmp.query_migrate().await.map_err(qmp_err)?;
-        Ok::<_, RuntimeError>(ACTIVE.contains(&info.status.unwrap_or_default().as_str()))
-    };
-    if !active().await? {
-        return Ok(());
-    }
-    qmp.migrate_cancel().await.map_err(qmp_err)?;
-    let give_up = Instant::now() + Duration::from_secs(30);
-    while active().await? {
-        if Instant::now() >= give_up {
-            return Err(RuntimeError::Other("the migration does not cancel".into()));
-        }
-        tokio::time::sleep(POLL).await;
-    }
-    Ok(())
-}
-
-/// QEMU's `--version` line must name 9.0 or newer.
-pub(crate) fn check_qemu_version(line: &str) -> Result<(), String> {
-    let v = line
-        .strip_prefix("QEMU emulator version ")
-        .and_then(|r| r.split_whitespace().next())
-        .unwrap_or_default();
-    let mut parts = v.split('.').map(|p| p.parse::<u32>());
-    match (parts.next(), parts.next()) {
-        (Some(Ok(major)), Some(Ok(minor))) if (major, minor) >= MIN_QEMU => Ok(()),
-        (Some(Ok(_)), Some(Ok(_))) => Err(format!(
-            "{line:?} is too old: orbd needs QEMU {}.{} or newer (file migration with mapped-ram)",
-            MIN_QEMU.0, MIN_QEMU.1
-        )),
-        _ => Err(format!("unrecognised QEMU version {line:?}")),
-    }
-}
-
-/// The versioned machine type `q35` stands for in this QEMU (e.g. `pc-q35-11.0`).
-fn q35_machine(qemu: &Path) -> Result<String, String> {
-    let out = std::process::Command::new(qemu)
-        .args(["-machine", "help"])
-        .output()
-        .map_err(|e| format!("{} -machine help: {e}", qemu.display()))?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.split_whitespace().next() == Some("q35"))
-        .find_map(|l| Some(l.split("(alias of ").nth(1)?.split(')').next()?.to_owned()))
-        .ok_or_else(|| format!("{} has no q35 machine", qemu.display()))
+    migration::cancel_outgoing(qmp, POLL)
+        .await
+        .map_err(|e| match e {
+            MigrationError::Qmp(e) => qmp_err(e),
+            other => RuntimeError::Other(other.to_string()),
+        })
 }
 
 /// Bandwidth cap for saves: unlimited unless `qemu::save::throttle=return(<MiB/s>)`.
@@ -1493,30 +1316,15 @@ fn save_bandwidth() -> u64 {
 
 /// `qemu::save::write=return`: the running save fails as QEMU's does when the disk
 /// fills (the caller cancels it, leaving a partial file).
-fn inject_write_fault() -> Result<(), RuntimeError> {
+fn inject_write_fault() -> Result<(), String> {
     #[cfg(feature = "failpoints")]
     if fail::eval("qemu::save::write", |_| ()).is_some() {
-        return Err(RuntimeError::CheckpointFailed(format!(
+        return Err(format!(
             "migration failed: writing the checkpoint: {}",
             std::io::Error::from_raw_os_error(nix::libc::ENOSPC)
-        )));
+        ));
     }
     Ok(())
-}
-
-/// True when files in `dir` can be opened with O_DIRECT (cache=none).
-fn probe_direct_io(dir: &Path) -> bool {
-    use std::os::unix::fs::OpenOptionsExt;
-    let probe = dir.join(".direct-io-probe");
-    let ok = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .custom_flags(nix::libc::O_DIRECT)
-        .open(&probe)
-        .is_ok();
-    let _ = std::fs::remove_file(&probe);
-    ok
 }
 
 fn qmp_err(e: qmp::QmpError) -> RuntimeError {

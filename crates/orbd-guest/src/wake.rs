@@ -27,6 +27,19 @@ const BOOTSTRAP_SETTLE: Duration = Duration::from_secs(5);
 const SYSTEMD_BOOT_WAIT: Duration = Duration::from_secs(90);
 const SYSTEMCTL: Duration = Duration::from_secs(60);
 
+/// orbd's [`Handler`](crate::server::Handler): [`wake`] and [`resync`].
+pub struct Bootstrap;
+
+impl crate::server::Handler for Bootstrap {
+    fn wake(&self, wake: &Wake) -> Result<(), String> {
+        self::wake(wake)
+    }
+
+    fn resync(&self, resync: &Resync) -> Result<(), String> {
+        self::resync(resync)
+    }
+}
+
 pub fn wake(w: &Wake) -> Result<(), String> {
     log!(
         "wake: generation {} ({} boot)",

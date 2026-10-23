@@ -8,23 +8,8 @@
 //!   (default `org.orbd.control`), or on vsock when the kernel command line has
 //!   `orbd.vsock=<port>` (Firecracker).
 
-macro_rules! log {
-    ($($arg:tt)*) => { eprintln!("orbd-guest: {}", format_args!($($arg)*)) };
-}
-
-mod cmd;
-mod files;
-mod init;
-mod net;
-mod server;
-mod transport;
-mod wake;
-
-mod proto {
-    include!(concat!(env!("OUT_DIR"), "/orbd.guest.v1.rs"));
-}
-
-const DEFAULT_PORT: &str = "org.orbd.control";
+use orbd_guest::{DEFAULT_PORT, init, server, transport, wake};
+use std::sync::Arc;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -44,8 +29,11 @@ fn main() {
 fn serve(port: &str) -> ! {
     transport::block_sigio();
     match vsock_port() {
-        Some(p) => server::serve(&transport::Vsock::new(p)),
-        None => server::serve(&transport::VirtioSerial::new(port)),
+        Some(p) => server::serve(&transport::Vsock::new(p), Arc::new(wake::Bootstrap)),
+        None => server::serve(
+            &transport::VirtioSerial::new(port),
+            Arc::new(wake::Bootstrap),
+        ),
     }
 }
 
