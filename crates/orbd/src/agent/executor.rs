@@ -558,7 +558,9 @@ impl Run {
         f
     }
 
-    /// Local admission: the agent's own reservations must never exceed capacity.
+    /// Local admission: running orbs' vCPUs and memory must never exceed capacity, and
+    /// nothing starts on a filesystem below its reserve. The coordinator admits disk by
+    /// headroom; orb disk sizes are sparse and are not summed here.
     fn admit(&self) -> Result<(), Flow> {
         let need = self.orb().spec.template.resources;
         let mut reserved = self.sh.reserved.lock().unwrap_or_else(|e| e.into_inner());
@@ -572,12 +574,21 @@ impl Run {
             });
         let total = used.checked_add(need);
         let cap = self.sh.capacity;
+        let (free, _) = self.sh.disk_stats();
+        let reserve = self.sh.disk_reserve;
         let (code, what) = match total {
-            None => (FailureCode::InsufficientMemory, "resources overflow"),
+            None => (FailureCode::InsufficientMemory, "resources overflow".into()),
             Some(t) if t.memory_bytes > cap.memory_bytes || t.vcpus > cap.vcpus => {
-                (FailureCode::InsufficientMemory, "memory/cpu")
+                (FailureCode::InsufficientMemory, "memory/cpu".into())
             }
-            Some(t) if t.disk_bytes > cap.disk_bytes => (FailureCode::InsufficientDisk, "disk"),
+            Some(_) if free < reserve => (
+                FailureCode::InsufficientDisk,
+                format!(
+                    "disk: {} MiB free, below the {} MiB reserve",
+                    free / crate::model::MIB,
+                    reserve / crate::model::MIB
+                ),
+            ),
             Some(_) => {
                 reserved.insert(self.orb().id, need);
                 return Ok(());

@@ -105,7 +105,27 @@ The coordinator creates its CA and keys in its volume on first start; keep that 
 Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
 `ORBD_CAPACITY_MEMORY_MIB`, `ORBD_CAPACITY_DISK_GIB`); orbs use DNS `1.1.1.1` and `9.9.9.9`
 (`ORBD_DNS`). `orbd agent list` and `orbd agent remove <id>` manage agents; a removed
-agent's orbs stay on it, unavailable.
+agent's orbs stay on it, unavailable. `orbd agent list` shows each agent's orbs, its
+reservations against its capacity, and its disk: free, allocated by orbd, reserved and
+limit (also exported as `orbd_agent_disk_*_bytes` and `orbd_reserved_disk_bytes`).
+
+Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An offering's
+`disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
+admitted by what the host actually has: a new or waking orb needs free space for its
+headroom (up to `running_orb_disk_headroom_gib`, default 10, of growth plus its memory
+checkpoint) after the headroom of the orbs already running and the agent's reserve
+(`ORBD_DISK_RESERVE_GIB`, default max(10 GiB, 5% of the filesystem)) are set aside.
+`ORBD_CAPACITY_DISK_GIB` optionally limits what orbd allocates on the host (default: the
+whole filesystem). A refusal names each host's limiting resource with its numbers.
+
+Amp pauses an orb when its thread goes idle or is archived and deletes it when it is no
+longer needed, e.g. when the thread is deleted; archiving sends no delete, so orbs of
+archived threads would stay asleep on disk forever. The
+coordinator deletes orbs that have been asleep for `idle_orb_ttl_days` (default 30; 0
+never deletes) through the ordinary delete path. **A deleted orb is gone:** if its thread
+is used again, its next spawn starts a fresh orb from the image (or project snapshot),
+without its files, uncommitted work or processes, and Amp runs setup again. Set the TTL
+longer than any thread you might come back to.
 
 Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
 `/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores

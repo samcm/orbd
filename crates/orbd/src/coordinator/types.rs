@@ -177,7 +177,7 @@ pub fn failure_text(code: FailureCode, message: &str) -> String {
     let msg: String = message
         .chars()
         .filter(|c| !c.is_control())
-        .take(200)
+        .take(1000)
         .collect();
     format!("{code:?}: {msg}")
 }

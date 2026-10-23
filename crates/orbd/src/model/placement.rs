@@ -35,6 +35,26 @@ impl Location {
     }
 }
 
+/// One host's orb filesystem as its agent last reported it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskReport {
+    /// Bytes available on the filesystem holding the agent's state directory.
+    pub free_bytes: u64,
+    /// Size of that filesystem; 0 when the agent does not report it.
+    pub total_bytes: u64,
+    /// Bytes orbd has allocated under the state directory (sparse files count only
+    /// their allocated blocks).
+    pub allocated_bytes: u64,
+    /// Free space admission never hands out.
+    pub reserve_bytes: u64,
+}
+
+/// The default disk reserve of a host: max(10 GiB, 5% of the filesystem). Admission
+/// never hands out a host's reserve; below it every new or waking orb is refused.
+pub fn disk_reserve(total_bytes: u64) -> u64 {
+    (10 * super::GIB).max(total_bytes / 20)
+}
+
 /// Executor-owned binding of an external allocation to the provider's resource id.
 /// An unknown binding after a lost create response requires reconciliation; it is never
 /// permission to allocate again.

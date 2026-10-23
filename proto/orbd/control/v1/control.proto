@@ -392,7 +392,10 @@ message Hello {
   string boot_id = 2;               // changes every agent process start
   repeated uint32 protocol_versions = 3;
   repeated RuntimeInfo runtimes = 4;
-  Resources capacity = 5;           // configured ceiling for orbs on this host
+  // Ceiling for orbs on this host. vCPUs and memory bound running orbs; disk_bytes bounds
+  // what orbd may actually allocate under the agent's state directory (not the sum of
+  // orb disk sizes, which are sparse).
+  Resources capacity = 5;
   uint64 last_controller_epoch = 6; // highest epoch this agent has accepted
   repeated string project_snapshot_keys = 7; // project snapshots published on this host
 }
@@ -400,11 +403,20 @@ message Hello {
 message Heartbeat {
   Resources capacity = 1;
   Resources reserved = 2;           // agent-local reservations (running/starting orbs)
+  // Filesystem holding the agent's state directory: bytes available to the agent.
   uint64 disk_free_bytes = 3;
   uint32 memory_pressure_permille = 4;
   // The agent is shutting down: it accepts no new commands and is checkpointing its
   // running orbs, which it restores when it starts again.
   bool draining = 5;
+  // Size of that filesystem (0 = not reported).
+  uint64 disk_total_bytes = 6;
+  // Bytes allocated under the state directory (orb disks, checkpoints, images, project
+  // snapshots; sparse files count only their allocated blocks). Measured periodically.
+  uint64 disk_allocated_bytes = 7;
+  // Free space the agent keeps: orbs are refused once free space would drop below it.
+  // With disk_total_bytes 0 (an older agent), the coordinator assumes 10 GiB.
+  uint64 disk_reserve_bytes = 8;
 }
 
 message CommandAccepted {
@@ -567,6 +579,19 @@ message AgentInfo {
   bool connected = 3;
   uint64 enrolled_unix_ms = 4;
   uint64 certificate_expires_unix_ms = 5;
+  // From the agent's Hello and latest heartbeat; disk_reported is false until the
+  // first heartbeat.
+  Resources capacity = 6;
+  bool disk_reported = 7;
+  uint64 disk_free_bytes = 8;
+  uint64 disk_total_bytes = 9;
+  uint64 disk_allocated_bytes = 10;
+  // Coordinator reservations on the agent: running orbs hold vCPUs, memory and disk
+  // headroom; sleeping orbs hold nothing.
+  Resources reserved = 11;
+  uint32 orbs = 12;
+  uint32 running_orbs = 13;
+  uint64 disk_reserve_bytes = 14;
 }
 
 message ListAgentsResponse {

@@ -12,12 +12,12 @@ mod core;
 pub(crate) mod db;
 mod logs;
 mod service;
-mod store;
+pub(crate) mod store;
 mod types;
 
 use crate::backend::{BackendHandle, ComputeBackend};
 use crate::config::coordinator::CoordinatorConfig;
-use crate::model::{BackendId, Offering, OfferingId};
+use crate::model::{BackendId, GIB, Offering, OfferingId};
 use crate::secrets::SecretKey;
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
@@ -160,7 +160,26 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
     }
 
     let offerings_arc = Arc::new(offerings.clone());
-    let mut core = core::Core::new(db, key.clone(), epoch, offerings, backends, core_tx.clone());
+    let policy = core::Policy {
+        running_orb_disk_headroom: config.running_orb_disk_headroom_gib.saturating_mul(GIB),
+        idle_orb_ttl: (config.idle_orb_ttl_days > 0).then(|| {
+            std::time::Duration::from_secs(config.idle_orb_ttl_days.saturating_mul(86_400))
+        }),
+    };
+    tracing::info!(
+        running_orb_disk_headroom_gib = config.running_orb_disk_headroom_gib,
+        idle_orb_ttl_days = config.idle_orb_ttl_days,
+        "placement policy"
+    );
+    let mut core = core::Core::new(
+        db,
+        key.clone(),
+        epoch,
+        offerings,
+        backends,
+        core_tx.clone(),
+        policy,
+    );
     core.recover().await.context("recovering commands")?;
 
     let core_task = tokio::spawn(core.run(core_rx, shutdown.clone()));

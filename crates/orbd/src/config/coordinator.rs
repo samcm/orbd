@@ -60,7 +60,25 @@ pub struct CoordinatorConfig {
     /// restarted onto a new version between jobs. The CLI never self-updates.
     #[serde(default = "default_amp_cli_update_interval")]
     pub amp_cli_update_interval_secs: u64,
+    /// Disk held free on its host for each running orb to grow into (capped at the
+    /// orb's disk size), on top of its next memory checkpoint. Sleeping orbs hold none.
+    #[serde(default = "default_running_orb_disk_headroom_gib")]
+    pub running_orb_disk_headroom_gib: u64,
+    /// Orbs asleep longer than this many days are deleted (0 never deletes). Amp sends
+    /// no delete when a thread is archived, only a pause, so this is what frees the
+    /// disks of abandoned orbs. An orb woken after it was deleted starts fresh from the
+    /// image: its files and processes are gone and Amp runs setup again.
+    #[serde(default = "default_idle_orb_ttl_days")]
+    pub idle_orb_ttl_days: u64,
     pub offerings: Vec<OfferingConfig>,
+}
+
+fn default_running_orb_disk_headroom_gib() -> u64 {
+    10
+}
+
+fn default_idle_orb_ttl_days() -> u64 {
+    30
 }
 
 fn default_listen() -> SocketAddr {

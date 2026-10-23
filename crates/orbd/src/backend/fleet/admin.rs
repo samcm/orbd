@@ -1,7 +1,8 @@
 //! `orbd.control.v1.Admin` (local unix socket): join tokens and the agent registry.
 
 use super::{Inner, registry};
-use crate::model::{AgentId, unix_ms_now};
+use crate::coordinator::store::{self, PoolUse};
+use crate::model::{AgentId, GIB, unix_ms_now};
 use crate::pki::{self, JoinToken};
 use orbd_proto::control::v1 as pb;
 use orbd_proto::control::v1::admin_server::Admin;
@@ -55,16 +56,39 @@ impl Admin for AdminService {
         &self,
         _: Request<pb::ListAgentsRequest>,
     ) -> Result<Response<pb::ListAgentsResponse>, Status> {
+        let backend = self.0.id.to_string();
+        let pools: std::collections::HashMap<String, PoolUse> = self
+            .0
+            .db
+            .call(move |c| store::pools(c, &backend))
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .collect();
         let st = self.0.lock();
         let agents = st
             .agents
             .iter()
-            .map(|(id, s)| pb::AgentInfo {
-                agent_id: id.to_string(),
-                removed: s.removed,
-                connected: s.session.is_some(),
-                enrolled_unix_ms: s.enrolled_ms,
-                certificate_expires_unix_ms: s.cert_not_after_ms,
+            .map(|(id, s)| {
+                let used = pools.get(id.as_str()).copied().unwrap_or_default();
+                let disk = s.heartbeat.as_ref().map(|(hb, _)| super::disk_report(hb));
+                let d = disk.unwrap_or_default();
+                pb::AgentInfo {
+                    agent_id: id.to_string(),
+                    removed: s.removed,
+                    connected: s.session.is_some(),
+                    enrolled_unix_ms: s.enrolled_ms,
+                    certificate_expires_unix_ms: s.cert_not_after_ms,
+                    capacity: s.hello.as_ref().and_then(|h| h.capacity),
+                    disk_reported: disk.is_some(),
+                    disk_free_bytes: d.free_bytes,
+                    disk_total_bytes: d.total_bytes,
+                    disk_allocated_bytes: d.allocated_bytes,
+                    disk_reserve_bytes: d.reserve_bytes,
+                    reserved: Some(used.held.into()),
+                    orbs: used.orbs,
+                    running_orbs: used.running,
+                }
             })
             .collect();
         Ok(Response::new(pb::ListAgentsResponse { agents }))
@@ -122,7 +146,11 @@ pub async fn cli_join_token(
     Ok(r.into_inner().token)
 }
 
-/// One line per agent: id, state, certificate expiry.
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// One line per agent: id, state, orbs, reserved/capacity, disk, certificate expiry.
 pub async fn cli_list(socket: &std::path::Path) -> anyhow::Result<String> {
     let r = client(socket)
         .await?
@@ -138,9 +166,35 @@ pub async fn cli_list(socket: &std::path::Path) -> anyhow::Result<String> {
             (false, false) => "disconnected",
         };
         let days = a.certificate_expires_unix_ms.saturating_sub(now) / 86_400_000;
+        let cap = a.capacity.unwrap_or_default();
+        let held = a.reserved.unwrap_or_default();
+        let disk = if a.disk_reported {
+            let of = if a.disk_total_bytes > 0 {
+                format!(" of {}", gib(a.disk_total_bytes))
+            } else {
+                String::new()
+            };
+            format!(
+                "disk {} free{of} ({} kept free), {} allocated, {} reserved, limit {}",
+                gib(a.disk_free_bytes),
+                gib(a.disk_reserve_bytes),
+                gib(a.disk_allocated_bytes),
+                gib(held.disk_bytes),
+                gib(cap.disk_bytes)
+            )
+        } else {
+            "disk not reported".into()
+        };
         out.push_str(&format!(
-            "{}\t{state}\tcertificate expires in {days}d\n",
-            a.agent_id
+            "{}\t{state}\t{} orbs ({} running)\tvCPUs {}/{}\tmemory {}/{}\t{disk}\t\
+             certificate expires in {days}d\n",
+            a.agent_id,
+            a.orbs,
+            a.running_orbs,
+            held.vcpus,
+            cap.vcpus,
+            gib(held.memory_bytes),
+            gib(cap.memory_bytes),
         ));
     }
     Ok(out)

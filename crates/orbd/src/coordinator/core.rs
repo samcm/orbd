@@ -69,7 +69,19 @@ pub struct Core {
     last_submit: HashMap<OperationId, Instant>,
     last_cancel: HashMap<OperationId, Instant>,
     last_reconcile: HashMap<OperationId, Instant>,
+    /// Orbs an idle reclaim was attempted for, and when (retried at most hourly).
+    last_reclaim: HashMap<OrbId, Instant>,
+    policy: Policy,
     ticks: u64,
+}
+
+/// Placement and lifecycle policy from the coordinator config.
+#[derive(Clone, Copy, Debug)]
+pub struct Policy {
+    /// Disk each running orb may still grow by, held free on its host.
+    pub running_orb_disk_headroom: u64,
+    /// Orbs asleep longer than this are deleted. None disables.
+    pub idle_orb_ttl: Option<Duration>,
 }
 
 enum Step {
@@ -100,6 +112,7 @@ impl Core {
         offerings: HashMap<OfferingId, Offering>,
         backends: HashMap<BackendId, Arc<dyn ComputeBackend>>,
         self_tx: mpsc::Sender<Msg>,
+        policy: Policy,
     ) -> Self {
         Self {
             db,
@@ -113,6 +126,8 @@ impl Core {
             last_submit: HashMap::new(),
             last_cancel: HashMap::new(),
             last_reconcile: HashMap::new(),
+            last_reclaim: HashMap::new(),
+            policy,
             ticks: 0,
         }
     }
@@ -604,7 +619,7 @@ impl Core {
         &self,
         cand: &PlacementCandidate,
         exclude: Option<OrbId>,
-    ) -> Result<Resources> {
+    ) -> Result<store::PoolUse> {
         let (b, p) = (
             cand.location.backend_id().to_string(),
             cand.capacity_pool.clone(),
@@ -612,6 +627,24 @@ impl Core {
         self.db
             .call(move |c| store::pool_used(c, &b, &p, exclude))
             .await
+    }
+
+    /// What a running orb of `spec` reserves on its host. Disk is headroom, not the disk
+    /// size: room to grow (at most to its size) plus, for memory-preserving sleep, its
+    /// next memory checkpoint. What it has already written is in the host's free space.
+    fn demand(&self, spec: &SpecTemplate) -> Resources {
+        let r = spec.resources;
+        let checkpoint = match spec.pause_policy {
+            PausePolicy::MemoryPreserving { .. } => r.memory_bytes,
+            PausePolicy::DiskOnly => 0,
+        };
+        Resources {
+            disk_bytes: r
+                .disk_bytes
+                .min(self.policy.running_orb_disk_headroom)
+                .saturating_add(checkpoint),
+            ..r
+        }
     }
 
     /// Admission: choose/verify the location and build the atomic creation plan.
@@ -686,14 +719,28 @@ impl Core {
                     )));
                 };
                 if matches!(head.action, ReqAction::Spawn { .. }) {
-                    let used = self.pool_used(&cand, Some(orb.id)).await?;
-                    if let Some(code) = shortfall(cand.demand, cand.capacity_ceiling, used) {
-                        return Ok(Err(refuse(code, "the orb's host lacks capacity to run it")));
+                    let demand = self.demand(template);
+                    // A running orb already holds its reservation; re-spawning it (a
+                    // bootstrap retry) needs nothing new.
+                    let running =
+                        matches!(orb.observation.state.last_known(), StableOrbState::Running);
+                    if !running {
+                        let used = self.pool_used(&cand, Some(orb.id)).await?;
+                        let short = shortfalls(&cand, &used, demand);
+                        if let Some(first) = short.first() {
+                            return Ok(Err(refuse(
+                                first.0,
+                                format!(
+                                    "the orb's host lacks capacity to run it: {}",
+                                    describe(&short)
+                                ),
+                            )));
+                        }
                     }
                     plan.reservation = Some((
                         cand.location.backend_id().to_string(),
                         cand.capacity_pool.clone(),
-                        cand.demand,
+                        demand,
                     ));
                 }
                 plan.orb_id = orb.id;
@@ -750,27 +797,37 @@ impl Core {
                         "no available host can run this offering",
                     )));
                 }
+                let demand = self.demand(&offering.spec);
                 let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();
-                let mut first_shortfall = None;
+                let mut refusals: Vec<(String, Vec<(FailureCode, String)>)> = Vec::new();
                 for cand in available {
                     let used = self.pool_used(&cand, None).await?;
-                    match shortfall(cand.demand, cand.capacity_ceiling, used) {
-                        None => {
-                            let free = cand
-                                .capacity_ceiling
-                                .memory_bytes
-                                .saturating_sub(used.memory_bytes);
-                            fitting.push((cand, free));
-                        }
-                        Some(code) => {
-                            first_shortfall.get_or_insert(code);
-                        }
+                    let short = shortfalls(&cand, &used, demand);
+                    if short.is_empty() {
+                        let free = cand
+                            .capacity_ceiling
+                            .memory_bytes
+                            .saturating_sub(used.held.memory_bytes);
+                        fitting.push((cand, free));
+                    } else {
+                        refusals.push((cand.capacity_pool.clone(), short));
                     }
                 }
                 if fitting.is_empty() {
+                    let hosts: Vec<String> = refusals
+                        .iter()
+                        .map(|(pool, short)| format!("{pool}: {}", describe(short)))
+                        .collect();
                     return Ok(Err(refuse(
-                        first_shortfall.unwrap_or(FailureCode::InsufficientMemory),
-                        "no host has capacity for this orb",
+                        limiting(&refusals),
+                        format!(
+                            "no host has capacity for this orb ({} vCPUs, {} memory, {} disk \
+                             headroom); {}",
+                            demand.vcpus,
+                            gib(demand.memory_bytes),
+                            gib(demand.disk_bytes),
+                            hosts.join("; ")
+                        ),
                     )));
                 }
                 // Prefer a host holding the project snapshot (v1: snapshots are
@@ -824,7 +881,7 @@ impl Core {
                 plan.reservation = Some((
                     chosen.location.backend_id().to_string(),
                     chosen.capacity_pool.clone(),
-                    chosen.demand,
+                    demand,
                 ));
                 plan.command_digest = command_digest(&plan, &spec_digest);
                 match self.seal_for(head, op).await? {
@@ -1360,6 +1417,9 @@ impl Core {
             let cutoff = now.saturating_sub(3_600_000);
             self.db.call(move |c| store::gc(c, cutoff)).await?;
         }
+        if self.ticks.is_multiple_of(60) {
+            self.reclaim_idle(now).await?;
+        }
         let (queued, active, pools) = self
             .db
             .call(|c| {
@@ -1369,16 +1429,78 @@ impl Core {
                         c,
                         "SELECT COUNT(*) FROM commands WHERE status <> 'terminal'",
                     )?,
-                    store::pool_memory_gauges(c)?,
+                    store::pool_gauges(c)?,
                 ))
             })
             .await?;
         metrics::gauge!("orbd_queue_depth").set(queued as f64);
         metrics::gauge!("orbd_active_commands").set(active as f64);
-        for (pool, mem) in pools {
-            metrics::gauge!("orbd_reserved_memory_bytes", "pool" => pool).set(mem as f64);
+        for (pool, u) in pools {
+            metrics::gauge!("orbd_reserved_memory_bytes", "pool" => pool.clone())
+                .set(u.held.memory_bytes as f64);
+            metrics::gauge!("orbd_reserved_disk_bytes", "pool" => pool.clone())
+                .set(u.held.disk_bytes as f64);
+            metrics::gauge!("orbd_orbs", "pool" => pool.clone()).set(u.orbs as f64);
+            metrics::gauge!("orbd_running_orbs", "pool" => pool).set(u.running as f64);
         }
         self.subs.retain(|_, tx| !tx.is_closed());
+        Ok(())
+    }
+
+    /// Deletes orbs asleep longer than the idle TTL through the ordinary delete path (a
+    /// queued Delete request, as if Amp had sent it). Amp sends no delete when a thread
+    /// is archived, only a pause, so without this abandoned orbs keep their disks
+    /// forever. A later spawn of the same orb creates a fresh one.
+    async fn reclaim_idle(&mut self, now: u64) -> Result<()> {
+        let Some(ttl) = self.policy.idle_orb_ttl else {
+            return Ok(());
+        };
+        let cutoff = now.saturating_sub(ttl.as_millis() as u64);
+        self.last_reclaim
+            .retain(|_, t| t.elapsed() < Duration::from_secs(3600));
+        let idle = self.db.call(move |c| store::idle_orbs(c, cutoff)).await?;
+        for orb in idle {
+            if self.last_reclaim.contains_key(&orb.id)
+                || !self.offerings.contains_key(&orb.offering_id)
+            {
+                continue;
+            }
+            self.last_reclaim.insert(orb.id, Instant::now());
+            let asleep_days = now.saturating_sub(orb.observation.observed_at_unix_ms) / 86_400_000;
+            tracing::info!(
+                orb = %orb.id,
+                amp_orb_id = %orb.identity.amp_orb_id,
+                location = ?orb.location,
+                asleep_days,
+                ttl_days = ttl.as_secs() / 86_400,
+                "deleting orb asleep past the idle TTL"
+            );
+            metrics::counter!("orbd_idle_orbs_reclaimed_total").increment(1);
+            let req = Req {
+                invocation_id: InvocationId::generate(),
+                offering_id: orb.offering_id.clone(),
+                amp_endpoint: orb.identity.amp_endpoint.clone(),
+                amp_orb_id: orb.identity.amp_orb_id.clone(),
+                action: ReqAction::Delete,
+                fingerprint: None,
+                seq: 0,
+                start_ms: now,
+                work_deadline_ms: now + WORK_BUDGET_MS,
+                cleanup_deadline_ms: now + CLEANUP_BUDGET_MS,
+                dispatch_deadline_ms: now + DISPATCH_BUDGET_MS,
+                status: ReqStatus::Queued,
+                operation_id: None,
+                result: None,
+            };
+            self.db
+                .call(move |c| store::insert_request(c, &req, None))
+                .await?;
+            self.evaluate(
+                orb.identity.amp_endpoint.as_str(),
+                orb.identity.amp_orb_id.as_str(),
+            )
+            .await;
+        }
         Ok(())
     }
 }
@@ -1387,18 +1509,127 @@ fn js<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("serializable")
 }
 
-/// Which dimension of `demand` exceeds what remains of `ceiling` after `used`.
-fn shortfall(demand: Resources, ceiling: Resources, used: Resources) -> Option<FailureCode> {
-    let free = ceiling.saturating_sub(used);
-    if demand.memory_bytes > free.memory_bytes {
-        Some(FailureCode::InsufficientMemory)
-    } else if demand.disk_bytes > free.disk_bytes {
-        Some(FailureCode::InsufficientDisk)
-    } else if demand.vcpus > free.vcpus {
-        Some(FailureCode::QuotaExceeded)
-    } else {
-        None
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// Every resource `cand` lacks for `demand` after the reservations in `used`, with the
+/// numbers. Disk is judged by what the host reports, not by orb disk sizes (sparse): the
+/// filesystem's free space less its reserve, and the agent's disk limit less what orbd
+/// has allocated, must each still hold the headroom of every running orb plus this one.
+fn shortfalls(
+    cand: &PlacementCandidate,
+    used: &store::PoolUse,
+    demand: Resources,
+) -> Vec<(FailureCode, String)> {
+    let cap = cand.capacity_ceiling;
+    let held = used.held;
+    let running = used.running;
+    let mut out = Vec::new();
+    let free_mem = cap.memory_bytes.saturating_sub(held.memory_bytes);
+    if demand.memory_bytes > free_mem {
+        out.push((
+            FailureCode::InsufficientMemory,
+            format!(
+                "memory: needs {}, {} free of {} (running orbs: {running})",
+                gib(demand.memory_bytes),
+                gib(free_mem),
+                gib(cap.memory_bytes)
+            ),
+        ));
     }
+    let free_cpu = cap.vcpus.saturating_sub(held.vcpus);
+    if demand.vcpus > free_cpu {
+        out.push((
+            FailureCode::QuotaExceeded,
+            format!(
+                "vCPUs: needs {}, {free_cpu} free of {} (running orbs: {running})",
+                demand.vcpus, cap.vcpus
+            ),
+        ));
+    }
+    match cand.disk {
+        None => out.push((
+            FailureCode::BackendUnavailable,
+            "disk: the agent has not reported its disk yet".into(),
+        )),
+        Some(d) => {
+            let reserve = d.reserve_bytes;
+            let fs_room = d
+                .free_bytes
+                .saturating_sub(reserve)
+                .saturating_sub(held.disk_bytes);
+            let cap_room = cap
+                .disk_bytes
+                .saturating_sub(d.allocated_bytes)
+                .saturating_sub(held.disk_bytes);
+            if demand.disk_bytes > fs_room.min(cap_room) {
+                let detail = if fs_room <= cap_room {
+                    let of = if d.total_bytes > 0 {
+                        format!(" of {}", gib(d.total_bytes))
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "disk: needs {} headroom, {} usable (filesystem {} free{of}, {} \
+                         reserve, {} held by {running} running)",
+                        gib(demand.disk_bytes),
+                        gib(fs_room),
+                        gib(d.free_bytes),
+                        gib(reserve),
+                        gib(held.disk_bytes)
+                    )
+                } else {
+                    format!(
+                        "disk: needs {} headroom, {} usable (agent disk limit {}, {} \
+                         allocated, {} held by {running} running)",
+                        gib(demand.disk_bytes),
+                        gib(cap_room),
+                        gib(cap.disk_bytes),
+                        gib(d.allocated_bytes),
+                        gib(held.disk_bytes)
+                    )
+                };
+                out.push((FailureCode::InsufficientDisk, detail));
+            }
+        }
+    }
+    out
+}
+
+fn describe(short: &[(FailureCode, String)]) -> String {
+    short
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The refusal code when no host fits: the resource most hosts lack (memory before
+/// disk before vCPUs on a tie). Hosts that only lack a disk report are unavailable,
+/// not full.
+fn limiting(refusals: &[(String, Vec<(FailureCode, String)>)]) -> FailureCode {
+    const ORDER: [FailureCode; 3] = [
+        FailureCode::InsufficientMemory,
+        FailureCode::InsufficientDisk,
+        FailureCode::QuotaExceeded,
+    ];
+    let count = |code: FailureCode| {
+        refusals
+            .iter()
+            .filter(|(_, s)| s.iter().any(|(c, _)| *c == code))
+            .count()
+    };
+    ORDER
+        .into_iter()
+        .filter(|c| count(*c) > 0)
+        .max_by_key(|c| {
+            (
+                count(*c),
+                std::cmp::Reverse(ORDER.iter().position(|o| o == c)),
+            )
+        })
+        .unwrap_or(FailureCode::BackendUnavailable)
 }
 
 /// Digest over the immutable command contents, including the identity (keyed

@@ -151,3 +151,97 @@ fn placement_is_fixed_and_admission_is_exact() {
     assert!(x.running);
     assert_eq!((x.counters.disk_creates, x.counters.restores), (1, 1));
 }
+
+/// Disk is admitted by what hosts actually use, not by summing orb disk sizes: sleeping
+/// orbs hold no disk headroom, so a host whose orbs' disk sizes add up far past its
+/// disk limit still takes new orbs (the failure that blocked every spawn while 1.4 TB
+/// was free). Running orbs do hold headroom, so the limit still binds.
+#[test]
+fn sleeping_orbs_do_not_block_new_orbs_on_disk() {
+    let mut c = Cluster::new(&["agent-a"], 8);
+    // Each running orb holds 3 GiB (1 GiB growth + its 2 GiB memory checkpoint); each
+    // orb's disk is 4 GiB.
+    c.agent_env
+        .push(("ORBD_CAPACITY_DISK_GIB".into(), "8".into()));
+    c.start_all();
+
+    for i in 0..5 {
+        let orb = format!("amp-asleep-{i}");
+        assert_ok(&c.dispatch("spawn", &orb, &[]), "spawn");
+        assert_ok(&c.dispatch("pause", &orb, &[]), "pause");
+    }
+    // 20 GiB of disk sizes against an 8 GiB limit, all asleep.
+    assert_ok(
+        &c.dispatch("spawn", "amp-1", &[]),
+        "spawn beside sleeping orbs",
+    );
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "second running orb");
+    let full = c.dispatch("spawn", "amp-3", &[]);
+    assert_eq!(
+        full.code, 1,
+        "third running orb must be refused: {}",
+        full.stderr
+    );
+    assert!(
+        full.stderr.contains("InsufficientDisk")
+            && full
+                .stderr
+                .contains("agent-a: disk: needs 3.0 GiB headroom")
+            && full.stderr.contains("agent disk limit 8.0 GiB")
+            && full.stderr.contains("6.0 GiB held by 2 running)"),
+        "{}",
+        full.stderr
+    );
+
+    let list = c.admin(&["agent", "list"]);
+    assert_ok(&list, "agent list");
+    assert!(
+        list.stdout.contains("7 orbs (2 running)")
+            && list.stdout.contains("6.0 GiB reserved, limit 8.0 GiB"),
+        "{}",
+        list.stdout
+    );
+
+    // Waking a sleeping orb needs the same headroom: refused while two run, admitted
+    // once one sleeps.
+    let wake = c.dispatch("spawn", "amp-asleep-0", &[]);
+    assert_eq!(wake.code, 1, "{}", wake.stderr);
+    assert!(wake.stderr.contains("InsufficientDisk"), "{}", wake.stderr);
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-asleep-0", &[]), "wake");
+}
+
+/// A host whose filesystem is nearly full refuses new orbs with InsufficientDisk and
+/// the numbers, whatever its orbs' sizes: free space below the reserve (default
+/// max(10 GiB, 5%)) is never handed out.
+#[test]
+fn nearly_full_filesystem_refuses_new_orbs() {
+    let mut c = Cluster::with_runtime(
+        &["agent-a"],
+        8,
+        "fake",
+        "runtime:\n  fake:\n    memory_preserving_sleep: true\n    \
+         disk: { free_gib: 52, total_gib: 1000 }\n",
+    );
+    c.start_all();
+
+    let full = c.dispatch("spawn", "amp-1", &[]);
+    assert_eq!(full.code, 1, "spawn must be refused: {}", full.stderr);
+    assert!(
+        full.stderr.contains("InsufficientDisk")
+            && full.stderr.contains(
+                "agent-a: disk: needs 3.0 GiB headroom, 2.0 GiB usable (filesystem 52.0 GiB \
+                 free of 1000.0 GiB, 50.0 GiB reserve"
+            ),
+        "{}",
+        full.stderr
+    );
+    assert!(c.fake_orbs("agent-a").is_empty(), "nothing was created");
+    let list = c.admin(&["agent", "list"]);
+    assert!(
+        list.stdout
+            .contains("disk 52.0 GiB free of 1000.0 GiB (50.0 GiB kept free)"),
+        "{}",
+        list.stdout
+    );
+}

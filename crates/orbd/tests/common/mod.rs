@@ -39,6 +39,8 @@ pub struct Cluster {
     tokens: BTreeMap<String, String>,
     agent_orbs: u64,
     offering: String,
+    /// Extra agent environment, applied last (e.g. `ORBD_CAPACITY_DISK_GIB`).
+    pub agent_env: Vec<(String, String)>,
 }
 
 pub struct Job {
@@ -55,7 +57,9 @@ impl Cluster {
             agent_ids,
             agent_orbs,
             "fake",
-            "runtime:\n  fake:\n    memory_preserving_sleep: true\n",
+            // A roomy simulated filesystem, so tests do not depend on the host's.
+            "runtime:\n  fake:\n    memory_preserving_sleep: true\n    \
+             disk: { free_gib: 1000, total_gib: 2000 }\n",
         )
     }
 
@@ -84,6 +88,7 @@ listen: 127.0.0.1:{control_port}
 state_dir: {root}/coordinator
 metrics_listen: 127.0.0.1:{metrics_port}
 heartbeat_interval_ms: 300
+running_orb_disk_headroom_gib: 1
 offerings:
   - id: {offering}
     runtime: {runtime}
@@ -103,6 +108,12 @@ offerings:
             tokens: BTreeMap::new(),
             agent_orbs,
             offering,
+            // Real runtimes use the host's disk: keep little of it in reserve.
+            agent_env: if runtime == "fake" {
+                vec![]
+            } else {
+                vec![("ORBD_DISK_RESERVE_GIB".into(), "1".into())]
+            },
         }
     }
 
@@ -194,9 +205,9 @@ offerings:
             .env("ORBD_JOIN", token)
             .env("ORBD_CAPACITY_VCPUS", (2 * n).to_string())
             .env("ORBD_CAPACITY_MEMORY_MIB", (2048 * n).to_string())
-            .env("ORBD_CAPACITY_DISK_GIB", (4 * n).to_string())
             .env("RUST_LOG", "info,orbd=debug")
             .env("FAILPOINTS", failpoints)
+            .envs(self.agent_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);

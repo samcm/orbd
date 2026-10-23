@@ -83,8 +83,11 @@ pub struct PlacementCandidate {
     /// Gross ceiling of the pool. The core subtracts its own reservations; backends must
     /// not report an already-net figure.
     pub capacity_ceiling: Resources,
-    /// Resources one orb of this request reserves in the pool (spec + overhead).
+    /// Resources one orb of this request reserves in the pool (spec + overhead). The
+    /// core replaces the disk figure with its headroom policy.
     pub demand: Resources,
+    /// The location's disk as last reported; None until it reports.
+    pub disk: Option<crate::model::DiskReport>,
     /// True when the location already holds the requested project snapshot.
     pub has_project_snapshot: bool,
 }
