@@ -530,6 +530,7 @@ impl QemuRuntime {
                 machine_id(recipe.orb)
             ),
             net_args: recipe.net.qemu_args(),
+            extra_args: Vec::new(),
         }
         .args();
         Ok(LaunchConfig {
