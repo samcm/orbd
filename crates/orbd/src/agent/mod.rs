@@ -27,12 +27,13 @@ mod maintenance;
 mod session;
 
 use crate::config::agent::AgentConfig;
-use crate::model::{OperationId, OrbId, Resources, RuntimeKind};
+use crate::model::{GIB, OperationId, OrbId, Resources, RuntimeKind};
 use crate::runtime::Runtime;
 use crate::secrets::SecretKey;
 use anyhow::Context;
 use orbd_proto::control::v1 as pb;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -59,6 +60,10 @@ pub(crate) struct Shared {
     /// accepted), running orbs checkpointed.
     pub draining: CancellationToken,
     pub reserved: Mutex<HashMap<OrbId, Resources>>,
+    /// Last measurement of the bytes allocated under the state directory.
+    pub disk_allocated: AtomicU64,
+    /// Free disk to keep (see [`crate::model::disk_reserve`]).
+    pub disk_reserve: u64,
     pub tokens: Mutex<HashMap<OperationId, CancellationToken>>,
     pub actors: Mutex<HashMap<OrbId, mpsc::UnboundedSender<executor::Work>>>,
     pub session: Mutex<Option<SessionHandle>>,
@@ -92,6 +97,11 @@ impl Shared {
             })
     }
 
+    /// Free and total bytes of the filesystem holding the state directory.
+    pub(crate) fn disk_stats(&self) -> (u64, u64) {
+        disk_stats(&self.config)
+    }
+
     pub(crate) fn token_for(&self, op: OperationId) -> CancellationToken {
         self.tokens
             .lock()
@@ -100,6 +110,60 @@ impl Shared {
             .or_default()
             .clone()
     }
+}
+
+/// Free and total bytes of the filesystem holding the state directory (0, 0 if it
+/// cannot be read).
+pub(crate) fn disk_stats(config: &AgentConfig) -> (u64, u64) {
+    if let Some(d) = config.runtime.fake.as_ref().and_then(|f| f.disk) {
+        return (d.free_gib * GIB, d.total_gib * GIB);
+    }
+    nix::sys::statvfs::statvfs(&config.agent.state_dir)
+        .map(|s| {
+            let frag = s.fragment_size();
+            (s.blocks_available() * frag, s.blocks() * frag)
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Bytes allocated under `dir`: every file's blocks (sparse disks and checkpoints count
+/// only what they hold), each inode once, without crossing into other filesystems.
+fn allocated_bytes(dir: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(root) = std::fs::symlink_metadata(dir) else {
+        return 0;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut total = 0u64;
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            // Does not follow symlinks.
+            let Ok(m) = e.metadata() else { continue };
+            if m.dev() != root.dev() {
+                continue;
+            }
+            if m.is_dir() {
+                stack.push(e.path());
+            } else if m.nlink() <= 1 || seen.insert(m.ino()) {
+                total = total.saturating_add(m.blocks().saturating_mul(512));
+            }
+        }
+    }
+    total
+}
+
+/// Measures [`allocated_bytes`] of the state directory now and then every minute, for
+/// heartbeats.
+async fn measure_disk(sh: &Arc<Shared>) {
+    let dir = sh.config.agent.state_dir.clone();
+    let bytes = tokio::task::spawn_blocking(move || allocated_bytes(&dir))
+        .await
+        .unwrap_or(0);
+    sh.disk_allocated.store(bytes, Ordering::Relaxed);
 }
 
 fn acquire_lock(path: &std::path::Path) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
@@ -136,6 +200,11 @@ pub async fn run(
     };
     detect::runtime(&mut config).await?;
     let capacity = detect::capacity(&config).await?;
+    let disk_reserve = match config.agent.capacity.disk_reserve_gib {
+        Some(g) => g.saturating_mul(GIB),
+        None => crate::model::disk_reserve(disk_stats(&config).1),
+    };
+    tracing::info!(disk_reserve_gib = disk_reserve / GIB, "disk reserve");
 
     let mut runtimes: HashMap<RuntimeKind, Arc<dyn Runtime>> = HashMap::new();
     if let Some(fake) = &config.runtime.fake {
@@ -207,6 +276,8 @@ pub async fn run(
         shutdown: CancellationToken::new(),
         draining: CancellationToken::new(),
         reserved: Mutex::default(),
+        disk_allocated: AtomicU64::new(0),
+        disk_reserve,
         tokens: Mutex::default(),
         actors: Mutex::default(),
         session: Mutex::default(),
@@ -217,6 +288,19 @@ pub async fn run(
 
     // Ready (Hello) only after interrupted work is requeued and drained orbs restored.
     executor::recover(&shared).await?;
+    measure_disk(&shared).await;
+    tokio::spawn({
+        let sh = shared.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = sh.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                }
+                measure_disk(&sh).await;
+            }
+        }
+    });
     tokio::spawn(identity::renew_loop(shared.clone()));
     let session = tokio::spawn({
         let sh = shared.clone();

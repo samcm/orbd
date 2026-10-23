@@ -85,9 +85,12 @@ struct AgentArgs {
     /// Overrides the detected memory ceiling.
     #[arg(long, env = "ORBD_CAPACITY_MEMORY_MIB")]
     capacity_memory_mib: Option<u64>,
-    /// Overrides the detected disk ceiling.
+    /// Limits what orbs may allocate on disk [default: the filesystem's size].
     #[arg(long, env = "ORBD_CAPACITY_DISK_GIB")]
     capacity_disk_gib: Option<u64>,
+    /// Free disk to keep: no orb starts or wakes below it [default: max(10 GiB, 5%)].
+    #[arg(long, env = "ORBD_DISK_RESERVE_GIB")]
+    disk_reserve_gib: Option<u64>,
     /// Prometheus listener, e.g. `127.0.0.1:9465`.
     #[arg(long, env = "ORBD_METRICS_LISTEN")]
     metrics_listen: Option<std::net::SocketAddr>,
@@ -169,6 +172,7 @@ fn main() -> anyhow::Result<()> {
                 vcpus: a.capacity_vcpus,
                 memory_mib: a.capacity_memory_mib,
                 disk_gib: a.capacity_disk_gib,
+                disk_reserve_gib: a.disk_reserve_gib,
             };
             s.metrics_listen = a.metrics_listen;
             config.agent = s;

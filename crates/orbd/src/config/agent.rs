@@ -134,7 +134,12 @@ impl AgentSection {
 pub struct CapacityOverrides {
     pub vcpus: Option<u32>,
     pub memory_mib: Option<u64>,
+    /// Limit on what orbd allocates under the state directory (default: the
+    /// filesystem's size).
     pub disk_gib: Option<u64>,
+    /// Free space to keep on the state directory's filesystem (default: max(10 GiB,
+    /// 5% of it)).
+    pub disk_reserve_gib: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -237,6 +242,16 @@ pub struct FakeRuntimeConfig {
     /// Advertise memory-preserving sleep (to exercise that path).
     #[serde(default)]
     pub memory_preserving_sleep: bool,
+    /// Report this filesystem instead of the state directory's real one, so tests do
+    /// not depend on the host's free space.
+    pub disk: Option<FakeDisk>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeDisk {
+    pub free_gib: u64,
+    pub total_gib: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]

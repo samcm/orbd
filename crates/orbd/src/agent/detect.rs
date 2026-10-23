@@ -159,9 +159,7 @@ pub(crate) async fn capacity(config: &AgentConfig) -> Result<Resources> {
             local_memory()?,
         ),
     };
-    let disk = nix::sys::statvfs::statvfs(&config.agent.state_dir)
-        .map(|s| s.blocks_available() * s.fragment_size())
-        .with_context(|| format!("statvfs {}", config.agent.state_dir.display()))?;
+    let (_, disk) = super::disk_stats(config);
     let c = Resources {
         vcpus: o
             .vcpus
@@ -170,15 +168,14 @@ pub(crate) async fn capacity(config: &AgentConfig) -> Result<Resources> {
             .memory_mib
             .map(|m| m.saturating_mul(MIB))
             .unwrap_or_else(|| memory.saturating_sub((2 * GIB).max(memory / 10))),
-        disk_bytes: o
-            .disk_gib
-            .map(|g| g.saturating_mul(GIB))
-            .unwrap_or_else(|| disk.saturating_sub((10 * GIB).max(disk / 10))),
+        // A limit on what orbd allocates; by default the filesystem's size, so only its
+        // free space (less a reserve, see `disk_reserve`) limits orbs.
+        disk_bytes: o.disk_gib.map(|g| g.saturating_mul(GIB)).unwrap_or(disk),
     };
     if c.vcpus == 0 || c.memory_bytes == 0 || c.disk_bytes == 0 {
         bail!(
-            "no capacity for orbs: {} vCPUs, {} MiB memory, {} GiB disk after reserving 1 CPU, \
-             max(2 GiB, 10%) memory and max(10 GiB, 10%) of {}; set ORBD_CAPACITY_VCPUS, \
+            "no capacity for orbs: {} vCPUs, {} MiB memory, {} GiB disk after reserving 1 CPU \
+             and max(2 GiB, 10%) memory (filesystem of {}); set ORBD_CAPACITY_VCPUS, \
              ORBD_CAPACITY_MEMORY_MIB or ORBD_CAPACITY_DISK_GIB",
             c.vcpus,
             c.memory_bytes / MIB,

@@ -105,8 +105,10 @@ probe() { # RUNTIME TARGET -> open|refused|dropped (last report)
     console "$1" | grep -aoE "^probe $2 [a-z]+" | tail -n 1 | cut -d' ' -f3
 }
 
+# CI runners have little free disk: hold less of it per running orb and in reserve.
 cat >"$work/orbd.yaml" <<EOF
 public_url: https://$coord:7443
+running_orb_disk_headroom_gib: 1
 offerings:
   - id: qemu-1vcpu-2gb
     runtime: qemu
@@ -130,7 +132,7 @@ wait_for 30 "the dispatch socket" docker exec "$coord" test -S /var/lib/orbd/dis
 token=$(docker exec "$coord" orbd join-token agent-1)
 docker run -d --name "$agent" --network "$id" --privileged --stop-timeout 300 \
     -v "$agent:/var/lib/orbd" -v "$work/agent.yaml:/etc/orbd/agent.yaml:ro" \
-    -v "$rootfs:/fixture/rootfs.ext4:ro" -e "ORBD_JOIN=$token" \
+    -v "$rootfs:/fixture/rootfs.ext4:ro" -e "ORBD_JOIN=$token" -e ORBD_DISK_RESERVE_GIB=2 \
     -e ORBD_AGENT_CONFIG=/etc/orbd/agent.yaml "$image" agent >/dev/null
 wait_for 60 "the agent to connect" connected
 agent_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$agent")

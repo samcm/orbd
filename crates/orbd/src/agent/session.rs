@@ -104,15 +104,16 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
 }
 
 pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
-    let free = nix::sys::statvfs::statvfs(&sh.config.agent.state_dir)
-        .map(|s| s.blocks_available() * s.fragment_size())
-        .unwrap_or(0);
+    let (free, total) = sh.disk_stats();
     ev(pb::agent_event::Event::Heartbeat(pb::Heartbeat {
         capacity: Some(sh.capacity.into()),
         reserved: Some(sh.reserved_total().into()),
         disk_free_bytes: free,
         memory_pressure_permille: 0,
         draining: sh.draining.is_cancelled(),
+        disk_total_bytes: total,
+        disk_allocated_bytes: sh.disk_allocated.load(std::sync::atomic::Ordering::Relaxed),
+        disk_reserve_bytes: sh.disk_reserve,
     }))
 }
 

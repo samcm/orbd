@@ -378,6 +378,14 @@ impl Inner {
                             availability: Availability::Draining,
                         });
                     }
+                    let d = disk_report(&hb);
+                    let a = agent.to_string();
+                    metrics::gauge!("orbd_agent_disk_free_bytes", "agent" => a.clone())
+                        .set(d.free_bytes as f64);
+                    metrics::gauge!("orbd_agent_disk_total_bytes", "agent" => a.clone())
+                        .set(d.total_bytes as f64);
+                    metrics::gauge!("orbd_agent_disk_allocated_bytes", "agent" => a)
+                        .set(d.allocated_bytes as f64);
                     slot.heartbeat = Some((hb, Instant::now()));
                 }
             }
@@ -473,6 +481,20 @@ impl Inner {
             }
         }
         Ok(())
+    }
+}
+
+fn disk_report(hb: &pb::Heartbeat) -> crate::model::DiskReport {
+    crate::model::DiskReport {
+        free_bytes: hb.disk_free_bytes,
+        total_bytes: hb.disk_total_bytes,
+        allocated_bytes: hb.disk_allocated_bytes,
+        // An agent that reports no filesystem size predates the reserve.
+        reserve_bytes: if hb.disk_total_bytes == 0 {
+            crate::model::disk_reserve(0)
+        } else {
+            hb.disk_reserve_bytes
+        },
     }
 }
 
@@ -576,6 +598,7 @@ impl ComputeBackend for FleetBackend {
                 capacity_pool: agent.to_string(),
                 capacity_ceiling: ceiling,
                 demand: request.resources,
+                disk: slot.heartbeat.as_ref().map(|(hb, _)| disk_report(hb)),
                 has_project_snapshot: request
                     .project_snapshot
                     .as_ref()

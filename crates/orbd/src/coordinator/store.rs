@@ -188,6 +188,37 @@ pub fn open_commands(c: &Connection) -> Result<Vec<(CmdRow, OrbRecord)>> {
     Ok(out)
 }
 
+/// Orbs asleep (or stopped) since before `cutoff_ms` with no open command, no pending
+/// deletion and no request since the cutoff: what an idle reclaim deletes.
+pub fn idle_orbs(c: &Connection, cutoff_ms: u64) -> Result<Vec<OrbRecord>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ORB_COLS} FROM orbs o WHERE retired_ms IS NULL
+           AND NOT EXISTS (SELECT 1 FROM commands m
+                           WHERE m.orb_id = o.id AND m.status <> 'terminal')
+           AND NOT EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+           AND NOT EXISTS (SELECT 1 FROM requests r
+                           WHERE r.amp_endpoint = o.amp_endpoint
+                             AND r.amp_orb_id = o.amp_orb_id
+                             AND (r.status <> 'finished' OR r.start_ms >= ?1))"
+    ))?;
+    let orbs = st
+        .query_map(params![cutoff_ms as i64], orb_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(orbs
+        .into_iter()
+        .filter(|o| {
+            o.observation.observed_at_unix_ms < cutoff_ms
+                && matches!(
+                    o.observation.state,
+                    OrbState::Known {
+                        state: StableOrbState::Sleeping { .. }
+                            | StableOrbState::DiskOnlyStopped { .. }
+                    }
+                )
+        })
+        .collect())
+}
+
 /// Retires a deleted orb so a new incarnation can take its Amp id.
 pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
     c.execute(
@@ -267,43 +298,70 @@ pub fn count_where(c: &Connection, sql: &str) -> Result<u64> {
     Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
 }
 
-/// Sum of reservations in a pool, optionally excluding one orb (its own current row).
+/// What the reservations of one pool hold.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolUse {
+    /// Summed over running orbs only: sleeping orbs hold no vCPUs or memory, and their
+    /// disk is already allocated (it is in the agent's free space).
+    pub held: Resources,
+    pub running: u32,
+    pub orbs: u32,
+}
+
+/// Rows from before disk headroom: a stopped row may still carry its orb's nominal disk
+/// size, so only running rows count.
+const POOL_USE_SQL: &str = "SELECT
+        COALESCE(SUM(CASE WHEN kind = 'running' THEN vcpus ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN kind = 'running' THEN memory_bytes ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN kind = 'running' THEN disk_bytes ELSE 0 END), 0),
+        COALESCE(SUM(kind = 'running'), 0),
+        COUNT(*)
+     FROM reservations";
+
+fn pool_use_row(r: &Row, off: usize) -> rusqlite::Result<PoolUse> {
+    Ok(PoolUse {
+        held: Resources {
+            vcpus: u(r, off)?.min(u32::MAX as u64) as u32,
+            memory_bytes: u(r, off + 1)?,
+            disk_bytes: u(r, off + 2)?,
+        },
+        running: u(r, off + 3)? as u32,
+        orbs: u(r, off + 4)? as u32,
+    })
+}
+
+/// Reservations in a pool, optionally excluding one orb (its own current row).
 pub fn pool_used(
     c: &Connection,
     backend: &str,
     pool: &str,
     exclude: Option<OrbId>,
-) -> Result<Resources> {
-    let mut st = c.prepare(
-        "SELECT vcpus, memory_bytes, disk_bytes FROM reservations
-         WHERE backend_id = ?1 AND pool = ?2 AND orb_id <> ?3",
-    )?;
+) -> Result<PoolUse> {
     let ex = exclude.map(|o| o.to_string()).unwrap_or_default();
-    let rows = st.query_map(params![backend, pool, ex], |r| {
-        Ok((r.get::<_, i64>(0)? as u32, u(r, 1)?, u(r, 2)?))
-    })?;
-    let mut sum = Resources::default();
-    for r in rows {
-        let (v, m, d) = r?;
-        sum = Resources {
-            vcpus: sum.vcpus.saturating_add(v),
-            memory_bytes: sum.memory_bytes.saturating_add(m),
-            disk_bytes: sum.disk_bytes.saturating_add(d),
-        };
-    }
-    Ok(sum)
+    Ok(c.query_row(
+        &format!("{POOL_USE_SQL} WHERE backend_id = ?1 AND pool = ?2 AND orb_id <> ?3"),
+        params![backend, pool, ex],
+        |r| pool_use_row(r, 0),
+    )?)
 }
 
-pub fn pool_memory_gauges(c: &Connection) -> Result<Vec<(String, u64)>> {
-    let mut st = c.prepare("SELECT backend_id || '/' || pool, memory_bytes FROM reservations")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, u(r, 1)?)))?;
-    let mut map = std::collections::BTreeMap::<String, u64>::new();
-    for r in rows {
-        let (k, m) = r?;
-        let e = map.entry(k).or_default();
-        *e = e.saturating_add(m);
-    }
-    Ok(map.into_iter().collect())
+/// Every pool of `backend` that holds reservations.
+pub fn pools(c: &Connection, backend: &str) -> Result<Vec<(String, PoolUse)>> {
+    let mut st = c.prepare(&format!(
+        "{} WHERE backend_id = ?1 GROUP BY pool",
+        POOL_USE_SQL.replacen("SELECT", "SELECT pool,", 1)
+    ))?;
+    let rows = st.query_map(params![backend], |r| Ok((r.get(0)?, pool_use_row(r, 1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn pool_gauges(c: &Connection) -> Result<Vec<(String, PoolUse)>> {
+    let mut st = c.prepare(&format!(
+        "{} GROUP BY backend_id, pool",
+        POOL_USE_SQL.replacen("SELECT", "SELECT backend_id || '/' || pool,", 1)
+    ))?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, pool_use_row(r, 1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn get_payload(c: &Connection, owner: &str) -> Result<Option<Vec<u8>>> {
@@ -400,7 +458,7 @@ pub struct CreatePlan {
     pub fingerprint: Option<String>,
     pub work_deadline_ms: u64,
     pub cleanup_deadline_ms: u64,
-    /// (backend, pool, resources) to reserve in full ('running').
+    /// (backend, pool, resources) to reserve as 'running' (disk is the orb's headroom).
     pub reservation: Option<(String, String, Resources)>,
     pub tombstone: Option<(String, String)>,
     /// Sealed guest env for the new operation (aad = operation id).
@@ -606,7 +664,8 @@ pub fn apply_completion(
                 state: StableOrbState::Sleeping { .. } | StableOrbState::DiskOnlyStopped { .. },
             } => {
                 tx.execute(
-                    "UPDATE reservations SET vcpus = 0, memory_bytes = 0, kind = 'stopped'
+                    "UPDATE reservations SET vcpus = 0, memory_bytes = 0, disk_bytes = 0,
+                        kind = 'stopped'
                      WHERE orb_id = ?1",
                     params![orb_id],
                 )?;
