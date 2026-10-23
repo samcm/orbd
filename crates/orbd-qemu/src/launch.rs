@@ -38,7 +38,7 @@ pub type LaunchRecord = process::LaunchRecord<LaunchConfig>;
 
 /// The guest-visible machine: a q35 KVM VM with a direct-boot kernel, a serial console,
 /// the guest agent's virtio-serial port, one virtio-blk disk (node `disk0`), the
-/// caller's network devices and a free-page-reporting balloon.
+/// caller's network devices and further arguments, and a free-page-reporting balloon.
 pub struct Machine<'a> {
     /// Versioned machine type ([`q35_machine`](crate::probe::q35_machine)).
     pub machine_type: &'a str,
@@ -50,6 +50,9 @@ pub struct Machine<'a> {
     pub kernel_cmdline: &'a str,
     /// Network device arguments (`-netdev`/`-device`), with fixed ids.
     pub net_args: Vec<String>,
+    /// Further guest-visible arguments, e.g. `-device vmgenid,id=vmgenid0,guid=auto` or
+    /// `-rtc clock=vm`; devices with fixed ids.
+    pub extra_args: Vec<String>,
 }
 
 impl Machine<'_> {
@@ -82,6 +85,7 @@ impl Machine<'_> {
         .map(String::from)
         .into();
         a.extend(self.net_args.iter().cloned());
+        a.extend(self.extra_args.iter().cloned());
         a.extend(
             [
                 "-device",
