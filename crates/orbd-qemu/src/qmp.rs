@@ -110,6 +110,45 @@ struct BlockdevSnapshot {
     overlay: String,
 }
 command!(BlockdevSnapshot, "blockdev-snapshot", qapi::Empty);
+#[derive(Serialize)]
+struct BlockdevDel {
+    #[serde(rename = "node-name")]
+    node_name: String,
+}
+command!(BlockdevDel, "blockdev-del", qapi::Empty);
+#[derive(Serialize)]
+struct BlockdevBackup {
+    #[serde(rename = "job-id")]
+    job_id: String,
+    device: String,
+    target: String,
+    sync: &'static str,
+    #[serde(rename = "auto-dismiss")]
+    auto_dismiss: bool,
+}
+command!(BlockdevBackup, "blockdev-backup", qapi::Empty);
+
+#[derive(Serialize)]
+struct QueryJobs {}
+command!(QueryJobs, "query-jobs", Vec<JobInfo>);
+#[derive(Clone, Debug, Deserialize)]
+pub struct JobInfo {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JobDismiss {
+    id: String,
+}
+command!(JobDismiss, "job-dismiss", qapi::Empty);
+#[derive(Serialize)]
+struct JobCancel {
+    id: String,
+}
+command!(JobCancel, "job-cancel", qapi::Empty);
 
 #[derive(Serialize)]
 struct QueryStatus {}
@@ -354,6 +393,47 @@ impl Qmp {
         })
         .await
         .map(drop)
+    }
+
+    /// Removes a block node that no device or job uses.
+    pub async fn blockdev_del(&self, node: &str) -> Result<(), QmpError> {
+        self.run(BlockdevDel {
+            node_name: node.into(),
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Starts a full point-in-time copy of `device` into the newly created, all-zero
+    /// `target`. The job remains after it concludes so its error can be observed with
+    /// [`Qmp::query_jobs`] before [`Qmp::job_dismiss`] removes it.
+    pub async fn blockdev_backup(
+        &self,
+        job: &str,
+        device: &str,
+        target: &str,
+    ) -> Result<(), QmpError> {
+        self.run(BlockdevBackup {
+            job_id: job.into(),
+            device: device.into(),
+            target: target.into(),
+            sync: "full",
+            auto_dismiss: false,
+        })
+        .await
+        .map(drop)
+    }
+
+    pub async fn query_jobs(&self) -> Result<Vec<JobInfo>, QmpError> {
+        self.run(QueryJobs {}).await
+    }
+
+    pub async fn job_dismiss(&self, id: &str) -> Result<(), QmpError> {
+        self.run(JobDismiss { id: id.into() }).await.map(drop)
+    }
+
+    pub async fn job_cancel(&self, id: &str) -> Result<(), QmpError> {
+        self.run(JobCancel { id: id.into() }).await.map(drop)
     }
 
     /// Applies file-migration settings on either side of a save/restore and checks
