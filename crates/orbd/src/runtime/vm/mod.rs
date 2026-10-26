@@ -131,10 +131,59 @@ pub async fn copy_disk(ctx: &OpContext, from: &Path, to: &Path) -> Result<(), Ru
     .await
 }
 
+/// Shrinks a raw ext4 disk to the blocks its files use, so a snapshot of a big orb fits
+/// any offering; the guest grows its root filesystem to the orb's disk at boot.
+async fn shrink_ext4(ctx: &OpContext, raw: &Path) -> Result<(), RuntimeError> {
+    let path = raw.display().to_string();
+    // resize2fs wants a freshly checked filesystem. Exit 1 means e2fsck fixed something,
+    // such as replaying the journal of this crash-consistent copy.
+    let fsck = bounded(
+        ctx,
+        tokio::process::Command::new("e2fsck")
+            .args(["-f", "-y", &path])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await?
+    .map_err(|e| RuntimeError::Other(format!("e2fsck: {e}")))?;
+    if !matches!(fsck.status.code(), Some(0 | 1)) {
+        return Err(RuntimeError::Other(format!(
+            "e2fsck: {}",
+            String::from_utf8_lossy(&fsck.stdout).trim()
+        )));
+    }
+    run_tool(ctx, Path::new("resize2fs"), &["-M".into(), path.clone()]).await?;
+    let out = bounded(
+        ctx,
+        tokio::process::Command::new("dumpe2fs")
+            .args(["-h", &path])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await?
+    .map_err(|e| RuntimeError::Other(format!("dumpe2fs: {e}")))?;
+    let header = String::from_utf8_lossy(&out.stdout);
+    let field = |name: &str| {
+        header
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
+            .ok_or_else(|| RuntimeError::Other(format!("dumpe2fs: no {name:?} in {path}")))
+    };
+    let bytes = field("Block count:")? * field("Block size:")?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(raw)
+        .and_then(|f| f.set_len(bytes))
+        .map_err(io_err)
+}
+
 /// Publishes the project snapshot `<state>/projects/<key>/{disk.raw, meta.json}`:
-/// `write_raw` fills a standalone raw disk in staging, which is fsynced and renamed into
-/// place. The format is the same for every VM runtime.
+/// `write_raw` fills a standalone raw disk in staging, which is shrunk to its used size,
+/// fsynced and renamed into place. The format is the same for every VM runtime.
 pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
+    ctx: &OpContext,
     state_dir: &Path,
     key: &ProjectSnapshotKey,
     source_orb: OrbId,
@@ -149,6 +198,7 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
         std::fs::create_dir_all(&staging).map_err(io_err)?;
         let raw = staging.join("disk.raw");
         write_raw(raw.clone()).await?;
+        shrink_ext4(ctx, &raw).await?;
         std::fs::File::open(&raw)
             .and_then(|f| f.sync_all())
             .map_err(io_err)?;
