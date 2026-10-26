@@ -691,11 +691,13 @@ impl FirecrackerRuntime {
         };
         let res = orb.spec.template.resources;
         let base_bytes = std::fs::metadata(&base).map_err(io_err)?.len();
-        if res.disk_bytes < base_bytes {
-            return Err(RuntimeError::Other(format!(
-                "offering disk ({} bytes) is smaller than the base image ({base_bytes} bytes)",
-                res.disk_bytes
-            )));
+        // Project snapshots published before they were shrunk can outsize the offering.
+        let disk_bytes = res.disk_bytes.max(base_bytes);
+        if disk_bytes > res.disk_bytes {
+            log(
+                ctx,
+                &format!("base is {base_bytes} bytes, larger than the offering disk"),
+            );
         }
         // The network index is claimed (durably, by this orb) before anything is built.
         let (id, state) = (orb.id, self.state_dir.clone());
@@ -707,7 +709,7 @@ impl FirecrackerRuntime {
             orb: orb.id,
             vcpus: res.vcpus,
             memory_bytes: res.memory_bytes,
-            disk_bytes: res.disk_bytes,
+            disk_bytes,
             source,
             net,
             created_unix_ms: unix_ms_now(),
@@ -730,7 +732,7 @@ impl FirecrackerRuntime {
                 .write(true)
                 .open(&disk)
                 .map_err(io_err)?;
-            f.set_len(res.disk_bytes).map_err(io_err)?;
+            f.set_len(disk_bytes).map_err(io_err)?;
             f.sync_all().map_err(io_err)?;
             fsync_dir(&staging).map_err(io_err)
         }
@@ -1192,7 +1194,7 @@ impl Runtime for FirecrackerRuntime {
         }
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("copying disk into project snapshot {key}"));
-        publish_project(&self.state_dir, key, orb.id, |raw| async move {
+        publish_project(ctx, &self.state_dir, key, orb.id, |raw| async move {
             copy_disk(ctx, &disk, &raw).await
         })
         .await?;

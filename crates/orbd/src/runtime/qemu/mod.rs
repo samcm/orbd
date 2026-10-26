@@ -669,17 +669,19 @@ impl QemuRuntime {
         };
         let res = orb.spec.template.resources;
         let base = BaseDisk::of(&base_path, &source).map_err(io_err)?;
-        if res.disk_bytes < base.size {
-            return Err(RuntimeError::Other(format!(
-                "offering disk ({} bytes) is smaller than the base image ({} bytes)",
-                res.disk_bytes, base.size
-            )));
+        // Project snapshots published before they were shrunk can outsize the offering.
+        let disk_bytes = res.disk_bytes.max(base.size);
+        if disk_bytes > res.disk_bytes {
+            log(
+                ctx,
+                &format!("base is {} bytes, larger than the offering disk", base.size),
+            );
         }
         let recipe = VmRecipe {
             orb: orb.id,
             vcpus: res.vcpus,
             memory_bytes: res.memory_bytes,
-            disk_bytes: res.disk_bytes,
+            disk_bytes,
             base,
             net: NetAttachment::user(orb.id),
             created_unix_ms: unix_ms_now(),
@@ -709,7 +711,7 @@ impl QemuRuntime {
                     "-b".into(),
                     base_path.display().to_string(),
                     disk.display().to_string(),
-                    res.disk_bytes.to_string(),
+                    disk_bytes.to_string(),
                 ],
             )
             .await?;
@@ -1235,7 +1237,7 @@ impl Runtime for QemuRuntime {
         }
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("converting disk into project snapshot {key}"));
-        publish_project(&self.state_dir, key, orb.id, |raw| async move {
+        publish_project(ctx, &self.state_dir, key, orb.id, |raw| async move {
             run_tool(
                 ctx,
                 &self.config.qemu_img,
