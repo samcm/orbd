@@ -26,7 +26,7 @@
 //! * a restore marks the checkpoint consumed (durably) after the load and before `cont`,
 //!   so stale RAM is never replayed against a disk the guest has since written; a
 //!   loaded-but-unconsumed QEMU is killed (its vCPUs never ran);
-//! * a cold boot consumes every published checkpoint first.
+//! * a cold boot discards every published checkpoint first.
 //!
 //! Requires QEMU 9.0 or newer (file migration with `mapped-ram`); checkpoints restore
 //! only on the exact QEMU binary, machine type, host CPU and kernel they were saved with.
@@ -445,7 +445,7 @@ impl QemuRuntime {
             "running" => {
                 let cps = self.checkpoints(orb);
                 cps.discard_tmps()?;
-                cps.consume_all()?;
+                cps.discard_all()?;
             }
             "paused" | "postmigrate" | "prelaunch" => {
                 let complete = self.checkpoints(orb).complete_tmp();
@@ -1084,7 +1084,7 @@ impl Runtime for QemuRuntime {
                     }
                 }
                 // Booting writes the disk: published checkpoints become stale first.
-                self.checkpoints(orb.id).consume_all()?;
+                self.checkpoints(orb.id).discard_all()?;
                 self.boot(orb, ctx).await
             }
             StartSource::MemoryCheckpoint(cp) => self.restore(orb, cp, ctx).await,

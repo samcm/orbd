@@ -441,7 +441,7 @@ impl FirecrackerRuntime {
             }
         }
         cps.discard_tmps()?;
-        cps.consume_all()?;
+        cps.discard_all()?;
         Ok(Some(Observed::Running(proc)))
     }
 
@@ -1053,7 +1053,7 @@ impl Runtime for FirecrackerRuntime {
                     }
                 }
                 // Booting writes the disk: published checkpoints become stale first.
-                self.checkpoints(orb.id).consume_all()?;
+                self.checkpoints(orb.id).discard_all()?;
                 self.boot(orb, ctx).await
             }
             StartSource::MemoryCheckpoint(cp) => self.restore(orb, cp, ctx).await,

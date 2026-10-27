@@ -138,7 +138,9 @@ The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Lin
 LTS guest kernel; an agent run outside it needs QEMU 9.0 or newer, and for Firecracker
 `ip` and `nft` (`orbd doctor` checks). Firecracker orbs run in their own network
 namespace behind NAT and cannot reach the agent itself or each other. A sleeping orb wakes only on the
-VMM build and CPU it slept on, so after an upgrade it cold-boots once.
+VMM build and CPU it slept on, so after an upgrade it cold-boots once; the agent deletes
+such memory checkpoints when it starts, as it deletes every checkpoint that was restored
+or superseded.
 
 ## License
 
