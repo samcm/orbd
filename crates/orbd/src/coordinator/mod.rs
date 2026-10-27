@@ -7,10 +7,12 @@
 //! * `store` — typed queries and the multi-statement transactions.
 //! * `core` — the single actor owning admission, queueing, delivery and results.
 //! * `service` — the tonic `Dispatch` service (validation only).
+//! * `orbs` — the tonic `Orbs` admin service and the `orbd orb` CLI.
 
 mod core;
 pub(crate) mod db;
 mod logs;
+pub mod orbs;
 mod service;
 pub(crate) mod store;
 mod types;
@@ -44,24 +46,12 @@ fn lock_state_dir(dir: &std::path::Path) -> Result<nix::fcntl::Flock<std::fs::Fi
     })
 }
 
-/// Serves a gRPC service on a fresh unix socket (mode 0600) until `shutdown`.
-fn serve_unix<S>(
+/// Serves gRPC services on a fresh unix socket (mode 0600) until `shutdown`.
+fn serve_unix(
     socket: &std::path::Path,
-    service: S,
+    routes: tonic::service::Routes,
     shutdown: CancellationToken,
-) -> Result<tokio::task::JoinHandle<()>>
-where
-    S: tower::Service<
-            tonic::codegen::http::Request<tonic::body::Body>,
-            Response = tonic::codegen::http::Response<tonic::body::Body>,
-            Error = std::convert::Infallible,
-        > + tonic::server::NamedService
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    S::Future: Send + 'static,
-{
+) -> Result<tokio::task::JoinHandle<()>> {
     match std::fs::remove_file(socket) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -73,7 +63,7 @@ where
     let path = socket.to_owned();
     Ok(tokio::spawn(async move {
         let r = tonic::transport::Server::builder()
-            .add_service(service)
+            .add_routes(routes)
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::UnixListenerStream::new(listener),
                 shutdown.cancelled(),
@@ -171,6 +161,7 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         idle_orb_ttl_days = config.idle_orb_ttl_days,
         "placement policy"
     );
+    let db_for_admin = db.clone();
     let mut core = core::Core::new(
         db,
         key.clone(),
@@ -184,18 +175,26 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
 
     let core_task = tokio::spawn(core.run(core_rx, shutdown.clone()));
     let socket = config.dispatch_socket();
+    let orbs = orbd_proto::control::v1::orbs_server::OrbsServer::new(orbs::OrbsService {
+        core: core_tx.clone(),
+        db: db_for_admin,
+    });
     let dispatch = serve_unix(
         &socket,
-        orbd_proto::control::v1::dispatch_server::DispatchServer::new(service::DispatchService {
-            core: core_tx,
-            offerings: offerings_arc,
-            key,
-        }),
+        tonic::service::Routes::new(
+            orbd_proto::control::v1::dispatch_server::DispatchServer::new(
+                service::DispatchService {
+                    core: core_tx,
+                    offerings: offerings_arc,
+                    key,
+                },
+            ),
+        ),
         shutdown.clone(),
     )?;
     let admin = serve_unix(
         &config.admin_socket(),
-        admin.into_server(),
+        tonic::service::Routes::new(admin.into_server()).add_service(orbs),
         shutdown.clone(),
     )?;
     tracing::info!(socket = %socket.display(), "dispatch socket ready");

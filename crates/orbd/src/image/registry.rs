@@ -173,6 +173,10 @@ impl BlobCache {
     ) -> Result<(), String> {
         let path = self.path(&desc.digest)?;
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            // Reused: garbage collection keeps blobs builds still use.
+            if let Ok(f) = std::fs::File::options().append(true).open(&path) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
             progress.fetch_add(desc.size.max(0) as u64, Ordering::Relaxed);
             return Ok(());
         }

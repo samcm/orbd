@@ -127,6 +127,19 @@ is used again, its next spawn starts a fresh orb from the image (or project snap
 without its files, uncommitted work or processes, and Amp runs setup again. Set the TTL
 longer than any thread you might come back to.
 
+To delete the orbs of archived threads sooner, run a job that checks each orb's thread
+in Amp: `orbd orb list` prints every orb's Amp id (`amp-<thread id>`), state and agent,
+and `orbd orb delete <amp orb id>` deletes one the same way. It refuses an orb unless
+it was last seen asleep or stopped at least `--min-asleep-mins` ago (default 60), with
+no job from Amp open or started since (finished jobs are kept for about an hour), so an
+orb in use is never deleted.
+
+Amp never deletes project snapshots either: it reuses one for at most 72 hours, then
+names a new one. An agent deletes a project snapshot or prepared image once no orb on it
+is built on it and nothing has used it for 72 hours (the current image of a prewarmed
+reference is kept), and image layers no build has used for as long. It checks at
+startup, hourly and after each orb delete.
+
 Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
 `/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores
 them when it starts again,
@@ -138,7 +151,9 @@ The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Lin
 LTS guest kernel; an agent run outside it needs QEMU 9.0 or newer, and for Firecracker
 `ip` and `nft` (`orbd doctor` checks). Firecracker orbs run in their own network
 namespace behind NAT and cannot reach the agent itself or each other. A sleeping orb wakes only on the
-VMM build and CPU it slept on, so after an upgrade it cold-boots once.
+VMM build and CPU it slept on, so after an upgrade it cold-boots once; the agent deletes
+such memory checkpoints when it starts, as it deletes every checkpoint that was restored
+or superseded.
 
 ## License
 

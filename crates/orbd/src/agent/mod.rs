@@ -9,6 +9,7 @@
 //! * [`logs`]: bounded log queue kept apart from control messages.
 //! * [`maintenance`]: graceful stop (drain: checkpoint running orbs, leave restore
 //!   intents) and their restore at the next start.
+//! * [`gc`]: deletes project snapshots and prepared images no orb is built on.
 //!
 //! Crash points (feature `failpoints`, `FAILPOINTS="<name>=return"` aborts):
 //! `agent::accepted_committed` (receipt durable, Accepted not yet sent),
@@ -21,6 +22,7 @@
 mod db;
 mod detect;
 mod executor;
+mod gc;
 mod identity;
 mod logs;
 mod maintenance;
@@ -69,6 +71,10 @@ pub(crate) struct Shared {
     pub session: Mutex<Option<SessionHandle>>,
     pub logs: Arc<logs::LogQueue>,
     pub tasks: TaskTracker,
+    /// The image pipeline, when VM runtimes use it (for garbage collection).
+    pub images: Option<crate::image::ImageStore>,
+    /// Signalled after an orb was deleted: its base may now be unused.
+    pub orb_deleted: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -223,15 +229,18 @@ pub async fn run(
         runtimes.insert(RuntimeKind::Docker, Arc::new(rt));
     }
     // One image source for every VM runtime (one build lock, one cache).
+    let mut image_store = None;
     let vm_images = if config.runtime.qemu.is_some() || config.runtime.firecracker.is_some() {
         let images: Arc<dyn crate::runtime::vm::images::ImageProvider> = match &config.images {
             Some(i) if !i.static_images.is_empty() => Arc::new(
                 crate::runtime::vm::images::StaticImages(i.static_images.clone()),
             ),
-            Some(i) => Arc::new(
-                crate::image::ImageStore::open(i, &config.agent.state_dir)
-                    .map_err(|e| anyhow::anyhow!("image store: {e}"))?,
-            ),
+            Some(i) => {
+                let store = crate::image::ImageStore::open(i, &config.agent.state_dir)
+                    .map_err(|e| anyhow::anyhow!("image store: {e}"))?;
+                image_store = Some(store.clone());
+                Arc::new(store)
+            }
             None => anyhow::bail!("VM runtimes need `images`"),
         };
         Some(images)
@@ -283,11 +292,14 @@ pub async fn run(
         session: Mutex::default(),
         logs: Arc::new(logs::LogQueue::new(256)),
         tasks: TaskTracker::new(),
+        images: image_store,
+        orb_deleted: tokio::sync::Notify::new(),
     });
     tracing::info!(agent = %shared.identity.agent_id, boot_id = %shared.boot_id, "agent starting");
 
     // Ready (Hello) only after interrupted work is requeued and drained orbs restored.
     executor::recover(&shared).await?;
+    tokio::spawn(gc::run_loop(shared.clone()));
     measure_disk(&shared).await;
     tokio::spawn({
         let sh = shared.clone();

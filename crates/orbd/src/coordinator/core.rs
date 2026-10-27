@@ -55,6 +55,13 @@ pub enum Msg {
         key: CommandKey,
         status: OperationStatus,
     },
+    /// `orbd orb delete`: delete the orb if it has been asleep, with no job, for
+    /// `min_asleep`. Refusals arrive on `tx` as an error, results as dispatch events.
+    DeleteAsleep {
+        amp_orb_id: AmpOrbId,
+        min_asleep: Duration,
+        tx: EventTx,
+    },
 }
 
 pub struct Core {
@@ -183,6 +190,18 @@ impl Core {
             Msg::Reconciled { key, status } => {
                 if let Err(err) = self.reconciled(key, status).await {
                     tracing::error!(error = %format!("{err:#}"), "applying reconcile result failed");
+                }
+            }
+            Msg::DeleteAsleep {
+                amp_orb_id,
+                min_asleep,
+                tx,
+            } => {
+                if let Err(err) = self.delete_asleep(amp_orb_id, min_asleep, tx.clone()).await {
+                    tracing::error!(error = %format!("{err:#}"), "orb delete request failed");
+                    let _ = tx
+                        .send(Err(GrpcStatus::unavailable("coordinator internal error")))
+                        .await;
                 }
             }
         }
@@ -1447,10 +1466,10 @@ impl Core {
         Ok(())
     }
 
-    /// Deletes orbs asleep longer than the idle TTL through the ordinary delete path (a
-    /// queued Delete request, as if Amp had sent it). Amp sends no delete when a thread
-    /// is archived, only a pause, so without this abandoned orbs keep their disks
-    /// forever. A later spawn of the same orb creates a fresh one.
+    /// Deletes orbs asleep longer than the idle TTL through the ordinary delete path.
+    /// Amp sends no delete when a thread is archived, only a pause, so without this
+    /// abandoned orbs keep their disks forever. A later spawn of the same orb creates a
+    /// fresh one.
     async fn reclaim_idle(&mut self, now: u64) -> Result<()> {
         let Some(ttl) = self.policy.idle_orb_ttl else {
             return Ok(());
@@ -1476,32 +1495,134 @@ impl Core {
                 "deleting orb asleep past the idle TTL"
             );
             metrics::counter!("orbd_idle_orbs_reclaimed_total").increment(1);
-            let req = Req {
-                invocation_id: InvocationId::generate(),
-                offering_id: orb.offering_id.clone(),
-                amp_endpoint: orb.identity.amp_endpoint.clone(),
-                amp_orb_id: orb.identity.amp_orb_id.clone(),
-                action: ReqAction::Delete,
-                fingerprint: None,
-                seq: 0,
-                start_ms: now,
-                work_deadline_ms: now + WORK_BUDGET_MS,
-                cleanup_deadline_ms: now + CLEANUP_BUDGET_MS,
-                dispatch_deadline_ms: now + DISPATCH_BUDGET_MS,
-                status: ReqStatus::Queued,
-                operation_id: None,
-                result: None,
-            };
-            self.db
-                .call(move |c| store::insert_request(c, &req, None))
-                .await?;
-            self.evaluate(
-                orb.identity.amp_endpoint.as_str(),
-                orb.identity.amp_orb_id.as_str(),
-            )
-            .await;
+            self.queue_delete(&orb, now, None).await?;
         }
         Ok(())
+    }
+
+    /// Deletes one orb on an operator's request (`orbd orb delete`, e.g. from a job
+    /// that finds archived threads), through the ordinary delete path. The orb
+    /// qualifies as [`store::idle_orbs`] judges it with a cutoff `min_asleep` ago: last
+    /// seen asleep or stopped before the cutoff, no open command, and no request
+    /// queued, running, or started since the cutoff (finished requests are pruned
+    /// after about an hour). An orb Amp is using is never deleted; checking and
+    /// queueing here in the actor leaves no gap for a spawn to slip in between.
+    async fn delete_asleep(
+        &mut self,
+        amp_orb_id: AmpOrbId,
+        min_asleep: Duration,
+        tx: EventTx,
+    ) -> Result<()> {
+        let now = unix_ms_now();
+        let cutoff = now.saturating_sub(min_asleep.as_millis() as u64);
+        let mut endpoints: Vec<AmpEndpointId> = self
+            .offerings
+            .values()
+            .map(|o| o.amp_endpoint.clone())
+            .collect();
+        endpoints.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        endpoints.dedup();
+        let id = amp_orb_id.clone();
+        let (orbs, idle) = self
+            .db
+            .call(move |c| {
+                let mut orbs = Vec::new();
+                for ep in &endpoints {
+                    if let Some(o) = store::get_orb_by_identity(c, ep.as_str(), id.as_str())?
+                        && !store::is_tombstoned(c, o.id)?
+                    {
+                        orbs.push(o);
+                    }
+                }
+                let idle: Vec<OrbId> = store::idle_orbs(c, cutoff)?.iter().map(|o| o.id).collect();
+                Ok((orbs, idle))
+            })
+            .await?;
+        let mins = min_asleep.as_secs() / 60;
+        let refusal = match orbs.as_slice() {
+            [] => Some(GrpcStatus::not_found(format!("no orb {amp_orb_id}"))),
+            [_, _, ..] => Some(GrpcStatus::failed_precondition(format!(
+                "{amp_orb_id} names orbs under {} Amp endpoints",
+                orbs.len()
+            ))),
+            [o] if !idle.contains(&o.id) => Some(GrpcStatus::failed_precondition(format!(
+                "{amp_orb_id} is {} (recorded {} min ago); it must have been last seen asleep \
+                 or stopped at least {mins} min ago, with no job from Amp open or started \
+                 since (finished jobs are kept for about an hour)",
+                state_label(&o.observation.state),
+                now.saturating_sub(o.observation.observed_at_unix_ms) / 60_000
+            ))),
+            [o] if !self.offerings.contains_key(&o.offering_id) => {
+                Some(GrpcStatus::failed_precondition(format!(
+                    "{amp_orb_id}'s offering {} is no longer configured",
+                    o.offering_id
+                )))
+            }
+            [_] => None,
+        };
+        if let Some(status) = refusal {
+            let _ = tx.send(Err(status)).await;
+            return Ok(());
+        }
+        let orb = orbs.into_iter().next().expect("checked above");
+        tracing::info!(
+            orb = %orb.id,
+            amp_orb_id = %orb.identity.amp_orb_id,
+            location = ?orb.location,
+            asleep_mins = now.saturating_sub(orb.observation.observed_at_unix_ms) / 60_000,
+            "deleting orb on request"
+        );
+        self.queue_delete(&orb, now, Some(tx)).await
+    }
+
+    /// Queues a Delete request for `orb`, as if Amp had sent it, and starts it if the
+    /// orb is free. With `tx`, the caller follows it like a dispatch.
+    async fn queue_delete(&mut self, orb: &OrbRecord, now: u64, tx: Option<EventTx>) -> Result<()> {
+        let req = Req {
+            invocation_id: InvocationId::generate(),
+            offering_id: orb.offering_id.clone(),
+            amp_endpoint: orb.identity.amp_endpoint.clone(),
+            amp_orb_id: orb.identity.amp_orb_id.clone(),
+            action: ReqAction::Delete,
+            fingerprint: None,
+            seq: 0,
+            start_ms: now,
+            work_deadline_ms: now + WORK_BUDGET_MS,
+            cleanup_deadline_ms: now + CLEANUP_BUDGET_MS,
+            dispatch_deadline_ms: now + DISPATCH_BUDGET_MS,
+            status: ReqStatus::Queued,
+            operation_id: None,
+            result: None,
+        };
+        let inv = req.invocation_id;
+        self.db
+            .call(move |c| store::insert_request(c, &req, None))
+            .await?;
+        if let Some(tx) = tx {
+            self.subs.insert(inv, tx);
+        }
+        self.evaluate(
+            orb.identity.amp_endpoint.as_str(),
+            orb.identity.amp_orb_id.as_str(),
+        )
+        .await;
+        Ok(())
+    }
+}
+
+/// An orb's state in words: running, asleep, stopped, uncreated, deleted, or faulted
+/// (with its last known state).
+pub(crate) fn state_label(s: &OrbState) -> String {
+    let stable = |s: &StableOrbState| match s {
+        StableOrbState::Uncreated => "uncreated",
+        StableOrbState::Running => "running",
+        StableOrbState::Sleeping { .. } => "asleep",
+        StableOrbState::DiskOnlyStopped { .. } => "stopped",
+        StableOrbState::Deleted => "deleted",
+    };
+    match s {
+        OrbState::Known { state } => stable(state).into(),
+        OrbState::Faulted { last_known, .. } => format!("faulted ({})", stable(last_known)),
     }
 }
 

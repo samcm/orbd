@@ -26,7 +26,7 @@
 //! * a restore marks the checkpoint consumed (durably) after the load and before `cont`,
 //!   so stale RAM is never replayed against a disk the guest has since written; a
 //!   loaded-but-unconsumed QEMU is killed (its vCPUs never ran);
-//! * a cold boot consumes every published checkpoint first.
+//! * a cold boot discards every published checkpoint first.
 //!
 //! Requires QEMU 9.0 or newer (file migration with `mapped-ram`); checkpoints restore
 //! only on the exact QEMU binary, machine type, host CPU and kernel they were saved with.
@@ -150,6 +150,28 @@ impl BaseDisk {
             mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
         })
     }
+}
+
+/// The base disk directories (`images/<key>`, `projects/<key>`) a QEMU orb's `vm.json`
+/// reads through to, or None if `json` is not a QEMU recipe.
+pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
+    let recipe: VmRecipe = serde_json::from_slice(json).ok()?;
+    let mut bases = Vec::new();
+    match serde_json::from_str(&recipe.base.source) {
+        Ok(BaseSource::Image { key, .. }) => bases.push(format!("images/{key}")),
+        Ok(BaseSource::ProjectSnapshot { key }) => bases.push(format!("projects/{key}")),
+        Err(_) => {}
+    }
+    // The backing file itself, whatever the source says.
+    let dir = recipe.base.path.parent()?;
+    if let (Some(kind), Some(key)) = (dir.parent().and_then(|p| p.file_name()), dir.file_name()) {
+        bases.push(format!(
+            "{}/{}",
+            kind.to_string_lossy(),
+            key.to_string_lossy()
+        ));
+    }
+    Some(bases)
 }
 
 /// `checkpoints/<gen>/manifest.json`. Its presence in a `.tmp` directory marks the
@@ -445,7 +467,7 @@ impl QemuRuntime {
             "running" => {
                 let cps = self.checkpoints(orb);
                 cps.discard_tmps()?;
-                cps.consume_all()?;
+                cps.discard_all()?;
             }
             "paused" | "postmigrate" | "prelaunch" => {
                 let complete = self.checkpoints(orb).complete_tmp();
@@ -637,6 +659,8 @@ impl QemuRuntime {
         src: InitialDiskSource,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
+        // Until the published recipe names the base, garbage collection must not take it.
+        let _bases = bounded(ctx, super::vm::BASES.read()).await?;
         let (base_path, source) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -664,6 +688,7 @@ impl QemuRuntime {
                         r.key
                     )));
                 }
+                super::vm::mark_used(&self.project_dir(&r.key));
                 (disk, BaseSource::ProjectSnapshot { key: r.key })
             }
         };
@@ -890,8 +915,12 @@ impl QemuRuntime {
                     m.launch.kernel.path.display()
                 ));
             }
+            // Not knowing is not a mismatch: the checkpoint is kept.
             Err(e) => {
-                return bad(format!("kernel {}: {e}", m.launch.kernel.path.display()));
+                return Err(RuntimeError::Other(format!(
+                    "kernel {}: {e}",
+                    m.launch.kernel.path.display()
+                )));
             }
         }
         match std::fs::metadata(memory) {
@@ -901,7 +930,8 @@ impl QemuRuntime {
                 meta.len(),
                 m.memory_file_bytes
             )),
-            Err(e) => bad(format!("memory file: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bad(format!("memory file: {e}")),
+            Err(e) => Err(io_err(e)),
         }
     }
 
@@ -1084,7 +1114,7 @@ impl Runtime for QemuRuntime {
                     }
                 }
                 // Booting writes the disk: published checkpoints become stale first.
-                self.checkpoints(orb.id).consume_all()?;
+                self.checkpoints(orb.id).discard_all()?;
                 self.boot(orb, ctx).await
             }
             StartSource::MemoryCheckpoint(cp) => self.restore(orb, cp, ctx).await,
@@ -1222,8 +1252,7 @@ impl Runtime for QemuRuntime {
         ctx: &OpContext,
     ) -> Result<ProjectSnapshotRef, RuntimeError> {
         let done = ProjectSnapshotRef { key: key.clone() };
-        let dest = self.project_dir(key);
-        if dest.join("disk.raw").is_file() {
+        if super::vm::reuse_project(ctx, &self.state_dir, key).await? {
             return Ok(done);
         }
         let _g = bounded(ctx, self.lock(orb.id)).await?;

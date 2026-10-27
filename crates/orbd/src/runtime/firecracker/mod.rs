@@ -116,6 +116,16 @@ struct VmRecipe {
     created_unix_ms: u64,
 }
 
+/// The base disk directory (`images/<key>`, `projects/<key>`) a Firecracker orb's
+/// `vm.json` was copied from, or None if `json` is not a Firecracker recipe.
+pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
+    let recipe: VmRecipe = serde_json::from_slice(json).ok()?;
+    Some(vec![match recipe.source {
+        DiskSource::Image { key, .. } => format!("images/{key}"),
+        DiskSource::ProjectSnapshot { key } => format!("projects/{key}"),
+    }])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum DiskSource {
@@ -441,7 +451,7 @@ impl FirecrackerRuntime {
             }
         }
         cps.discard_tmps()?;
-        cps.consume_all()?;
+        cps.discard_all()?;
         Ok(Some(Observed::Running(proc)))
     }
 
@@ -655,6 +665,8 @@ impl FirecrackerRuntime {
         src: InitialDiskSource,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
+        // Until the published recipe names the base, garbage collection must not take it.
+        let _bases = bounded(ctx, super::vm::BASES.read()).await?;
         let (base, source) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -686,6 +698,7 @@ impl FirecrackerRuntime {
                         r.key
                     )));
                 }
+                super::vm::mark_used(disk.parent().expect("in a directory"));
                 (disk, DiskSource::ProjectSnapshot { key: r.key })
             }
         };
@@ -890,7 +903,10 @@ impl FirecrackerRuntime {
                         meta.len()
                     ));
                 }
-                Err(e) => return bad(format!("{file}: {e}")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return bad(format!("{file}: {e}"));
+                }
+                Err(e) => return Err(io_err(e)),
             }
         }
         Ok(m)
@@ -1053,7 +1069,7 @@ impl Runtime for FirecrackerRuntime {
                     }
                 }
                 // Booting writes the disk: published checkpoints become stale first.
-                self.checkpoints(orb.id).consume_all()?;
+                self.checkpoints(orb.id).discard_all()?;
                 self.boot(orb, ctx).await
             }
             StartSource::MemoryCheckpoint(cp) => self.restore(orb, cp, ctx).await,
@@ -1174,13 +1190,7 @@ impl Runtime for FirecrackerRuntime {
         ctx: &OpContext,
     ) -> Result<ProjectSnapshotRef, RuntimeError> {
         let done = ProjectSnapshotRef { key: key.clone() };
-        if self
-            .state_dir
-            .join("projects")
-            .join(key.as_str())
-            .join("disk.raw")
-            .is_file()
-        {
+        if super::vm::reuse_project(ctx, &self.state_dir, key).await? {
             return Ok(done);
         }
         let _g = bounded(ctx, self.locks.lock(orb.id)).await?;

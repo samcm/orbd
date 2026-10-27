@@ -81,6 +81,74 @@ fn lifecycle_and_reincarnation_after_delete() {
     );
 }
 
+/// `orbd orb delete` (for orbs of archived threads, which Amp never deletes) deletes
+/// only an orb asleep with no job for the given time, through the ordinary delete path:
+/// a running or freshly paused orb is kept, and a later spawn starts a fresh orb.
+#[test]
+fn orb_delete_takes_only_orbs_asleep_long_enough() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn 2");
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
+
+    let list = c.admin(&["orb", "list"]);
+    assert_ok(&list, "orb list");
+    assert_eq!(
+        list.stdout,
+        format!(
+            "amp-1\trunning for 0m\tagent-a\t{OFFERING}\namp-2\tasleep for 0m\tagent-a\t{OFFERING}"
+        )
+    );
+
+    let running = c.admin(&["orb", "delete", "amp-1", "--min-asleep-mins", "0"]);
+    assert_ne!(running.code, 0, "a running orb must not be deleted");
+    assert!(
+        running.stderr.contains("amp-1 is running"),
+        "{}",
+        running.stderr
+    );
+    let recent = c.admin(&["orb", "delete", "amp-2"]);
+    assert_ne!(recent.code, 0, "asleep for less than the default hour");
+    assert!(
+        recent.stderr.contains("amp-2 is asleep"),
+        "{}",
+        recent.stderr
+    );
+    let unknown = c.admin(&["orb", "delete", "amp-3", "--min-asleep-mins", "0"]);
+    assert!(
+        unknown.stderr.contains("no orb amp-3"),
+        "{}",
+        unknown.stderr
+    );
+    assert!(c.fake_orbs("agent-a").iter().all(|o| o.disk));
+
+    let deleted = c.admin(&["orb", "delete", "amp-2", "--min-asleep-mins", "0"]);
+    assert_ok(&deleted, "delete asleep orb");
+    let orbs = c.fake_orbs("agent-a");
+    assert_eq!(
+        orbs.iter().filter(|o| o.disk).count(),
+        1,
+        "amp-2's disk is gone"
+    );
+    assert!(orbs.iter().any(|o| o.running), "amp-1 still runs");
+    let list = c.admin(&["orb", "list"]);
+    assert!(!list.stdout.contains("amp-2"), "{}", list.stdout);
+
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause 1");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn after delete");
+    let orbs = c.fake_orbs("agent-a");
+    assert_eq!(
+        orbs.len(),
+        3,
+        "a fresh incarnation, the deleted one stays deleted"
+    );
+    let running: Vec<_> = orbs.iter().filter(|o| o.running).collect();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].counters.restores, 0);
+    assert!(running[0].bootstraps.iter().all(|b| b.cold_boot));
+}
+
 /// An orb stays on its recorded agent for life: while that agent is offline its jobs
 /// fail fast instead of being re-placed, and it resumes there once the agent is back.
 /// New orbs go to agents with room; with no room anywhere, spawns are refused.

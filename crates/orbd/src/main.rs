@@ -43,6 +43,9 @@ enum Command {
         #[command(flatten)]
         coordinator: CoordinatorArgs,
     },
+    /// List or delete orbs (run on the coordinator).
+    #[command(subcommand)]
+    Orb(OrbCommand),
     /// Handle one Amp dispatch job from the environment (run by `amp orb provider`).
     Dispatch,
     /// Check host prerequisites (QEMU, /dev/kvm, guest kernel, umoci, mkfs.ext4).
@@ -64,6 +67,26 @@ enum AgentCommand {
     /// Revoke an agent for good; its orbs stay recorded on it, unavailable.
     Remove {
         agent_id: String,
+        #[command(flatten)]
+        coordinator: CoordinatorArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum OrbCommand {
+    /// List orbs: Amp orb id, state and for how long, agent, offering.
+    List(CoordinatorArgs),
+    /// Delete an orb whose thread is gone (Amp sends no delete for an archived thread),
+    /// as if Amp had sent `delete`. Refused unless the orb was last seen asleep or
+    /// stopped at least `--min-asleep-mins` ago, with no job from Amp open or started
+    /// since (the coordinator keeps finished jobs for about an hour). A later spawn
+    /// starts a fresh orb.
+    Delete {
+        /// Amp orb id (Amp's ORB_ID, `amp-<thread id>`), as `orbd orb list` shows it.
+        amp_orb_id: String,
+        /// How long ago the orb must have been last seen asleep or stopped.
+        #[arg(long, default_value_t = 60)]
+        min_asleep_mins: u64,
         #[command(flatten)]
         coordinator: CoordinatorArgs,
     },
@@ -149,6 +172,31 @@ fn main() -> anyhow::Result<()> {
                 }),
             ..
         } => rt.block_on(admin::cli_remove(&admin_socket(&coordinator)?, &agent_id)),
+        Command::Orb(OrbCommand::List(coordinator)) => {
+            print!(
+                "{}",
+                rt.block_on(orbd::coordinator::orbs::cli_list(&admin_socket(
+                    &coordinator
+                )?))?
+            );
+            Ok(())
+        }
+        Command::Orb(OrbCommand::Delete {
+            amp_orb_id,
+            min_asleep_mins,
+            coordinator,
+        }) => {
+            let min_asleep = std::time::Duration::from_secs(min_asleep_mins.saturating_mul(60));
+            println!(
+                "{}",
+                rt.block_on(orbd::coordinator::orbs::cli_delete(
+                    &admin_socket(&coordinator)?,
+                    &amp_orb_id,
+                    min_asleep
+                ))?
+            );
+            Ok(())
+        }
         Command::Coordinator(args) => {
             orbd::telemetry::init_logging(cli.log_json);
             let config = orbd::config::coordinator::CoordinatorConfig::load(&args.config)?;

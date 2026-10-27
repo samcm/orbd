@@ -16,7 +16,11 @@
 //! On disk (`<state_dir>`):
 //! `images/blobs/sha256/<hex>` (blob cache), `images/refs/<sha256(ref)>.json` (last
 //! resolution of each reference), `images/<key>/{rootfs.ext4,image.json}` (published,
-//! immutable), `staging/image-<key>-<nonce>/` (in progress; removed at startup).
+//! immutable; `last_used` records its last use), `staging/image-<key>-<nonce>/` (in
+//! progress; removed at startup).
+//!
+//! [`ImageStore::collect_garbage`] deletes images no orb is built on that have not been
+//! used for a while, and blobs no build has used for as long.
 
 mod integration;
 mod registry;
@@ -28,7 +32,7 @@ pub use rootfs::UMOCI_VERSION;
 use crate::config::agent::ImagesConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,8 +44,8 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 const ROOTFS_FILE: &str = "rootfs.ext4";
 const META_FILE: &str = "image.json";
 
-/// A published, immutable root disk. Per-orb disks are copy-on-write overlays of it,
-/// so it must not be deleted while any orb or project snapshot references it.
+/// A published, immutable root disk. QEMU orb disks are copy-on-write overlays of it,
+/// so it must not be deleted while any orb references it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedImage {
     /// Cache key (hex), also the directory name under `images/`.
@@ -100,6 +104,7 @@ struct Inner {
     config: ImagesConfig,
     images: PathBuf,
     staging: PathBuf,
+    trash: PathBuf,
     blobs: registry::BlobCache,
     integration: IntegrationLayer,
     client: oci_client::Client,
@@ -120,6 +125,17 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Whether `last` (a use time of `path`) is at least `idle` ago; unknown counts as recent.
+fn idle_for(path: &Path, last: std::io::Result<SystemTime>, idle: Duration) -> bool {
+    match last {
+        Ok(t) => t.elapsed().is_ok_and(|e| e >= idle),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "garbage collection: no use time; keeping it");
+            false
+        }
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -157,6 +173,7 @@ impl ImageStore {
                 blobs: registry::BlobCache::new(images.join("blobs/sha256")),
                 images,
                 staging,
+                trash: state_dir.join("trash"),
                 integration,
                 client: registry::client(),
                 runtime: tokio::runtime::Handle::current(),
@@ -210,6 +227,7 @@ impl ImageStore {
                     >= self.inner.config.refresh_interval_secs
         });
         if let Some(image) = ready {
+            crate::runtime::vm::mark_used(&self.inner.images.join(&image.key));
             if stale {
                 // Refresh the tag in the background; keep serving this image meanwhile.
                 let _ = self.start(image_ref);
@@ -286,6 +304,70 @@ impl ImageStore {
             }
         });
         msg
+    }
+
+    /// Moves into the trash every published image whose key is not in `in_use` (the
+    /// bases of this host's orbs), that is not the current image of a prewarmed
+    /// reference and that has not been used for `idle`. Returns each image's key and
+    /// its path in the trash, for the caller to delete. The caller holds
+    /// [`crate::runtime::vm::BASES`] exclusively.
+    pub fn collect_garbage(
+        &self,
+        in_use: &HashSet<String>,
+        idle: Duration,
+    ) -> Vec<(String, PathBuf)> {
+        let prewarmed: HashSet<String> = self
+            .inner
+            .config
+            .prewarm
+            .iter()
+            .filter_map(|r| self.read_ref(r))
+            .map(|r| self.cache_key(&r.manifest_digest))
+            .collect();
+        let mut trashed = Vec::new();
+        for e in std::fs::read_dir(&self.inner.images)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let key = e.file_name().to_string_lossy().into_owned();
+            let dir = e.path();
+            if !dir.join(META_FILE).is_file()
+                || in_use.contains(&key)
+                || prewarmed.contains(&key)
+                || !idle_for(&dir, crate::runtime::vm::last_used(&dir), idle)
+            {
+                continue;
+            }
+            match orbd_vm::fsutil::move_to_trash(&dir, &self.inner.trash) {
+                Ok(Some(t)) => trashed.push((key, t)),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(key, error = %e, "deleting an unused image"),
+            }
+        }
+        trashed
+    }
+
+    /// Moves into the trash every cached blob no build has used for `idle`, unless a
+    /// build is running. Returns their paths in the trash, for the caller to delete.
+    pub fn collect_blobs(&self, idle: Duration) -> Vec<PathBuf> {
+        // Holding the job table keeps builds from starting meanwhile.
+        let jobs = self.inner.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if jobs.values().any(|j| matches!(j, Job::Running { .. })) {
+            return Vec::new();
+        }
+        let dir = self.inner.images.join("blobs/sha256");
+        let mut trashed = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if idle_for(&p, e.metadata().and_then(|m| m.modified()), idle)
+                && let Ok(Some(t)) = orbd_vm::fsutil::move_to_trash(&p, &self.inner.trash)
+            {
+                trashed.push(t);
+            }
+        }
+        drop(jobs);
+        trashed
     }
 
     fn cache_key(&self, manifest_digest: &str) -> String {
@@ -463,5 +545,93 @@ impl ImageStore {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sets a file's or directory's modification time `days` into the past.
+    fn age(path: &Path, days: u64) {
+        let t = SystemTime::now() - Duration::from_secs(days * 86_400);
+        std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// Images go once no orb is built on them and nothing used them for the idle time,
+    /// except the current image of a prewarmed reference; idle blobs go too.
+    #[tokio::test]
+    async fn collect_garbage_keeps_images_in_use_or_used_recently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("orbd-guest");
+        std::fs::write(&helper, b"\x7fELF test").unwrap();
+        let prewarmed_ref = "example.invalid/amp-orb:latest";
+        let mut config = crate::config::agent::AgentConfig::default().images.unwrap();
+        config.guest_helper = helper;
+        config.prewarm = vec![prewarmed_ref.into()];
+        let state = tmp.path().join("state");
+        let store = ImageStore::open(&config, &state).unwrap();
+        // Let the prewarm attempt (example.invalid does not resolve) finish first.
+        let started = Instant::now();
+        while !matches!(
+            store.inner.jobs.lock().unwrap().get(prewarmed_ref),
+            Some(Job::Failed { .. })
+        ) {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "prewarm did not fail"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        write_json_atomic(
+            &store.ref_path(prewarmed_ref),
+            &RefRecord {
+                image_ref: prewarmed_ref.into(),
+                manifest_digest: "sha256:current".into(),
+                resolved_unix: now_unix(),
+            },
+        )
+        .unwrap();
+        let current = store.cache_key("sha256:current");
+        let images = state.join("images");
+        for key in [
+            "base-of-an-orb",
+            current.as_str(),
+            "fresh",
+            "idle",
+            "used-lately",
+        ] {
+            std::fs::create_dir_all(images.join(key)).unwrap();
+            std::fs::write(images.join(key).join(META_FILE), b"{}").unwrap();
+        }
+        crate::runtime::vm::mark_used(&images.join("used-lately"));
+        for key in ["base-of-an-orb", current.as_str(), "idle", "used-lately"] {
+            age(&images.join(key), 4);
+        }
+        let blobs = images.join("blobs/sha256");
+        std::fs::write(blobs.join("old"), b"layer").unwrap();
+        std::fs::write(blobs.join("new"), b"layer").unwrap();
+        age(&blobs.join("old"), 4);
+
+        let in_use = HashSet::from(["base-of-an-orb".to_owned()]);
+        let idle = Duration::from_secs(72 * 3600);
+        let trashed = store.collect_garbage(&in_use, idle);
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].0, "idle");
+        assert!(
+            trashed[0].1.join(META_FILE).is_file(),
+            "moved, not yet deleted"
+        );
+        assert_eq!(store.collect_blobs(idle).len(), 1);
+        let mut left: Vec<String> = std::fs::read_dir(&images)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec!["base-of-an-orb", "blobs", "fresh", "refs", "used-lately"];
+        want.push(&current);
+        want.sort();
+        assert_eq!(left, want);
+        assert!(!blobs.join("old").exists() && blobs.join("new").exists());
     }
 }

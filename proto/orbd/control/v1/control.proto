@@ -598,6 +598,46 @@ message ListAgentsResponse {
   repeated AgentInfo agents = 1;
 }
 
+// Also served on the admin socket: the coordinator's orbs.
+service Orbs {
+  // Orbs that exist (not deleted), oldest first.
+  rpc ListOrbs(ListOrbsRequest) returns (ListOrbsResponse);
+  // Deletes one orb through the ordinary delete path, as if Amp had sent `delete`, and
+  // returns its result. Refused (FAILED_PRECONDITION) unless the coordinator last saw
+  // the orb asleep or stopped at least `min_asleep_secs` ago and no command or request
+  // for it is open or started since then (finished requests are only kept for about
+  // an hour). An orb in use is never deleted. A later spawn of the same Amp orb id
+  // starts a fresh orb.
+  rpc DeleteOrb(DeleteOrbRequest) returns (DeleteOrbResponse);
+}
+
+message ListOrbsRequest {}
+
+message OrbInfo {
+  string amp_orb_id = 1;
+  string offering_id = 2;
+  // Empty for orbs outside the agent fleet.
+  string agent_id = 3;
+  // running, asleep, stopped, uncreated, or faulted (<last known state>).
+  string state = 4;
+  // When the coordinator last learned the state (for an asleep orb, when it went to
+  // sleep).
+  uint64 observed_unix_ms = 5;
+}
+
+message ListOrbsResponse {
+  repeated OrbInfo orbs = 1;
+}
+
+message DeleteOrbRequest {
+  string amp_orb_id = 1;
+  uint64 min_asleep_secs = 2;
+}
+
+message DeleteOrbResponse {
+  string message = 1;
+}
+
 message RemoveAgentRequest {
   string agent_id = 1;
 }

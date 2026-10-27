@@ -7,7 +7,9 @@
 //! ```
 //!
 //! A checkpoint is consumed (durably, an empty `consumed` file) before a restored guest
-//! can run, and never restored again: the guest's disk moves on from that point.
+//! can run, and never restored again: the guest's disk moves on from that point. A
+//! consumed checkpoint only takes disk space, so it is removed as soon as its restore
+//! finished or the orb is next inspected without a VMM.
 
 use super::fsutil::write_atomic;
 use super::io_err;
@@ -79,13 +81,14 @@ impl Checkpoints {
         Ok(())
     }
 
-    /// Marks every published checkpoint consumed (the disk is about to move on).
-    pub fn consume_all(&self) -> Result<(), RuntimeError> {
+    /// Discards every published checkpoint (the disk is about to move on, or already
+    /// has).
+    pub fn discard_all(&self) -> Result<(), RuntimeError> {
         for (g, consumed) in self.list().0 {
             if !consumed {
-                tracing::info!(orb = %self.orb, generation = g, "checkpoint is stale; marking consumed");
-                self.consume(g)?;
+                tracing::info!(orb = %self.orb, generation = g, "checkpoint is stale; discarding it");
             }
+            self.discard(g)?;
         }
         Ok(())
     }
@@ -125,10 +128,12 @@ impl Checkpoints {
         self.store.publish(&generation.to_string()).map_err(io_err)
     }
 
-    /// With no VMM running: publishes complete saves, discards partial ones, consumes
-    /// all but the newest unconsumed checkpoint and returns that one if `restorable`
-    /// accepts it. One this host cannot restore exactly is consumed: the orb cold-boots
-    /// and its processes are lost.
+    /// With no VMM running: publishes complete saves, discards partial and consumed
+    /// ones and all but the newest unconsumed checkpoint, and returns that one if
+    /// `restorable` accepts it. One this host cannot restore exactly
+    /// (`CheckpointIncompatible`) is discarded: the orb cold-boots and its processes
+    /// are lost. Any other error from `restorable` (e.g. a failed read) is returned and
+    /// the checkpoint is kept for the next attempt.
     pub fn settle(
         &self,
         restorable: impl Fn(u64) -> Result<(), RuntimeError>,
@@ -142,24 +147,30 @@ impl Checkpoints {
                 self.discard_tmp(g)?;
             }
         }
-        let live: Vec<u64> = self
-            .list()
-            .0
-            .into_iter()
-            .filter(|(_, consumed)| !consumed)
-            .map(|(g, _)| g)
-            .collect();
-        let mut latest = live.last().copied();
-        for g in &live[..live.len().saturating_sub(1)] {
-            tracing::warn!(orb = %orb, generation = g, "older unconsumed checkpoint; marking consumed");
-            self.consume(*g)?;
+        let mut live = Vec::new();
+        for (g, consumed) in self.list().0 {
+            if consumed {
+                tracing::info!(orb = %orb, generation = g, "discarding a consumed checkpoint");
+                self.discard(g)?;
+            } else {
+                live.push(g);
+            }
         }
-        if let Some(g) = latest
-            && let Err(e) = restorable(g)
-        {
-            tracing::error!(orb = %orb, generation = g, error = %e, "checkpoint cannot be restored; the orb will cold-boot");
-            self.consume(g)?;
-            latest = None;
+        let mut latest = live.pop();
+        for g in live {
+            tracing::warn!(orb = %orb, generation = g, "older unconsumed checkpoint; discarding it");
+            self.discard(g)?;
+        }
+        if let Some(g) = latest {
+            match restorable(g) {
+                Ok(()) => {}
+                Err(e @ RuntimeError::CheckpointIncompatible(_)) => {
+                    tracing::error!(orb = %orb, generation = g, error = %e, "checkpoint cannot be restored; discarding it, the orb will cold-boot");
+                    self.discard(g)?;
+                    latest = None;
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(latest)
     }
@@ -168,4 +179,63 @@ impl Checkpoints {
 /// Size of a checkpoint file, for manifests and compatibility checks.
 pub fn file_len(path: &Path) -> Result<u64, RuntimeError> {
     std::fs::metadata(path).map(|m| m.len()).map_err(io_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn publish(cps: &Checkpoints, g: u64, consumed: bool) {
+        let dir = cps.published(g);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory"), b"ram").unwrap();
+        std::fs::write(dir.join(MANIFEST), b"{}").unwrap();
+        if consumed {
+            std::fs::write(dir.join("consumed"), b"").unwrap();
+        }
+    }
+
+    fn on_disk(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Only the newest unconsumed checkpoint stays on disk, and only if it can be
+    /// restored: consumed, superseded and unrestorable ones never are, so they are
+    /// deleted rather than kept forever.
+    #[test]
+    fn settle_keeps_only_the_restorable_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("checkpoints");
+        let cps = Checkpoints::new(OrbId::generate(), dir.clone(), tmp.path().join("trash"));
+        publish(&cps, 2, true);
+        publish(&cps, 9, false);
+        publish(&cps, 10, false);
+        std::fs::create_dir_all(cps.tmp(11)).unwrap();
+
+        assert_eq!(cps.settle(|_| Ok(())).unwrap(), Some(10));
+        assert_eq!(on_disk(&dir), ["10"]);
+        assert!(!cps.is_consumed(10));
+
+        // A failure to check (here a read error) keeps the checkpoint for next time.
+        let unreadable = |_| Err(RuntimeError::Other("kernel: Input/output error".into()));
+        assert!(cps.settle(unreadable).is_err());
+        assert_eq!(on_disk(&dir), ["10"]);
+        assert!(!cps.is_consumed(10));
+
+        let incompatible = |_| Err(RuntimeError::CheckpointIncompatible("new QEMU".into()));
+        assert_eq!(cps.settle(incompatible).unwrap(), None);
+        assert!(on_disk(&dir).is_empty());
+        assert!(cps.is_consumed(10));
+
+        // Before a cold boot every published checkpoint goes, consumed or not.
+        publish(&cps, 12, true);
+        publish(&cps, 13, false);
+        cps.discard_all().unwrap();
+        assert!(on_disk(&dir).is_empty());
+    }
 }
