@@ -4,7 +4,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `mkdir -p` with mode 0700 for the directories it creates.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -67,8 +67,17 @@ pub fn rename_durable(from: &Path, to: &Path) -> std::io::Result<()> {
 /// step, so a crash never leaves a half-deleted artifact in place), then deleting it.
 /// Missing paths are fine.
 pub fn remove_via_trash(path: &Path, trash: &Path) -> std::io::Result<()> {
+    match move_to_trash(path, trash)? {
+        Some(dest) => remove(&dest),
+        None => Ok(()),
+    }
+}
+
+/// The first step of [`remove_via_trash`]: renames `path` into `trash` under a unique
+/// name and returns that name (None if `path` is missing). Delete it with [`remove`].
+pub fn move_to_trash(path: &Path, trash: &Path) -> std::io::Result<Option<PathBuf>> {
     if std::fs::symlink_metadata(path).is_err() {
-        return Ok(());
+        return Ok(None);
     }
     std::fs::create_dir_all(trash)?;
     let name = format!(
@@ -80,10 +89,15 @@ pub fn remove_via_trash(path: &Path, trash: &Path) -> std::io::Result<()> {
     );
     let dest = trash.join(name);
     rename_durable(path, &dest)?;
-    if dest.is_dir() {
-        std::fs::remove_dir_all(&dest)
+    Ok(Some(dest))
+}
+
+/// Deletes a file or directory tree.
+pub fn remove(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
     } else {
-        std::fs::remove_file(&dest)
+        std::fs::remove_file(path)
     }
 }
 

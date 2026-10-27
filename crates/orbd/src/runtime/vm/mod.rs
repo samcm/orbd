@@ -208,6 +208,22 @@ async fn shrink_ext4(ctx: &OpContext, raw: &Path) -> Result<(), RuntimeError> {
         .map_err(io_err)
 }
 
+/// Whether the project snapshot `key` is already published; if so, records its use
+/// under [`BASES`], so garbage collection cannot delete it as it is named again.
+pub async fn reuse_project(
+    ctx: &OpContext,
+    state_dir: &Path,
+    key: &ProjectSnapshotKey,
+) -> Result<bool, RuntimeError> {
+    let dir = state_dir.join("projects").join(key.as_str());
+    let _bases = bounded(ctx, BASES.read()).await?;
+    if !dir.join("disk.raw").is_file() {
+        return Ok(false);
+    }
+    mark_used(&dir);
+    Ok(true)
+}
+
 /// Publishes the project snapshot `<state>/projects/<key>/{disk.raw, meta.json}`:
 /// `write_raw` fills a standalone raw disk in staging, which is shrunk to its used size,
 /// fsynced and renamed into place. The format is the same for every VM runtime.
@@ -246,7 +262,13 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
         return Err(e);
     }
     let dest = state_dir.join("projects").join(key.as_str());
-    let _bases = BASES.read().await;
+    let _bases = match bounded(ctx, BASES.read()).await {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = remove_via_trash(&staging, &trash);
+            return Err(e);
+        }
+    };
     if dest.exists() {
         remove_via_trash(&dest, &trash).map_err(io_err)?;
     }

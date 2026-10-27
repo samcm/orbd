@@ -13,7 +13,7 @@
 use super::{Shared, db};
 use crate::runtime::vm::{self, BASES};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,26 +38,30 @@ async fn collect(sh: &Arc<Shared>) {
     if !state.join("orbs").is_dir() {
         return; // No VM runtime has run here.
     }
-    let images = sh.images.clone();
-    let _bases = BASES.write().await;
-    let result = tokio::task::spawn_blocking(move || {
-        let in_use = orb_bases(&state)?;
-        let projects = collect_projects(&state, &in_use, IDLE);
-        let images = match &images {
-            Some(store) => {
-                let keys = in_use
-                    .iter()
-                    .filter_map(|b| b.strip_prefix("images/"))
-                    .map(str::to_owned)
-                    .collect();
-                store.collect_garbage(&keys, IDLE)
-            }
-            None => Vec::new(),
-        };
-        Ok::<_, String>((projects, images))
-    })
-    .await;
-    let (projects, images) = match result {
+    // Under the lock, doomed bases are only renamed into the trash; deleting them (some
+    // GiB each) waits until disk creation may go on.
+    let bases = BASES.write().await;
+    let found = {
+        let (state, images) = (state.clone(), sh.images.clone());
+        tokio::task::spawn_blocking(move || {
+            let in_use = orb_bases(&state)?;
+            let projects = collect_projects(&state, &in_use, IDLE);
+            let images = match &images {
+                Some(store) => {
+                    let keys = in_use
+                        .iter()
+                        .filter_map(|b| b.strip_prefix("images/"))
+                        .map(str::to_owned)
+                        .collect();
+                    store.collect_garbage(&keys, IDLE)
+                }
+                None => Vec::new(),
+            };
+            Ok::<_, String>((projects, images))
+        })
+        .await
+    };
+    let (projects, images) = match found {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::warn!("garbage collection skipped: {e}");
@@ -68,16 +72,9 @@ async fn collect(sh: &Arc<Shared>) {
             return;
         }
     };
-    if projects.is_empty() && images.is_empty() {
-        return;
-    }
-    tracing::info!(
-        ?projects,
-        ?images,
-        "deleted project snapshots and images no orb is built on, unused for {}h",
-        IDLE.as_secs() / 3600
-    );
-    for key in projects {
+    // Forgotten before a snapshot of the same key can be published again.
+    for (key, _) in &projects {
+        let key = key.clone();
         if let Err(e) = sh
             .db
             .call(move |c| db::forget_project_snapshot(c, &key))
@@ -85,6 +82,40 @@ async fn collect(sh: &Arc<Shared>) {
         {
             tracing::warn!(error = %e, "forgetting a deleted project snapshot");
         }
+    }
+    drop(bases);
+
+    let mut trashed: Vec<_> = projects
+        .iter()
+        .chain(&images)
+        .map(|(_, t)| t.clone())
+        .collect();
+    if let Some(store) = sh.images.clone() {
+        trashed.extend(
+            tokio::task::spawn_blocking(move || store.collect_blobs(IDLE))
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    let removed = tokio::task::spawn_blocking(move || {
+        for t in &trashed {
+            if let Err(e) = vm::fsutil::remove(t) {
+                tracing::warn!(path = %t.display(), error = %e, "deleting from the trash");
+            }
+        }
+    })
+    .await;
+    if let Err(e) = removed {
+        tracing::warn!("garbage collection failed: {e}");
+    }
+    if !projects.is_empty() || !images.is_empty() {
+        let keys = |v: &[(String, PathBuf)]| v.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        tracing::info!(
+            projects = ?keys(&projects),
+            images = ?keys(&images),
+            "deleted project snapshots and images no orb is built on, unused for {}h",
+            IDLE.as_secs() / 3600
+        );
     }
 }
 
@@ -100,7 +131,14 @@ fn orb_bases(state: &Path) -> Result<HashSet<String>, String> {
             continue;
         }
         let path = e.path().join("vm.json");
-        let json = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let json = match std::fs::read(&path) {
+            Ok(j) => j,
+            // Deleted since the listing (orb deletes do not wait for this lock).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !e.path().exists() => {
+                continue;
+            }
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
         let found = crate::runtime::qemu::recipe_bases(&json)
             .or_else(|| crate::runtime::firecracker::recipe_bases(&json))
             .ok_or_else(|| format!("{}: not a recipe this agent knows", path.display()))?;
@@ -109,8 +147,13 @@ fn orb_bases(state: &Path) -> Result<HashSet<String>, String> {
     Ok(bases)
 }
 
-/// Deletes project snapshots not in `in_use` and unused for `idle`; returns their keys.
-fn collect_projects(state: &Path, in_use: &HashSet<String>, idle: Duration) -> Vec<String> {
+/// Moves into the trash every project snapshot not in `in_use` and unused for `idle`;
+/// returns each one's key and path in the trash.
+fn collect_projects(
+    state: &Path,
+    in_use: &HashSet<String>,
+    idle: Duration,
+) -> Vec<(String, PathBuf)> {
     let mut deleted = Vec::new();
     let dir = state.join("projects");
     for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -127,8 +170,9 @@ fn collect_projects(state: &Path, in_use: &HashSet<String>, idle: Duration) -> V
                 continue;
             }
         }
-        match vm::fsutil::remove_via_trash(&path, &state.join("trash")) {
-            Ok(()) => deleted.push(key),
+        match vm::fsutil::move_to_trash(&path, &state.join("trash")) {
+            Ok(Some(t)) => deleted.push((key, t)),
+            Ok(None) => {}
             Err(e) => tracing::warn!(key, error = %e, "deleting an unused project snapshot"),
         }
     }
@@ -200,7 +244,9 @@ mod tests {
             in_use,
             HashSet::from(["projects/built-on".to_owned(), "images/k1".to_owned()])
         );
-        assert_eq!(collect_projects(state, &in_use, IDLE), ["idle"]);
+        let trashed = collect_projects(state, &in_use, IDLE);
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].0, "idle");
         let mut left: Vec<String> = std::fs::read_dir(state.join("projects"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -210,7 +256,11 @@ mod tests {
 
         let broken = state.join("orbs/01a17b00-0000-7000-8000-000000000009");
         std::fs::create_dir_all(&broken).unwrap();
+        assert!(
+            orb_bases(state).is_err(),
+            "an orb directory without vm.json"
+        );
         std::fs::write(broken.join("vm.json"), b"{").unwrap();
-        assert!(orb_bases(state).is_err());
+        assert!(orb_bases(state).is_err(), "an unreadable vm.json");
     }
 }

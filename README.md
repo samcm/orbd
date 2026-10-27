@@ -130,7 +130,8 @@ longer than any thread you might come back to.
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
 in Amp: `orbd orb list` prints every orb's Amp id (`amp-<thread id>`), state and agent,
 and `orbd orb delete <amp orb id>` deletes one the same way. It refuses an orb unless
-it has been asleep, with no job from Amp, for `--min-asleep-mins` (default 60), so an
+it was last seen asleep or stopped at least `--min-asleep-mins` ago (default 60), with
+no job from Amp open or started since (finished jobs are kept for about an hour), so an
 orb in use is never deleted.
 
 Amp never deletes project snapshots either: it reuses one for at most 72 hours, then

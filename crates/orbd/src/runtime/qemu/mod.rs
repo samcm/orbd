@@ -660,7 +660,7 @@ impl QemuRuntime {
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
         // Until the published recipe names the base, garbage collection must not take it.
-        let _bases = super::vm::BASES.read().await;
+        let _bases = bounded(ctx, super::vm::BASES.read()).await?;
         let (base_path, source) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -915,8 +915,12 @@ impl QemuRuntime {
                     m.launch.kernel.path.display()
                 ));
             }
+            // Not knowing is not a mismatch: the checkpoint is kept.
             Err(e) => {
-                return bad(format!("kernel {}: {e}", m.launch.kernel.path.display()));
+                return Err(RuntimeError::Other(format!(
+                    "kernel {}: {e}",
+                    m.launch.kernel.path.display()
+                )));
             }
         }
         match std::fs::metadata(memory) {
@@ -926,7 +930,8 @@ impl QemuRuntime {
                 meta.len(),
                 m.memory_file_bytes
             )),
-            Err(e) => bad(format!("memory file: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bad(format!("memory file: {e}")),
+            Err(e) => Err(io_err(e)),
         }
     }
 
@@ -1247,8 +1252,7 @@ impl Runtime for QemuRuntime {
         ctx: &OpContext,
     ) -> Result<ProjectSnapshotRef, RuntimeError> {
         let done = ProjectSnapshotRef { key: key.clone() };
-        let dest = self.project_dir(key);
-        if dest.join("disk.raw").is_file() {
+        if super::vm::reuse_project(ctx, &self.state_dir, key).await? {
             return Ok(done);
         }
         let _g = bounded(ctx, self.lock(orb.id)).await?;

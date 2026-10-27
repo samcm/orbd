@@ -1501,10 +1501,12 @@ impl Core {
     }
 
     /// Deletes one orb on an operator's request (`orbd orb delete`, e.g. from a job
-    /// that finds archived threads), through the ordinary delete path. Only an orb
-    /// that has been asleep, with no job, for `min_asleep` qualifies, so an orb Amp is
-    /// using is never deleted; checking and queueing here in the actor leaves no gap
-    /// for a spawn to slip in between.
+    /// that finds archived threads), through the ordinary delete path. The orb
+    /// qualifies as [`store::idle_orbs`] judges it with a cutoff `min_asleep` ago: last
+    /// seen asleep or stopped before the cutoff, no open command, and no request
+    /// queued, running, or started since the cutoff (finished requests are pruned
+    /// after about an hour). An orb Amp is using is never deleted; checking and
+    /// queueing here in the actor leaves no gap for a spawn to slip in between.
     async fn delete_asleep(
         &mut self,
         amp_orb_id: AmpOrbId,
@@ -1513,40 +1515,56 @@ impl Core {
     ) -> Result<()> {
         let now = unix_ms_now();
         let cutoff = now.saturating_sub(min_asleep.as_millis() as u64);
+        let mut endpoints: Vec<AmpEndpointId> = self
+            .offerings
+            .values()
+            .map(|o| o.amp_endpoint.clone())
+            .collect();
+        endpoints.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        endpoints.dedup();
         let id = amp_orb_id.clone();
-        let (orb, idle) = self
+        let (orbs, idle) = self
             .db
             .call(move |c| {
-                let Some(orb) = store::live_orbs(c)?
-                    .into_iter()
-                    .find(|o| o.identity.amp_orb_id == id)
-                else {
-                    return Ok((None, false));
-                };
-                let idle = store::idle_orbs(c, cutoff)?.iter().any(|o| o.id == orb.id);
-                Ok((Some(orb), idle))
+                let mut orbs = Vec::new();
+                for ep in &endpoints {
+                    if let Some(o) = store::get_orb_by_identity(c, ep.as_str(), id.as_str())?
+                        && !store::is_tombstoned(c, o.id)?
+                    {
+                        orbs.push(o);
+                    }
+                }
+                let idle: Vec<OrbId> = store::idle_orbs(c, cutoff)?.iter().map(|o| o.id).collect();
+                Ok((orbs, idle))
             })
             .await?;
-        let refusal = match &orb {
-            None => Some(GrpcStatus::not_found(format!("no orb {amp_orb_id}"))),
-            Some(o) if !idle => Some(GrpcStatus::failed_precondition(format!(
-                "{amp_orb_id} is {}; it must be asleep, with no job, for {} min",
-                state_label(&o.observation.state),
-                min_asleep.as_secs() / 60
+        let mins = min_asleep.as_secs() / 60;
+        let refusal = match orbs.as_slice() {
+            [] => Some(GrpcStatus::not_found(format!("no orb {amp_orb_id}"))),
+            [_, _, ..] => Some(GrpcStatus::failed_precondition(format!(
+                "{amp_orb_id} names orbs under {} Amp endpoints",
+                orbs.len()
             ))),
-            Some(o) if !self.offerings.contains_key(&o.offering_id) => {
+            [o] if !idle.contains(&o.id) => Some(GrpcStatus::failed_precondition(format!(
+                "{amp_orb_id} is {} (recorded {} min ago); it must have been last seen asleep \
+                 or stopped at least {mins} min ago, with no job from Amp open or started \
+                 since (finished jobs are kept for about an hour)",
+                state_label(&o.observation.state),
+                now.saturating_sub(o.observation.observed_at_unix_ms) / 60_000
+            ))),
+            [o] if !self.offerings.contains_key(&o.offering_id) => {
                 Some(GrpcStatus::failed_precondition(format!(
                     "{amp_orb_id}'s offering {} is no longer configured",
                     o.offering_id
                 )))
             }
-            Some(_) => None,
+            [_] => None,
         };
         if let Some(status) = refusal {
             let _ = tx.send(Err(status)).await;
             return Ok(());
         }
-        let orb = orb.expect("checked above");
+        let orb = orbs.into_iter().next().expect("checked above");
         tracing::info!(
             orb = %orb.id,
             amp_orb_id = %orb.identity.amp_orb_id,

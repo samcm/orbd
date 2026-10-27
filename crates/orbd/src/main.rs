@@ -77,12 +77,14 @@ enum OrbCommand {
     /// List orbs: Amp orb id, state and for how long, agent, offering.
     List(CoordinatorArgs),
     /// Delete an orb whose thread is gone (Amp sends no delete for an archived thread),
-    /// as if Amp had sent `delete`. Refused unless the orb has been asleep, with no job
-    /// from Amp, for `--min-asleep-mins`. A later spawn starts a fresh orb.
+    /// as if Amp had sent `delete`. Refused unless the orb was last seen asleep or
+    /// stopped at least `--min-asleep-mins` ago, with no job from Amp open or started
+    /// since (the coordinator keeps finished jobs for about an hour). A later spawn
+    /// starts a fresh orb.
     Delete {
         /// Amp orb id (Amp's ORB_ID, `amp-<thread id>`), as `orbd orb list` shows it.
         amp_orb_id: String,
-        /// How long the orb must have been asleep, with no job from Amp.
+        /// How long ago the orb must have been last seen asleep or stopped.
         #[arg(long, default_value_t = 60)]
         min_asleep_mins: u64,
         #[command(flatten)]

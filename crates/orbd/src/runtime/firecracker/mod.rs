@@ -666,7 +666,7 @@ impl FirecrackerRuntime {
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
         // Until the published recipe names the base, garbage collection must not take it.
-        let _bases = super::vm::BASES.read().await;
+        let _bases = bounded(ctx, super::vm::BASES.read()).await?;
         let (base, source) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -903,7 +903,10 @@ impl FirecrackerRuntime {
                         meta.len()
                     ));
                 }
-                Err(e) => return bad(format!("{file}: {e}")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return bad(format!("{file}: {e}"));
+                }
+                Err(e) => return Err(io_err(e)),
             }
         }
         Ok(m)
@@ -1187,13 +1190,7 @@ impl Runtime for FirecrackerRuntime {
         ctx: &OpContext,
     ) -> Result<ProjectSnapshotRef, RuntimeError> {
         let done = ProjectSnapshotRef { key: key.clone() };
-        if self
-            .state_dir
-            .join("projects")
-            .join(key.as_str())
-            .join("disk.raw")
-            .is_file()
-        {
+        if super::vm::reuse_project(ctx, &self.state_dir, key).await? {
             return Ok(done);
         }
         let _g = bounded(ctx, self.locks.lock(orb.id)).await?;

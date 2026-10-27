@@ -130,8 +130,10 @@ impl Checkpoints {
 
     /// With no VMM running: publishes complete saves, discards partial and consumed
     /// ones and all but the newest unconsumed checkpoint, and returns that one if
-    /// `restorable` accepts it. One this host cannot restore exactly is discarded: the
-    /// orb cold-boots and its processes are lost.
+    /// `restorable` accepts it. One this host cannot restore exactly
+    /// (`CheckpointIncompatible`) is discarded: the orb cold-boots and its processes
+    /// are lost. Any other error from `restorable` (e.g. a failed read) is returned and
+    /// the checkpoint is kept for the next attempt.
     pub fn settle(
         &self,
         restorable: impl Fn(u64) -> Result<(), RuntimeError>,
@@ -159,12 +161,16 @@ impl Checkpoints {
             tracing::warn!(orb = %orb, generation = g, "older unconsumed checkpoint; discarding it");
             self.discard(g)?;
         }
-        if let Some(g) = latest
-            && let Err(e) = restorable(g)
-        {
-            tracing::error!(orb = %orb, generation = g, error = %e, "checkpoint cannot be restored; discarding it, the orb will cold-boot");
-            self.discard(g)?;
-            latest = None;
+        if let Some(g) = latest {
+            match restorable(g) {
+                Ok(()) => {}
+                Err(e @ RuntimeError::CheckpointIncompatible(_)) => {
+                    tracing::error!(orb = %orb, generation = g, error = %e, "checkpoint cannot be restored; discarding it, the orb will cold-boot");
+                    self.discard(g)?;
+                    latest = None;
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(latest)
     }
@@ -212,6 +218,12 @@ mod tests {
         std::fs::create_dir_all(cps.tmp(11)).unwrap();
 
         assert_eq!(cps.settle(|_| Ok(())).unwrap(), Some(10));
+        assert_eq!(on_disk(&dir), ["10"]);
+        assert!(!cps.is_consumed(10));
+
+        // A failure to check (here a read error) keeps the checkpoint for next time.
+        let unreadable = |_| Err(RuntimeError::Other("kernel: Input/output error".into()));
+        assert!(cps.settle(unreadable).is_err());
         assert_eq!(on_disk(&dir), ["10"]);
         assert!(!cps.is_consumed(10));
 

@@ -603,9 +603,11 @@ service Orbs {
   // Orbs that exist (not deleted), oldest first.
   rpc ListOrbs(ListOrbsRequest) returns (ListOrbsResponse);
   // Deletes one orb through the ordinary delete path, as if Amp had sent `delete`, and
-  // returns its result. Refused (FAILED_PRECONDITION) unless the orb has been asleep,
-  // with no job from Amp, for at least `min_asleep_secs`, so an orb in use is never
-  // deleted. A later spawn of the same Amp orb id starts a fresh orb.
+  // returns its result. Refused (FAILED_PRECONDITION) unless the coordinator last saw
+  // the orb asleep or stopped at least `min_asleep_secs` ago and no command or request
+  // for it is open or started since then (finished requests are only kept for about
+  // an hour). An orb in use is never deleted. A later spawn of the same Amp orb id
+  // starts a fresh orb.
   rpc DeleteOrb(DeleteOrbRequest) returns (DeleteOrbResponse);
 }
 
