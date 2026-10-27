@@ -45,12 +45,16 @@ FROM base AS base-arm64
 
 FROM base AS base-amd64
 # QEMU from trixie-backports (orbd needs >= 9.0; trixie itself has 10.0). A new QEMU
-# build means sleeping orbs cold-boot once: checkpoints restore only on the exact binary.
+# build means sleeping orbs cold-boot once and agents delete their checkpoints:
+# checkpoints restore only on the exact binary. So the version is pinned, and a build
+# fails once backports drops it; bump it on purpose.
+ARG QEMU_VERSION=1:11.1.2+ds-3~bpo13+4
 RUN printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
         >/etc/apt/sources.list.d/backports.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends e2fsprogs iproute2 nftables \
-    && apt-get install -y --no-install-recommends -t trixie-backports qemu-system-x86 qemu-utils \
+    && apt-get install -y --no-install-recommends -t trixie-backports \
+        "qemu-system-x86=${QEMU_VERSION}" "qemu-utils=${QEMU_VERSION}" \
     && rm -rf /var/lib/apt/lists/* \
     && qemu-system-x86_64 --version
 COPY --from=fetch /umoci /usr/local/bin/umoci
