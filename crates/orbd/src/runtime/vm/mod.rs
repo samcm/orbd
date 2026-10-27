@@ -22,6 +22,35 @@ use std::sync::Arc;
 /// bottleneck).
 pub static SAVES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+/// Base disks (prepared images, project snapshots) in use: a disk is created from a
+/// base under a shared guard held until the orb's recipe names the base, and a project
+/// snapshot is published under one; the agent's garbage collection holds it
+/// exclusively while it decides which bases no orb is built on and deletes them.
+pub static BASES: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Name of the file whose modification time records a base's last use.
+const LAST_USED: &str = "last_used";
+
+/// Records that a base disk directory (`images/<key>`, `projects/<key>`) was used now.
+pub fn mark_used(dir: &Path) {
+    let r = std::fs::File::create(dir.join(LAST_USED))
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    if let Err(e) = r {
+        tracing::warn!(dir = %dir.display(), error = %e, "recording a base's use");
+    }
+}
+
+/// When a base disk directory was last used: published, or used since.
+pub fn last_used(dir: &Path) -> std::io::Result<std::time::SystemTime> {
+    let published = std::fs::metadata(dir)?.modified()?;
+    Ok(
+        match std::fs::metadata(dir.join(LAST_USED)).and_then(|m| m.modified()) {
+            Ok(used) => used.max(published),
+            Err(_) => published,
+        },
+    )
+}
+
 /// Runs a host tool with fixed arguments, bounded by the context; killed if cancelled
 /// or late.
 pub async fn run_tool(
@@ -217,6 +246,7 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
         return Err(e);
     }
     let dest = state_dir.join("projects").join(key.as_str());
+    let _bases = BASES.read().await;
     if dest.exists() {
         remove_via_trash(&dest, &trash).map_err(io_err)?;
     }

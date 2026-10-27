@@ -990,6 +990,7 @@ impl Run {
         self.check()?;
         self.log("deleting orb");
         self.rt.delete(orb_id, &self.ctx).await?;
+        self.sh.orb_deleted.notify_one();
         crate::crash_point!("agent::delete::after_delete");
         let mut f = Finished::ok(ActionResult::Deleted, ProcessDisposition::NotApplicable);
         f.observed = Some(OrbState::known(StableOrbState::Deleted));

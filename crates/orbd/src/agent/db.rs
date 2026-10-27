@@ -529,6 +529,12 @@ pub fn record_project_snapshot(
     Ok(())
 }
 
+/// Forgets a project snapshot deleted from this host.
+pub fn forget_project_snapshot(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM project_snapshots WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 pub fn list_project_snapshots(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut st = conn.prepare("SELECT key FROM project_snapshots ORDER BY key")?;
     st.query_map([], |r| r.get(0))?.collect()

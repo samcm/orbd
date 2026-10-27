@@ -152,6 +152,28 @@ impl BaseDisk {
     }
 }
 
+/// The base disk directories (`images/<key>`, `projects/<key>`) a QEMU orb's `vm.json`
+/// reads through to, or None if `json` is not a QEMU recipe.
+pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
+    let recipe: VmRecipe = serde_json::from_slice(json).ok()?;
+    let mut bases = Vec::new();
+    match serde_json::from_str(&recipe.base.source) {
+        Ok(BaseSource::Image { key, .. }) => bases.push(format!("images/{key}")),
+        Ok(BaseSource::ProjectSnapshot { key }) => bases.push(format!("projects/{key}")),
+        Err(_) => {}
+    }
+    // The backing file itself, whatever the source says.
+    let dir = recipe.base.path.parent()?;
+    if let (Some(kind), Some(key)) = (dir.parent().and_then(|p| p.file_name()), dir.file_name()) {
+        bases.push(format!(
+            "{}/{}",
+            kind.to_string_lossy(),
+            key.to_string_lossy()
+        ));
+    }
+    Some(bases)
+}
+
 /// `checkpoints/<gen>/manifest.json`. Its presence in a `.tmp` directory marks the
 /// memory file complete (QMP `completed`, stream EOF, fsync).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -637,6 +659,8 @@ impl QemuRuntime {
         src: InitialDiskSource,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
+        // Until the published recipe names the base, garbage collection must not take it.
+        let _bases = super::vm::BASES.read().await;
         let (base_path, source) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -664,6 +688,7 @@ impl QemuRuntime {
                         r.key
                     )));
                 }
+                super::vm::mark_used(&self.project_dir(&r.key));
                 (disk, BaseSource::ProjectSnapshot { key: r.key })
             }
         };

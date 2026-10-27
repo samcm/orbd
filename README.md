@@ -133,6 +133,12 @@ and `orbd orb delete <amp orb id>` deletes one the same way. It refuses an orb u
 it has been asleep, with no job from Amp, for `--min-asleep-mins` (default 60), so an
 orb in use is never deleted.
 
+Amp never deletes project snapshots either: it reuses one for at most 72 hours, then
+names a new one. An agent deletes a project snapshot or prepared image once no orb on it
+is built on it and nothing has used it for 72 hours (the current image of a prewarmed
+reference is kept), and image layers no build has used for as long. It checks at
+startup, hourly and after each orb delete.
+
 Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
 `/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores
 them when it starts again,
