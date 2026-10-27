@@ -219,6 +219,18 @@ pub fn idle_orbs(c: &Connection, cutoff_ms: u64) -> Result<Vec<OrbRecord>> {
         .collect())
 }
 
+/// Orbs that are not deleted (or being deleted), oldest first.
+pub fn live_orbs(c: &Connection) -> Result<Vec<OrbRecord>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ORB_COLS} FROM orbs o WHERE retired_ms IS NULL
+           AND NOT EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+         ORDER BY created_ms"
+    ))?;
+    Ok(st
+        .query_map([], orb_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Retires a deleted orb so a new incarnation can take its Amp id.
 pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
     c.execute(

@@ -127,6 +127,12 @@ is used again, its next spawn starts a fresh orb from the image (or project snap
 without its files, uncommitted work or processes, and Amp runs setup again. Set the TTL
 longer than any thread you might come back to.
 
+To delete the orbs of archived threads sooner, run a job that checks each orb's thread
+in Amp: `orbd orb list` prints every orb's Amp id (`amp-<thread id>`), state and agent,
+and `orbd orb delete <amp orb id>` deletes one the same way. It refuses an orb unless
+it has been asleep, with no job from Amp, for `--min-asleep-mins` (default 60), so an
+orb in use is never deleted.
+
 Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
 `/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores
 them when it starts again,
