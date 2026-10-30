@@ -761,6 +761,51 @@ impl FirecrackerRuntime {
 
     // --- save -------------------------------------------------------------------
 
+    /// Pauses the vCPUs with no guest I/O instruction left half done.
+    ///
+    /// Firecracker 1.17 can acknowledge a pause from a vCPU that handled an MMIO or port
+    /// I/O exit but did not re-enter KVM to finish the instruction (fixed upstream by
+    /// firecracker#6254, unreleased). A snapshot taken then runs that instruction again
+    /// on restore: a written console byte repeats, and a repeated read of the UART's
+    /// interrupt register loses the transmit interrupt the first read consumed, so the
+    /// guest's serial console never prints again. Firecracker logs each such vCPU;
+    /// resuming finishes the instruction, so pause again, after letting the guest's
+    /// burst of I/O (usually console output) go on for a moment, until none is caught.
+    async fn pause(&self, orb: OrbId, ctx: &OpContext) -> Result<(), RuntimeError> {
+        // Firecracker logs the line at most 10 times in a burst; 5 attempts of 2 vCPUs fit.
+        const ATTEMPTS: usize = 5;
+        const RETRY_AFTER: Duration = Duration::from_millis(50);
+        const CAUGHT: &str = "Requested a vCPU run with immediate_exit enabled";
+        let log = self.orb_paths(orb).vmm_log;
+        let caught = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .matches(CAUGHT)
+                .count()
+        };
+        let api = self.api(orb);
+        let mut attempt = 1;
+        loop {
+            let before = caught();
+            bounded(ctx, api.set_state("Paused", API_TIMEOUT))
+                .await?
+                .map_err(api_err)?;
+            if caught() == before {
+                return Ok(());
+            }
+            if attempt == ATTEMPTS {
+                tracing::warn!(orb = %orb, "a vCPU paused mid-I/O {ATTEMPTS} times; saving anyway");
+                return Ok(());
+            }
+            tracing::info!(orb = %orb, attempt, "a vCPU paused mid-I/O; resuming to finish it");
+            bounded(ctx, api.set_state("Resumed", API_TIMEOUT))
+                .await?
+                .map_err(api_err)?;
+            bounded(ctx, tokio::time::sleep(RETRY_AFTER)).await?;
+            attempt += 1;
+        }
+    }
+
     /// pause → snapshot into a fresh `<gen>.tmp` → disk fsync → manifest. Leaves the
     /// VMM paused; the caller kills it and publishes.
     async fn save(
@@ -775,9 +820,7 @@ impl FirecrackerRuntime {
         let record: LaunchRecord = process::read_record(&self.run_paths(orb).launch)
             .ok_or_else(|| RuntimeError::Other("launch record is missing".into()))?;
         let api = self.api(orb);
-        bounded(ctx, api.set_state("Paused", API_TIMEOUT))
-            .await?
-            .map_err(api_err)?;
+        self.pause(orb, ctx).await?;
         crate::crash_point!("firecracker::save::after_stop");
 
         let tmp = self.checkpoints(orb).fresh_tmp(generation)?;
