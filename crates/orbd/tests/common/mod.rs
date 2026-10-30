@@ -234,7 +234,8 @@ offerings:
         self.start_agent(id, "");
     }
 
-    /// Starts the coordinator and all agents and waits until every agent is connected.
+    /// Starts the coordinator and all agents and waits until every agent is connected
+    /// and has reported its disk (admission refuses an agent's first orb until then).
     pub fn start_all(&mut self) {
         self.start_coordinator("");
         let ids: Vec<String> = self.agents.keys().cloned().collect();
@@ -242,6 +243,15 @@ offerings:
             self.start_agent(a, "");
         }
         self.wait_connected(ids.len());
+        wait_until(
+            Duration::from_secs(20),
+            "agents reported their disks",
+            || {
+                let m = self.metrics().unwrap_or_default();
+                ids.iter()
+                    .all(|a| m.contains(&format!("orbd_agent_disk_free_bytes{{agent=\"{a}\"}}")))
+            },
+        );
     }
 
     /// Hard-kills (SIGKILL) a process, like a power cut.
@@ -299,14 +309,19 @@ offerings:
         self.root().join("coordinator/dispatch.sock")
     }
 
-    pub fn connected_agents(&self) -> Option<u64> {
+    fn metrics(&self) -> Option<String> {
         let mut s = TcpStream::connect(("127.0.0.1", self.metrics_port)).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         s.write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
             .ok()?;
         let mut body = String::new();
         s.read_to_string(&mut body).ok()?;
-        body.lines()
+        Some(body)
+    }
+
+    pub fn connected_agents(&self) -> Option<u64> {
+        self.metrics()?
+            .lines()
             .find(|l| l.starts_with("orbd_fleet_connected_agents"))
             .and_then(|l| l.split_whitespace().last())
             .and_then(|v| v.parse::<f64>().ok())
