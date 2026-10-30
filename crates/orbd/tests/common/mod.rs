@@ -299,23 +299,42 @@ offerings:
         self.root().join("coordinator/dispatch.sock")
     }
 
-    pub fn connected_agents(&self) -> Option<u64> {
+    fn metrics(&self) -> Option<String> {
         let mut s = TcpStream::connect(("127.0.0.1", self.metrics_port)).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         s.write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")
             .ok()?;
         let mut body = String::new();
         s.read_to_string(&mut body).ok()?;
-        body.lines()
+        Some(body)
+    }
+
+    pub fn connected_agents(&self) -> Option<u64> {
+        self.metrics()?
+            .lines()
             .find(|l| l.starts_with("orbd_fleet_connected_agents"))
             .and_then(|l| l.split_whitespace().last())
             .and_then(|v| v.parse::<f64>().ok())
             .map(|v| v as u64)
     }
 
+    /// Waits until `n` agents are connected and have each sent a heartbeat: placement
+    /// refuses an agent whose disk it has not heard about yet.
     pub fn wait_connected(&self, n: usize) {
         wait_until(Duration::from_secs(20), "agents connected", || {
-            self.connected_agents() == Some(n as u64)
+            let Some(m) = self.metrics() else {
+                return false;
+            };
+            let connected = m
+                .lines()
+                .find(|l| l.starts_with("orbd_fleet_connected_agents"))
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse::<f64>().ok());
+            let reported = m
+                .lines()
+                .filter(|l| l.starts_with("orbd_agent_disk_free_bytes{"))
+                .count();
+            connected == Some(n as f64) && reported >= n
         });
     }
 

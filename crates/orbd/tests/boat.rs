@@ -318,3 +318,72 @@ fn boat_orb_lifecycle() {
     }
     assert!(!c.logs().contains(TOKEN), "orb token in a log");
 }
+
+/// An agent with room for one orb, and the offering spills to Boat: the second new orb
+/// goes to Boat, and wakes there again after a pause even once the agent has room.
+#[test]
+fn new_orbs_spill_to_boat_only_when_the_agents_are_full() {
+    let (fake, url) = FakeBoat::start();
+    let mut c = Cluster::new(&["agent-a"], 1);
+    let key = c.root().join("boat-key");
+    std::fs::write(&key, format!("{API_KEY}\n")).unwrap();
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let offering = c.offering.clone();
+    let head = yaml.split("offerings:").next().unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{head}boat:\n  api_key_file: {}\n  capacity: {{ vcpus: 4, memory_mib: 8192 }}\n  \
+             auto_stop_secs: 7200\n  api_url: {url}\n\
+             offerings:\n  - id: {offering}\n    runtime: fake\n    \
+             resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}\n    \
+             spill_to: [boat-2vcpu-4gb]\n  - id: boat-2vcpu-4gb\n    runtime: boat\n    \
+             resources: {{ vcpus: 2, memory_mib: 4096, disk_gib: 51 }}\n",
+            key.display()
+        ),
+    )
+    .unwrap();
+    c.start_all();
+
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
+    assert_eq!(
+        c.fake_orbs("agent-a").len(),
+        1,
+        "the first orb is on the agent"
+    );
+    assert!(fake.lock().unwrap().sandboxes.is_empty());
+
+    let second = c.dispatch("spawn", "amp-2", &[]);
+    assert_ok(&second, "second spawn");
+    assert!(
+        second.stdout.contains("creating a small Boat sandbox"),
+        "the second orb did not spill:\n{}{}",
+        second.stdout,
+        second.stderr
+    );
+    assert_eq!(c.fake_orbs("agent-a").len(), 1);
+    assert_eq!(fake.lock().unwrap().sandboxes.len(), 1);
+
+    // Room on the agent again; the spilled orb still lives on Boat.
+    assert_ok(
+        &c.dispatch("delete", "amp-1", &[]),
+        "delete the agent's orb",
+    );
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause the spilled orb");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "wake the spilled orb");
+    {
+        let f = fake.lock().unwrap();
+        assert_eq!(f.sandboxes.values().next().unwrap().state, "ready");
+        assert_eq!(f.calls.iter().filter(|c| c.ends_with("/resume")).count(), 1);
+    }
+    assert!(
+        c.fake_orbs("agent-a").iter().all(|o| !o.running),
+        "the spilled orb woke on the agent"
+    );
+    assert_ok(
+        &c.dispatch("delete", "amp-2", &[]),
+        "delete the spilled orb",
+    );
+    assert!(fake.lock().unwrap().sandboxes.is_empty());
+}

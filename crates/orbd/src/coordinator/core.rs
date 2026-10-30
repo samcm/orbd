@@ -704,15 +704,16 @@ impl Core {
             plan.tombstone = Some((head.amp_endpoint.to_string(), head.amp_orb_id.to_string()));
         }
 
-        let Some(backend) = self.backends.get(&offering.backend_id).cloned() else {
-            return Ok(Err(refuse(
-                FailureCode::BackendUnavailable,
-                "backend not configured",
-            )));
-        };
-
         match orb {
             Some(orb) => {
+                // An existing orb lives on its own backend, which differs from the
+                // offering's when the orb was spilled.
+                let Some(backend) = self.backends.get(orb.location.backend_id()).cloned() else {
+                    return Ok(Err(refuse(
+                        FailureCode::BackendUnavailable,
+                        "backend not configured",
+                    )));
+                };
                 // Existing orb: never re-place.
                 let template = &orb.spec.template;
                 let cands = self
@@ -791,78 +792,40 @@ impl Core {
                 let snap_key = snapshot_id
                     .as_deref()
                     .map(ProjectSnapshotKey::from_external);
-                let cands = self
-                    .candidates(
-                        &backend,
-                        PlacementRequest {
-                            target: offering.spec.target.clone(),
-                            resources: offering.spec.resources,
-                            existing: None,
-                            project_snapshot: snap_key.clone(),
-                        },
-                    )
-                    .await;
-                let available: Vec<PlacementCandidate> = cands
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|c| {
-                        c.availability == Availability::Available
-                            && c.capabilities.check(&offering.spec).is_empty()
-                    })
-                    .collect();
-                if available.is_empty() {
-                    return Ok(Err(refuse(
-                        FailureCode::BackendUnavailable,
-                        "no available host can run this offering",
-                    )));
-                }
-                let demand = self.demand(&offering.spec);
-                let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();
-                let mut refusals: Vec<(String, Vec<(FailureCode, String)>)> = Vec::new();
-                for cand in available {
-                    let used = self.pool_used(&cand, None).await?;
-                    let short = shortfalls(&cand, &used, demand);
-                    if short.is_empty() {
-                        let free = cand
-                            .capacity_ceiling
-                            .memory_bytes
-                            .saturating_sub(used.held.memory_bytes);
-                        fitting.push((cand, free));
-                    } else {
-                        refusals.push((cand.capacity_pool.clone(), short));
+                // The offering's own hosts first, then its spill_to offerings in order.
+                let mut placed = self.place_new(offering, snap_key.as_ref()).await?;
+                if let Err(first) = &placed {
+                    let mut tried = Vec::new();
+                    for id in &offering.spill_to {
+                        let Some(target) = self.offerings.get(id).cloned() else {
+                            continue;
+                        };
+                        match self.place_new(&target, snap_key.as_ref()).await? {
+                            Ok(p) => {
+                                tracing::info!(
+                                    offering = %offering.id,
+                                    spill_to = %target.id,
+                                    amp_orb_id = %head.amp_orb_id,
+                                    reason = %first.message,
+                                    "spilling a new orb"
+                                );
+                                metrics::counter!("orbd_spills_total", "offering" => offering.id.to_string(), "to" => target.id.to_string()).increment(1);
+                                placed = Ok(p);
+                                break;
+                            }
+                            Err(r) => tried.push(format!("{}: {}", target.id, r.message)),
+                        }
+                    }
+                    if let Err(first) = &mut placed
+                        && !tried.is_empty()
+                    {
+                        first.message = format!("{}; spill: {}", first.message, tried.join("; "));
                     }
                 }
-                if fitting.is_empty() {
-                    let hosts: Vec<String> = refusals
-                        .iter()
-                        .map(|(pool, short)| format!("{pool}: {}", describe(short)))
-                        .collect();
-                    return Ok(Err(refuse(
-                        limiting(&refusals),
-                        format!(
-                            "no host has capacity for this orb ({} vCPUs, {} memory, {} disk \
-                             headroom); {}",
-                            demand.vcpus,
-                            gib(demand.memory_bytes),
-                            gib(demand.disk_bytes),
-                            hosts.join("; ")
-                        ),
-                    )));
-                }
-                // Prefer a host holding the project snapshot (v1: snapshots are
-                // host-local); otherwise fall back to the base image for this new orb.
-                if snap_key.is_some() && fitting.iter().any(|(c, _)| c.has_project_snapshot) {
-                    fitting.retain(|(c, _)| c.has_project_snapshot);
-                }
-                let (chosen, _) = fitting
-                    .into_iter()
-                    .max_by(|(a, fa), (b, fb)| {
-                        fa.cmp(fb).then_with(|| {
-                            let (ja, jb) = (js(&a.location), js(&b.location));
-                            jb.cmp(&ja)
-                        })
-                    })
-                    .expect("non-empty");
+                let (chosen, demand, template) = match placed {
+                    Ok(p) => p,
+                    Err(r) => return Ok(Err(r)),
+                };
                 let initial_disk = match &snap_key {
                     Some(k) if chosen.has_project_snapshot => InitialDiskSource::ProjectSnapshot {
                         snapshot: ProjectSnapshotRef { key: k.clone() },
@@ -873,7 +836,7 @@ impl Core {
                     },
                 };
                 let spec = OrbSpec {
-                    template: offering.spec.clone(),
+                    template,
                     initial_disk,
                 };
                 let spec_digest = spec.digest();
@@ -915,6 +878,94 @@ impl Core {
                 Ok(Ok(plan))
             }
         }
+    }
+
+    /// Places a new orb of `offering` on one of its backend's hosts: the chosen
+    /// candidate, what the orb reserves there, and the spec template it runs with.
+    async fn place_new(
+        &self,
+        offering: &Offering,
+        snap_key: Option<&ProjectSnapshotKey>,
+    ) -> Result<std::result::Result<(PlacementCandidate, Resources, SpecTemplate), Refusal>> {
+        let Some(backend) = self.backends.get(&offering.backend_id).cloned() else {
+            return Ok(Err(refuse(
+                FailureCode::BackendUnavailable,
+                "backend not configured",
+            )));
+        };
+        let cands = self
+            .candidates(
+                &backend,
+                PlacementRequest {
+                    target: offering.spec.target.clone(),
+                    resources: offering.spec.resources,
+                    existing: None,
+                    project_snapshot: snap_key.cloned(),
+                },
+            )
+            .await;
+        let available: Vec<PlacementCandidate> = cands
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| {
+                c.availability == Availability::Available
+                    && c.capabilities.check(&offering.spec).is_empty()
+            })
+            .collect();
+        if available.is_empty() {
+            return Ok(Err(refuse(
+                FailureCode::BackendUnavailable,
+                "no available host can run this offering",
+            )));
+        }
+        let demand = self.demand(&offering.spec);
+        let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();
+        let mut refusals: Vec<(String, Vec<(FailureCode, String)>)> = Vec::new();
+        for cand in available {
+            let used = self.pool_used(&cand, None).await?;
+            let short = shortfalls(&cand, &used, demand);
+            if short.is_empty() {
+                let free = cand
+                    .capacity_ceiling
+                    .memory_bytes
+                    .saturating_sub(used.held.memory_bytes);
+                fitting.push((cand, free));
+            } else {
+                refusals.push((cand.capacity_pool.clone(), short));
+            }
+        }
+        if fitting.is_empty() {
+            let hosts: Vec<String> = refusals
+                .iter()
+                .map(|(pool, short)| format!("{pool}: {}", describe(short)))
+                .collect();
+            return Ok(Err(refuse(
+                limiting(&refusals),
+                format!(
+                    "no host has capacity for this orb ({} vCPUs, {} memory, {} disk \
+                             headroom); {}",
+                    demand.vcpus,
+                    gib(demand.memory_bytes),
+                    gib(demand.disk_bytes),
+                    hosts.join("; ")
+                ),
+            )));
+        }
+        // Prefer a host holding the project snapshot (v1: snapshots are
+        // host-local); otherwise fall back to the base image for this new orb.
+        if snap_key.is_some() && fitting.iter().any(|(c, _)| c.has_project_snapshot) {
+            fitting.retain(|(c, _)| c.has_project_snapshot);
+        }
+        let (chosen, _) = fitting
+            .into_iter()
+            .max_by(|(a, fa), (b, fb)| {
+                fa.cmp(fb).then_with(|| {
+                    let (ja, jb) = (js(&a.location), js(&b.location));
+                    jb.cmp(&ja)
+                })
+            })
+            .expect("non-empty");
+        Ok(Ok((chosen, demand, offering.spec.clone())))
     }
 
     /// Re-seals a queued request's guest env under the new operation id.

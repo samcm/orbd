@@ -140,6 +140,13 @@ is built on it and nothing has used it for 72 hours (the current image of a prew
 reference is kept), and image layers no build has used for as long. It checks at
 startup, hourly and after each orb delete.
 
+An offering can list `spill_to` offerings: when none of its hosts can take a new orb
+(all full, down or unreported), the first listed offering that can takes it instead,
+e.g. a Firecracker offering spilling to a Boat size when the homelab is full. Targets
+must be like-for-like: `/dev/kvm` in the orb on both or neither, and at least as many
+vCPUs and as much memory. An orb lives where it was placed, so a spilled orb wakes on
+its spill target for the rest of its life. Resumes never spill.
+
 The coordinator keeps the Amp CLI current with `amp update` (every
 `amp_cli_update_interval_secs`, 6 h by default) and puts each new version on probation.
 The first spawn it runs that succeeds makes it the known-good CLI, kept as a copy in
