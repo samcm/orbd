@@ -19,7 +19,7 @@ creates and stops them. The obvious version, a container per orb, falls short:
 
 orbd runs each orb in a VM that sleeps to disk: a sleeping orb uses no host RAM, wakes in
 about 0.3 s with its processes intact, and has `/dev/kvm`. One coordinator serves many
-hosts, and later hosted sandboxes such as E2B.
+hosts, and hosted [Boat](#boat) sandboxes.
 
 ## How it works
 
@@ -154,6 +154,33 @@ namespace behind NAT and cannot reach the agent itself or each other. A sleeping
 VMM build and CPU it slept on, so after an upgrade it cold-boots once; the agent deletes
 such memory checkpoints when it starts, as it deletes every checkpoint that was restored
 or superseded.
+
+## Boat
+
+The coordinator can also run orbs as [Boat](https://boat.dev) sandboxes, with no agent:
+it drives Boat's API itself. Add a `boat:` section and offerings with `runtime: boat`
+whose vCPUs and memory are a Boat size (`small` 2/4096, `default` 4/8192, `large`
+8/16384, `xlarge` 16/32768; the free trial has only the first two):
+
+```yaml
+idle_orb_ttl_days: 7                       # below Boat's 14 days, see below
+boat:
+  api_key_file: /etc/orbd/tokens/boat      # a boat_... API key
+  capacity: { vcpus: 4, memory_mib: 8192 } # what running Boat orbs may hold together
+  auto_stop_secs: 86400                    # optional; Boat stops a forgotten orb (0: never)
+offerings:
+  - id: boat-2vcpu-4gb
+    runtime: boat
+    resources: { vcpus: 2, memory_mib: 4096, disk_gib: 51 }
+    provider_token_file: /etc/orbd/tokens/boat-2vcpu-4gb
+```
+
+Orbs run on Boat's Ubuntu machine, not Amp's orb image; the first spawn installs the
+Amp CLI. Sandboxes get none of the Boat account's secrets (`noEnv`). A pause stops the
+sandbox: Boat keeps its disk, not its processes, and bills nothing for it, but deletes
+the disk after 14 days stopped, so keep `idle_orb_ttl_days` below 14 (an orb whose disk
+expired anyway starts again from a fresh sandbox). Project snapshots are not supported.
+The coordinator keeps its Boat bookkeeping in `boat.sqlite` in its state directory.
 
 ## License
 

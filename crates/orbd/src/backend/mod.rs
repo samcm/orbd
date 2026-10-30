@@ -7,8 +7,8 @@
 //! reports acceptance/progress/logs/completion as [`BackendEvent`]s.
 //!
 //! Executors (durable acceptance, execution, terminal receipts) live *behind* a
-//! backend: on agents for the agent fleet ([`fleet`]); inside the coordinator, with
-//! backend-private tables, for a future API backend (E2B, exe.dev, ...).
+//! backend: on agents for the agent fleet ([`fleet`]); inside the coordinator, with a
+//! backend-private store, for API backends ([`boat`]).
 //!
 //! Rules every backend follows:
 //! * `submit` is a delivery attempt. It is neither durable acceptance nor completion.
@@ -18,6 +18,7 @@
 //! * A transport disconnect does not end the event stream or any accepted operation.
 //! * `NotAccepted` in reconciliation requires authoritative receipt evidence.
 
+pub mod boat;
 pub mod fleet;
 
 use crate::model::{

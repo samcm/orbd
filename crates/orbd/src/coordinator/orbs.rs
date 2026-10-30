@@ -36,7 +36,7 @@ impl Orbs for OrbsService {
                 offering_id: o.offering_id.to_string(),
                 agent_id: match &o.location {
                     Location::Fleet { agent_id, .. } => agent_id.to_string(),
-                    Location::External { .. } => String::new(),
+                    Location::External { backend_id, .. } => backend_id.to_string(),
                 },
                 state: state_label(&o.observation.state),
                 observed_unix_ms: o.observation.observed_at_unix_ms,

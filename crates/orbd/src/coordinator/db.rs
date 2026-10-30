@@ -142,13 +142,18 @@ CREATE INDEX join_tokens_agent ON join_tokens (agent_id);
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, SCHEMA, SCHEMA_VERSION)
+    }
+
+    /// Opens a database with its own schema (backend-private stores, e.g. Boat's).
+    pub(crate) fn open_with(path: &Path, schema: &str, version: i64) -> Result<Self> {
         let mut conn =
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, path, schema, version)?;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("orbd-db".into())
@@ -177,20 +182,21 @@ impl Db {
     }
 }
 
-fn migrate(conn: &mut Connection) -> Result<()> {
+fn migrate(conn: &mut Connection, path: &Path, schema: &str, version: i64) -> Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     match current {
-        SCHEMA_VERSION => Ok(()),
+        v if v == version => Ok(()),
         0 => {
             let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.execute_batch(schema)?;
+            tx.pragma_update(None, "user_version", version)?;
             tx.commit()?;
             Ok(())
         }
         v => bail!(
-            "database schema version {v} is not {SCHEMA_VERSION} (this orbd); orbd has no \
-             upgrade path: delete the coordinator state directory to start over"
+            "{}: schema version {v} is not {version} (this orbd); orbd has no upgrade path: \
+             delete the coordinator state directory to start over",
+            path.display()
         ),
     }
 }

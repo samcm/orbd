@@ -11,14 +11,15 @@
 //!     provider_token_file: /etc/orbd/tokens/qemu-4vcpu-8gb
 //! ```
 //!
-//! The coordinator serves one Amp endpoint and one agent fleet; pause policy and
-//! capability requirements follow from each offering's runtime.
+//! The coordinator serves one Amp endpoint, one agent fleet and optionally Boat
+//! (`boat:`, offerings with `runtime: boat`); pause policy and capability requirements
+//! follow from each offering's runtime.
 
 use super::{ConfigError, ResourcesConfig, load_yaml};
 use crate::model::{
-    AmpEndpointId, BackendId, CapabilityRequirements, CheckpointFailurePolicy, ExecutionTarget,
-    NestedKvmRequirement, Offering, OfferingId, PausePolicy, RuntimeKind, SnapshotRequirement,
-    SpecTemplate,
+    AmpEndpointId, BackendId, BackendProfileId, CapabilityRequirements, CheckpointFailurePolicy,
+    ExecutionTarget, NestedKvmRequirement, Offering, OfferingId, PausePolicy, RuntimeKind,
+    SnapshotRequirement, SpecTemplate,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -29,6 +30,8 @@ use std::path::{Path, PathBuf};
 pub const AMP_ENDPOINT: &str = "amp";
 /// Id of the single agent-fleet backend (recorded in every orb's location).
 pub const FLEET_BACKEND: &str = "fleet";
+/// Id of the Boat backend (recorded in the location of every Boat orb).
+pub const BOAT_BACKEND: &str = "boat";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,7 +73,64 @@ pub struct CoordinatorConfig {
     /// image: its files and processes are gone and Amp runs setup again.
     #[serde(default = "default_idle_orb_ttl_days")]
     pub idle_orb_ttl_days: u64,
+    /// Boat (boat.dev) sandboxes for offerings with `runtime: boat`.
+    pub boat: Option<BoatConfig>,
     pub offerings: Vec<OfferingConfig>,
+}
+
+/// `boat:`: runs orbs as Boat sandboxes, driven by the coordinator over Boat's API.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoatConfig {
+    /// File holding the Boat API key (`boat_...`).
+    pub api_key_file: PathBuf,
+    /// What running Boat orbs may hold together (sleeping ones hold nothing): the
+    /// spending cap. Keep it within the plan's "sandboxes at once".
+    pub capacity: BoatCapacity,
+    /// Boat stops a sandbox this long after it was created or resumed, in case Amp
+    /// never pauses it (0 never stops it). The free trial allows at most 7200.
+    #[serde(default = "default_boat_auto_stop")]
+    pub auto_stop_secs: u64,
+    #[serde(default = "default_boat_api_url")]
+    pub api_url: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoatCapacity {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+}
+
+fn default_boat_auto_stop() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_boat_api_url() -> String {
+    "https://boat.dev/api/v1".into()
+}
+
+/// Where an offering's orbs run: a fleet runtime on the agents, or Boat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfferingRuntime {
+    Fake,
+    Docker,
+    Qemu,
+    Firecracker,
+    Boat,
+}
+
+impl OfferingRuntime {
+    fn fleet(self) -> Option<RuntimeKind> {
+        match self {
+            Self::Fake => Some(RuntimeKind::Fake),
+            Self::Docker => Some(RuntimeKind::Docker),
+            Self::Qemu => Some(RuntimeKind::Qemu),
+            Self::Firecracker => Some(RuntimeKind::Firecracker),
+            Self::Boat => None,
+        }
+    }
 }
 
 fn default_running_orb_disk_headroom_gib() -> u64 {
@@ -112,35 +172,57 @@ pub struct OfferingConfig {
     /// `AMP_ORB_PROVIDER_TOKEN` for this offering's `amp orb provider` child.
     /// When absent the offering is served for local dispatch only (tests).
     pub provider_token_file: Option<PathBuf>,
-    pub runtime: RuntimeKind,
+    pub runtime: OfferingRuntime,
+    /// For `runtime: boat`, the vCPUs and memory of a Boat size (see
+    /// [`crate::backend::boat::SIZES`]).
     pub resources: ResourcesConfig,
 }
 
 impl OfferingConfig {
     /// Pause policy and requirements are what the runtime is for: VM runtimes keep
     /// memory across sleep (falling back to a cold stop) and QEMU gives orbs `/dev/kvm`;
-    /// Docker sleeps to disk. Every fleet runtime releases compute while paused.
+    /// Docker and Boat sleep to disk. Every runtime releases compute while paused.
     pub fn to_offering(&self) -> Result<Offering, ConfigError> {
         let pause_policy = match self.runtime {
-            RuntimeKind::Docker => PausePolicy::DiskOnly,
-            RuntimeKind::Qemu | RuntimeKind::Firecracker | RuntimeKind::Fake => {
+            OfferingRuntime::Docker | OfferingRuntime::Boat => PausePolicy::DiskOnly,
+            OfferingRuntime::Qemu | OfferingRuntime::Firecracker | OfferingRuntime::Fake => {
                 PausePolicy::MemoryPreserving {
                     on_failure: CheckpointFailurePolicy::ColdStop,
                 }
             }
         };
         let nested_kvm = match self.runtime {
-            RuntimeKind::Qemu => NestedKvmRequirement::GuestDevice,
+            OfferingRuntime::Qemu => NestedKvmRequirement::GuestDevice,
             _ => NestedKvmRequirement::NotRequired,
+        };
+        let (backend, target) = match self.runtime.fleet() {
+            Some(runtime) => (FLEET_BACKEND, ExecutionTarget::Fleet { runtime }),
+            None => {
+                let r = self.resources;
+                let size =
+                    crate::backend::boat::size_for(r.vcpus, r.memory_mib).ok_or_else(|| {
+                        ConfigError::Invalid(format!(
+                            "offering {}: Boat has no size with {} vCPUs and {} MiB; use one of {}",
+                            self.id,
+                            r.vcpus,
+                            r.memory_mib,
+                            crate::backend::boat::describe_sizes()
+                        ))
+                    })?;
+                (
+                    BOAT_BACKEND,
+                    ExecutionTarget::Provider {
+                        profile: BackendProfileId::new(size.name),
+                    },
+                )
+            }
         };
         Ok(Offering {
             id: self.id.clone(),
             amp_endpoint: AmpEndpointId::new(AMP_ENDPOINT),
-            backend_id: BackendId::new(FLEET_BACKEND),
+            backend_id: BackendId::new(backend),
             spec: SpecTemplate {
-                target: ExecutionTarget::Fleet {
-                    runtime: self.runtime,
-                },
+                target,
                 resources: self.resources.to_resources()?,
                 requirements: CapabilityRequirements {
                     release_compute_when_paused: true,
@@ -179,6 +261,17 @@ impl CoordinatorConfig {
                 return inv(format!("offering {}: resources must be non-zero", o.id));
             }
             o.to_offering()?;
+            if o.runtime == OfferingRuntime::Boat && self.boat.is_none() {
+                return inv(format!(
+                    "offering {}: runtime boat needs a `boat:` section",
+                    o.id
+                ));
+            }
+        }
+        if let Some(b) = &self.boat
+            && (b.capacity.vcpus == 0 || b.capacity.memory_mib == 0)
+        {
+            return inv("boat.capacity must be non-zero".into());
         }
         Ok(())
     }

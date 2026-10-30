@@ -38,7 +38,8 @@ pub struct Cluster {
     /// Each agent's join token, passed on every start like a container's ORBD_JOIN.
     tokens: BTreeMap<String, String>,
     agent_orbs: u64,
-    offering: String,
+    /// The offering jobs are dispatched to.
+    pub offering: String,
     /// Extra agent environment, applied last (e.g. `ORBD_CAPACITY_DISK_GIB`).
     pub agent_env: Vec<(String, String)>,
 }
