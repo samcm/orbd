@@ -49,6 +49,15 @@ pub struct DiskReport {
     pub reserve_bytes: u64,
 }
 
+/// One host's memory as its agent last reported it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryReport {
+    /// The host's available memory (MemAvailable).
+    pub available_bytes: u64,
+    /// Available memory admission never hands out.
+    pub reserve_bytes: u64,
+}
+
 /// The default disk reserve of a host: max(10 GiB, 5% of the filesystem). Admission
 /// never hands out a host's reserve; below it every new or waking orb is refused.
 pub fn disk_reserve(total_bytes: u64) -> u64 {

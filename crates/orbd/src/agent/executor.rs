@@ -34,6 +34,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// How long a newly admitted orb's memory counts against the host on top of what the
+/// host reports: a cold boot or a restore takes a while to show up as used.
+const RECENT_ADMIT: Duration = Duration::from_secs(120);
+
 pub(crate) fn runtime_for(sh: &Shared, orb: &OrbDefinition) -> Option<Arc<dyn Runtime>> {
     match &orb.spec.template.target {
         ExecutionTarget::Fleet { runtime } => sh.runtimes.get(runtime).cloned(),
@@ -561,6 +565,11 @@ impl Run {
     /// Local admission: running orbs' vCPUs and memory must never exceed capacity, and
     /// nothing starts on a filesystem below its reserve. The coordinator admits disk by
     /// headroom; orb disk sizes are sparse and are not summed here.
+    ///
+    /// Memory is also admitted by what the host really has: capacity may overcommit
+    /// (guests rarely touch all of theirs, and free-page reporting hands freed pages
+    /// back), so an orb starts only if the host's available memory, less the reserve and
+    /// less what orbs admitted in the last [`RECENT_ADMIT`] may still take, holds it.
     fn admit(&self) -> Result<(), Flow> {
         let need = self.orb().spec.template.resources;
         let mut reserved = self.sh.reserved.lock().unwrap_or_else(|e| e.into_inner());
@@ -576,11 +585,16 @@ impl Run {
         let cap = self.sh.capacity;
         let (free, _) = self.sh.disk_stats();
         let reserve = self.sh.disk_reserve;
+        let mem_short = self.memory_short(need.memory_bytes);
         let (code, what) = match total {
             None => (FailureCode::InsufficientMemory, "resources overflow".into()),
             Some(t) if t.memory_bytes > cap.memory_bytes || t.vcpus > cap.vcpus => {
                 (FailureCode::InsufficientMemory, "memory/cpu".into())
             }
+            Some(_) if mem_short.is_some() => (
+                FailureCode::InsufficientMemory,
+                mem_short.unwrap_or_default(),
+            ),
             Some(_) if free < reserve => (
                 FailureCode::InsufficientDisk,
                 format!(
@@ -591,6 +605,11 @@ impl Run {
             ),
             Some(_) => {
                 reserved.insert(self.orb().id, need);
+                self.sh
+                    .recent_admits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((Instant::now(), need.memory_bytes));
                 return Ok(());
             }
         };
@@ -598,6 +617,35 @@ impl Run {
             code,
             message: format!("agent capacity exceeded ({what})"),
         }))
+    }
+
+    /// Why the host cannot hold `need` bytes more right now, or None if it can.
+    fn memory_short(&self, need: u64) -> Option<String> {
+        let available = self.sh.memory_available()?;
+        let recent: u64 = {
+            let mut r = self
+                .sh
+                .recent_admits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            r.retain(|(t, _)| t.elapsed() < RECENT_ADMIT);
+            r.iter().map(|(_, b)| b).sum()
+        };
+        let room = available
+            .saturating_sub(self.sh.memory_reserve)
+            .saturating_sub(recent);
+        let gib = |b: u64| format!("{:.1} GiB", b as f64 / crate::model::GIB as f64);
+        (need > room).then(|| {
+            format!(
+                "memory: needs {}, {} usable on the host ({} available, {} reserve, {} for \
+                 orbs just started)",
+                gib(need),
+                gib(room),
+                gib(available),
+                gib(self.sh.memory_reserve),
+                gib(recent)
+            )
+        })
     }
 
     // --- spawn --------------------------------------------------------------

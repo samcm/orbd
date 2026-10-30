@@ -192,6 +192,20 @@ pub(crate) async fn capacity(config: &AgentConfig) -> Result<Resources> {
     Ok(c)
 }
 
+/// A `/proc/meminfo` field in bytes, e.g. `MemAvailable:`.
+pub(crate) fn meminfo(field: &str) -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix(field))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|kib| kib * 1024)
+}
+
 /// Physical memory, capped by this process's cgroup limit (v2 or v1).
 fn local_memory() -> Result<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;

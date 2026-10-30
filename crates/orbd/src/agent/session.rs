@@ -114,6 +114,8 @@ pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
         disk_total_bytes: total,
         disk_allocated_bytes: sh.disk_allocated.load(std::sync::atomic::Ordering::Relaxed),
         disk_reserve_bytes: sh.disk_reserve,
+        memory_available_bytes: sh.memory_available().unwrap_or(0),
+        memory_reserve_bytes: sh.memory_reserve,
     }))
 }
 

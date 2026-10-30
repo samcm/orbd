@@ -19,7 +19,7 @@
 //! `Availability::Unavailable` (a disconnect is not evidence their orbs stopped).
 
 pub mod admin;
-mod capabilities;
+pub(crate) mod capabilities;
 mod registry;
 mod server;
 
@@ -599,6 +599,14 @@ impl ComputeBackend for FleetBackend {
                 capacity_ceiling: ceiling,
                 demand: request.resources,
                 disk: slot.heartbeat.as_ref().map(|(hb, _)| disk_report(hb)),
+                memory: slot
+                    .heartbeat
+                    .as_ref()
+                    .filter(|(hb, _)| hb.memory_available_bytes > 0)
+                    .map(|(hb, _)| crate::model::MemoryReport {
+                        available_bytes: hb.memory_available_bytes,
+                        reserve_bytes: hb.memory_reserve_bytes,
+                    }),
                 has_project_snapshot: request
                     .project_snapshot
                     .as_ref()

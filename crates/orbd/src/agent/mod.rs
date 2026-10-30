@@ -66,6 +66,11 @@ pub(crate) struct Shared {
     pub disk_allocated: AtomicU64,
     /// Free disk to keep (see [`crate::model::disk_reserve`]).
     pub disk_reserve: u64,
+    /// Host memory to keep available (see `executor::admit`).
+    pub memory_reserve: u64,
+    /// Memory of orbs admitted lately, whose guests have not yet touched it: the host's
+    /// available memory does not show it yet.
+    pub recent_admits: Mutex<Vec<(std::time::Instant, u64)>>,
     pub tokens: Mutex<HashMap<OperationId, CancellationToken>>,
     pub actors: Mutex<HashMap<OrbId, mpsc::UnboundedSender<executor::Work>>>,
     pub session: Mutex<Option<SessionHandle>>,
@@ -101,6 +106,15 @@ impl Shared {
                     disk_bytes: u64::MAX,
                 })
             })
+    }
+
+    /// The host's available memory; None where it does not bound orbs (the fake
+    /// runtime, whose orbs use none).
+    pub(crate) fn memory_available(&self) -> Option<u64> {
+        if self.config.runtime.fake.is_some() {
+            return None;
+        }
+        detect::meminfo("MemAvailable:")
     }
 
     /// Free and total bytes of the filesystem holding the state directory.
@@ -211,6 +225,11 @@ pub async fn run(
         None => crate::model::disk_reserve(disk_stats(&config).1),
     };
     tracing::info!(disk_reserve_gib = disk_reserve / GIB, "disk reserve");
+    let memory_reserve = match config.agent.capacity.memory_reserve_gib {
+        Some(g) => g.saturating_mul(GIB),
+        None => (4 * GIB).max(detect::meminfo("MemTotal:").unwrap_or(0) / 10),
+    };
+    tracing::info!(memory_reserve_gib = memory_reserve / GIB, "memory reserve");
 
     let mut runtimes: HashMap<RuntimeKind, Arc<dyn Runtime>> = HashMap::new();
     if let Some(fake) = &config.runtime.fake {
@@ -287,6 +306,8 @@ pub async fn run(
         reserved: Mutex::default(),
         disk_allocated: AtomicU64::new(0),
         disk_reserve,
+        memory_reserve,
+        recent_admits: Mutex::default(),
         tokens: Mutex::default(),
         actors: Mutex::default(),
         session: Mutex::default(),

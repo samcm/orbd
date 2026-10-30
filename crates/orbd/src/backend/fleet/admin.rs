@@ -85,6 +85,14 @@ impl Admin for AdminService {
                     disk_total_bytes: d.total_bytes,
                     disk_allocated_bytes: d.allocated_bytes,
                     disk_reserve_bytes: d.reserve_bytes,
+                    memory_available_bytes: s
+                        .heartbeat
+                        .as_ref()
+                        .map_or(0, |(hb, _)| hb.memory_available_bytes),
+                    memory_reserve_bytes: s
+                        .heartbeat
+                        .as_ref()
+                        .map_or(0, |(hb, _)| hb.memory_reserve_bytes),
                     reserved: Some(used.held.into()),
                     orbs: used.orbs,
                     running_orbs: used.running,
@@ -185,8 +193,17 @@ pub async fn cli_list(socket: &std::path::Path) -> anyhow::Result<String> {
         } else {
             "disk not reported".into()
         };
+        let host_mem = if a.memory_available_bytes > 0 {
+            format!(
+                " ({} available on the host, {} kept)",
+                gib(a.memory_available_bytes),
+                gib(a.memory_reserve_bytes)
+            )
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "{}\t{state}\t{} orbs ({} running)\tvCPUs {}/{}\tmemory {}/{}\t{disk}\t\
+            "{}\t{state}\t{} orbs ({} running)\tvCPUs {}/{}\tmemory {}/{}{host_mem}\t{disk}\t\
              certificate expires in {days}d\n",
             a.agent_id,
             a.orbs,
