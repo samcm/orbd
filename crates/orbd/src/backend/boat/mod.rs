@@ -202,6 +202,7 @@ impl ComputeBackend for BoatBackend {
             capacity_pool: POOL.into(),
             capacity_ceiling: self.ceiling,
             demand: request.resources,
+            memory: None,
             disk: Some(DiskReport {
                 free_bytes: self.ceiling.disk_bytes,
                 total_bytes: self.ceiling.disk_bytes,

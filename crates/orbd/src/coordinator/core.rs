@@ -1635,7 +1635,8 @@ fn gib(bytes: u64) -> String {
 }
 
 /// Every resource `cand` lacks for `demand` after the reservations in `used`, with the
-/// numbers. Disk is judged by what the host reports, not by orb disk sizes (sparse): the
+/// numbers. Memory must also fit what the host really has available, less its reserve:
+/// a host's capacity may overcommit memory, and its agent rechecks this at admission. Disk is judged by what the host reports, not by orb disk sizes (sparse): the
 /// filesystem's free space less its reserve, and the agent's disk limit less what orbd
 /// has allocated, must each still hold the headroom of every running orb plus this one.
 fn shortfalls(
@@ -1658,6 +1659,21 @@ fn shortfalls(
                 gib(cap.memory_bytes)
             ),
         ));
+    }
+    if let Some(m) = cand.memory {
+        let room = m.available_bytes.saturating_sub(m.reserve_bytes);
+        if demand.memory_bytes > room && demand.memory_bytes <= free_mem {
+            out.push((
+                FailureCode::InsufficientMemory,
+                format!(
+                    "memory: needs {}, {} usable on the host ({} available, {} reserve)",
+                    gib(demand.memory_bytes),
+                    gib(room),
+                    gib(m.available_bytes),
+                    gib(m.reserve_bytes)
+                ),
+            ));
+        }
     }
     let free_cpu = cap.vcpus.saturating_sub(held.vcpus);
     if demand.vcpus > free_cpu {
@@ -1766,4 +1782,62 @@ fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
     ))
     .expect("serializable");
     hex::encode(Sha256::digest(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentId, BackendId, DiskReport, MemoryReport, RuntimeKind};
+
+    #[test]
+    fn memory_fits_overcommitted_capacity_only_while_the_host_has_it() {
+        let cand = |available_gib: u64| PlacementCandidate {
+            location: Location::Fleet {
+                backend_id: BackendId::new("fleet"),
+                agent_id: AgentId::new("n100".to_owned()),
+            },
+            availability: Availability::Available,
+            capabilities: crate::backend::fleet::capabilities::ceiling(RuntimeKind::Qemu),
+            capacity_pool: "n100".into(),
+            capacity_ceiling: Resources {
+                vcpus: 80,
+                memory_bytes: 88 * GIB,
+                disk_bytes: 1000 * GIB,
+            },
+            demand: Resources::default(),
+            disk: Some(DiskReport {
+                free_bytes: 900 * GIB,
+                total_bytes: 1800 * GIB,
+                allocated_bytes: 100 * GIB,
+                reserve_bytes: 90 * GIB,
+            }),
+            memory: Some(MemoryReport {
+                available_bytes: available_gib * GIB,
+                reserve_bytes: 8 * GIB,
+            }),
+            has_project_snapshot: false,
+        };
+        // Three running orbs reserve 34 GiB and 17 vCPUs nominally, as on 2026-10-30.
+        let used = store::PoolUse {
+            held: Resources {
+                vcpus: 17,
+                memory_bytes: 34 * GIB,
+                disk_bytes: 30 * GIB,
+            },
+            running: 3,
+            orbs: 18,
+        };
+        let demand = Resources {
+            vcpus: 8,
+            memory_bytes: 16 * GIB,
+            disk_bytes: 10 * GIB,
+        };
+        // 34 GiB available - 8 GiB reserve = 26 GiB: a 16 GiB orb fits.
+        assert!(shortfalls(&cand(34), &used, demand).is_empty());
+        // 23 GiB - 8 GiB = 15 GiB: it does not, although capacity has room.
+        let short = shortfalls(&cand(23), &used, demand);
+        assert_eq!(short.len(), 1, "{short:?}");
+        assert_eq!(short[0].0, FailureCode::InsufficientMemory);
+        assert!(short[0].1.contains("usable on the host"), "{}", short[0].1);
+    }
 }

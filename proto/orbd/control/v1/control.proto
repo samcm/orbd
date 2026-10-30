@@ -417,6 +417,10 @@ message Heartbeat {
   // Free space the agent keeps: orbs are refused once free space would drop below it.
   // With disk_total_bytes 0 (an older agent), the coordinator assumes 10 GiB.
   uint64 disk_reserve_bytes = 8;
+  // The host's available memory (MemAvailable) and the part of it the agent keeps:
+  // orbs are refused unless what is left holds them. 0 = not reported.
+  uint64 memory_available_bytes = 9;
+  uint64 memory_reserve_bytes = 10;
 }
 
 message CommandAccepted {
@@ -592,6 +596,9 @@ message AgentInfo {
   uint32 orbs = 12;
   uint32 running_orbs = 13;
   uint64 disk_reserve_bytes = 14;
+  // The host's available memory and the agent's memory reserve (0 = not reported).
+  uint64 memory_available_bytes = 15;
+  uint64 memory_reserve_bytes = 16;
 }
 
 message ListAgentsResponse {

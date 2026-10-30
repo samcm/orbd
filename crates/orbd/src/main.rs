@@ -114,6 +114,10 @@ struct AgentArgs {
     /// Free disk to keep: no orb starts or wakes below it [default: max(10 GiB, 5%)].
     #[arg(long, env = "ORBD_DISK_RESERVE_GIB")]
     disk_reserve_gib: Option<u64>,
+    /// Memory to keep available on the host: no orb starts or wakes unless the host's
+    /// available memory, less this, holds it [default: max(4 GiB, 10% of memory)].
+    #[arg(long, env = "ORBD_MEMORY_RESERVE_GIB")]
+    memory_reserve_gib: Option<u64>,
     /// Prometheus listener, e.g. `127.0.0.1:9465`.
     #[arg(long, env = "ORBD_METRICS_LISTEN")]
     metrics_listen: Option<std::net::SocketAddr>,
@@ -221,6 +225,7 @@ fn main() -> anyhow::Result<()> {
                 memory_mib: a.capacity_memory_mib,
                 disk_gib: a.capacity_disk_gib,
                 disk_reserve_gib: a.disk_reserve_gib,
+                memory_reserve_gib: a.memory_reserve_gib,
             };
             s.metrics_listen = a.metrics_listen;
             config.agent = s;

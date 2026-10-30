@@ -89,6 +89,8 @@ pub struct PlacementCandidate {
     pub demand: Resources,
     /// The location's disk as last reported; None until it reports.
     pub disk: Option<crate::model::DiskReport>,
+    /// The location's memory as last reported; None when it does not report it.
+    pub memory: Option<crate::model::MemoryReport>,
     /// True when the location already holds the requested project snapshot.
     pub has_project_snapshot: bool,
 }

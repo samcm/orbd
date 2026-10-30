@@ -140,6 +140,8 @@ pub struct CapacityOverrides {
     /// Free space to keep on the state directory's filesystem (default: max(10 GiB,
     /// 5% of it)).
     pub disk_reserve_gib: Option<u64>,
+    /// Memory to keep available on the host (default: max(4 GiB, 10% of it)).
+    pub memory_reserve_gib: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
