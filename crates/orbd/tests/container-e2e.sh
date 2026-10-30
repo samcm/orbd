@@ -11,7 +11,8 @@
 # agent's `images.static_images`. Its counter process prints `counter pid=<pid> n=<n>`
 # every second; it must keep its pid and count through pause/wake and through the agent
 # container's restart. Its stand-in bootstrap probes the TCP targets in `E2E_PROBE`: the
-# Firecracker orb must reach the internet but not the agent's namespace. Needs Docker,
+# Firecracker orb must reach the internet but not the agent's namespace. The agent sets a
+# non-default ORBD_GUEST_NETWORK, which both orbs must be addressed in. Needs Docker,
 # /dev/kvm and the internet; nested virtualization is not needed.
 set -euo pipefail
 image=$1
@@ -133,7 +134,8 @@ token=$(docker exec "$coord" orbd join-token agent-1)
 docker run -d --name "$agent" --network "$id" --privileged --stop-timeout 300 \
     -v "$agent:/var/lib/orbd" -v "$work/agent.yaml:/etc/orbd/agent.yaml:ro" \
     -v "$rootfs:/fixture/rootfs.ext4:ro" -e "ORBD_JOIN=$token" -e ORBD_DISK_RESERVE_GIB=2 \
-    -e ORBD_AGENT_CONFIG=/etc/orbd/agent.yaml "$image" agent >/dev/null
+    -e ORBD_AGENT_CONFIG=/etc/orbd/agent.yaml -e ORBD_GUEST_NETWORK=10.200.0.0/24 \
+    "$image" agent >/dev/null
 wait_for 60 "the agent to connect" connected
 agent_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$agent")
 echo "== agent-1 connected ($agent_ip)"
@@ -153,6 +155,14 @@ echo "== firecracker orb: internet $egress, agent namespace $inward"
 [ "$egress" = open ] || fail "the Firecracker orb cannot reach the internet ($egress)"
 [ "$inward" = dropped ] || fail "the Firecracker orb reaches the agent's namespace ($inward)"
 console firecracker | has -F '/dev/kvm is missing' || fail "the Firecracker orb has /dev/kvm"
+# Both orbs use the agent's guest network: addressed in it, and out through its gateway.
+for rt in $runtimes; do
+    console "$rt" | has -F '10.200.0.15/24 via 10.200.0.2' ||
+        fail "the $rt orb is not addressed in ORBD_GUEST_NETWORK"
+done
+qemu_probed() { [ -n "$(probe qemu 1.1.1.1:53)" ]; }
+wait_for 30 "the QEMU orb's network probes" qemu_probed
+[ "$(probe qemu 1.1.1.1:53)" = open ] || fail "the QEMU orb cannot reach the internet"
 
 for rt in $runtimes; do dispatch pause "$rt"; done
 [ "$(vmms)" = 0 ] || fail "a paused orb still has a VMM process"

@@ -551,7 +551,7 @@ impl QemuRuntime {
                 "{KERNEL_CMDLINE} systemd.machine_id={}",
                 machine_id(recipe.orb)
             ),
-            net_args: recipe.net.qemu_args(),
+            net_args: recipe.net.qemu_args().map_err(RuntimeError::Other)?,
             extra_args: Vec::new(),
         }
         .args();
@@ -708,7 +708,7 @@ impl QemuRuntime {
             memory_bytes: res.memory_bytes,
             disk_bytes,
             base,
-            net: NetAttachment::user(orb.id),
+            net: NetAttachment::user(orb.id, self.config.guest_network),
             created_unix_ms: unix_ms_now(),
         };
         let staging = self.state_dir.join("staging").join(format!(

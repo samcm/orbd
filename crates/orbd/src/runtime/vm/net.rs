@@ -1,25 +1,28 @@
 //! Agent-local network attachment for one VM, chosen when the orb's disk is created and
 //! persisted in its recipe; a sleeping VM is always restored with the attachment (and
-//! MAC) it was saved with. Guests always see the same addressing, `10.0.2.15/24` via
-//! `10.0.2.2`, applied by the guest helper from `Wake.network`.
+//! MAC) it was saved with. Guests see the agent's guest network as it was when the orb
+//! was created (default `10.0.2.15/24` via `10.0.2.2`), applied by the guest helper from
+//! `Wake.network`.
 //!
 //! * `User`: QEMU's built-in slirp. No host privileges, guest-initiated traffic only.
 //! * `Tap`: a per-orb network namespace `orbd-<orb>` holding the VM's `tap0`
-//!   (`10.0.2.2/24`) and one end of a veth pair; the other end, `orbd<i>`, sits in the
-//!   agent's namespace with a `/30` from `169.254.0.0/16` (`i` is a durable per-host
-//!   index). The namespace masquerades the guest behind its veth address and the agent's
-//!   namespace masquerades that onwards, so every guest has the same address and only
-//!   leaves through NAT. nftables table `inet orbd` drops orb → agent traffic (except
-//!   replies), orb ↔ orb forwarding, orb → link-local (cloud metadata) and IPv6. The
-//!   VMM runs inside the namespace and sees nothing but its TAP.
+//!   (the guest's gateway, e.g. `10.0.2.2/24`) and one end of a veth pair; the other
+//!   end, `orbd<i>`, sits in the agent's namespace with a `/30` from `169.254.0.0/16`
+//!   (`i` is a durable per-host index). The namespace masquerades the guest behind its
+//!   veth address and the agent's namespace masquerades that onwards, so guests share
+//!   addresses and only leave through NAT. nftables table `inet orbd` drops orb → agent
+//!   traffic (except replies), orb ↔ orb forwarding, orb → link-local (cloud metadata)
+//!   and IPv6. The VMM runs inside the namespace and sees nothing but its TAP.
 //!
 //! `Tap` is built with `ip` and `nft` run with fixed arguments; every step is
 //! idempotent, so `adopt` repairs what is missing (after a host reboot) without touching
 //! what a running VMM uses.
 
+use crate::config::agent::GuestNetwork;
 use orbd_proto::guest::v1 as gpb;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,10 +50,6 @@ pub struct NetAttachment {
     pub mtu: u32,
 }
 
-/// The guest's fixed private network (each VM has its own).
-const GUEST_NET: &str = "10.0.2.0/24";
-const GUEST_GATEWAY: &str = "10.0.2.2";
-const GUEST_ADDR: &str = "10.0.2.15";
 /// The TAP device inside an orb's namespace.
 pub const TAP: &str = "tap0";
 /// Highest `Tap` index: 169.254.0.0/16 in /30s, from index 1.
@@ -61,17 +60,18 @@ static ALLOCATION: Mutex<()> = Mutex::new(());
 
 impl NetAttachment {
     /// Slirp attachment for a new QEMU orb.
-    pub fn user(orb: OrbId) -> Self {
-        Self::with_backend(orb, NetBackend::User)
+    pub fn user(orb: OrbId, network: GuestNetwork) -> Self {
+        Self::with_backend(orb, network, NetBackend::User)
     }
 
     /// Allocates a durable index for `orb` (`<state>/net/<index>` names its owner, so a
     /// retry after a crash finds it again) and builds the orb's namespace. Undone by
     /// [`release`].
-    pub fn tap(orb: OrbId, state_dir: &Path) -> Result<Self, String> {
+    pub fn tap(orb: OrbId, state_dir: &Path, network: GuestNetwork) -> Result<Self, String> {
         let index = allocate(&state_dir.join("net"), orb)?;
         let att = Self::with_backend(
             orb,
+            network,
             NetBackend::Tap {
                 netns: format!("orbd-{orb}"),
                 index,
@@ -81,14 +81,24 @@ impl NetAttachment {
         Ok(att)
     }
 
-    fn with_backend(orb: OrbId, backend: NetBackend) -> Self {
+    fn with_backend(orb: OrbId, network: GuestNetwork, backend: NetBackend) -> Self {
         Self {
             backend,
             mac: stable_mac(orb),
-            ipv4_cidr: format!("{GUEST_ADDR}/24"),
-            ipv4_gateway: GUEST_GATEWAY.into(),
+            ipv4_cidr: format!("{}/{}", network.guest(), network.prefix()),
+            ipv4_gateway: network.gateway().to_string(),
             mtu: 1500,
         }
+    }
+
+    /// The guest's network address and prefix length, from its recorded address.
+    fn subnet(&self) -> Result<(Ipv4Addr, u8), String> {
+        let bad = || format!("bad guest address {:?}", self.ipv4_cidr);
+        let (addr, prefix) = self.ipv4_cidr.split_once('/').ok_or_else(bad)?;
+        let addr: Ipv4Addr = addr.parse().map_err(|_| bad())?;
+        let prefix: u8 = prefix.parse().ok().filter(|p| *p <= 32).ok_or_else(bad)?;
+        let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+        Ok((Ipv4Addr::from(u32::from(addr) & mask), prefix))
     }
 
     /// Makes sure the host side exists before a (re)launch, creating only what is
@@ -96,7 +106,10 @@ impl NetAttachment {
     pub fn adopt(&self) -> Result<(), String> {
         match &self.backend {
             NetBackend::User => Ok(()),
-            NetBackend::Tap { netns, index } => build_namespace(netns, *index),
+            NetBackend::Tap { netns, index } => {
+                let (_, prefix) = self.subnet()?;
+                build_namespace(netns, *index, &format!("{}/{prefix}", self.ipv4_gateway))
+            }
         }
     }
 
@@ -109,23 +122,24 @@ impl NetAttachment {
     }
 
     /// Guest-visible QEMU arguments (part of the device topology recorded in manifests).
-    pub fn qemu_args(&self) -> Vec<String> {
-        match self.backend {
-            NetBackend::User => vec![
-                "-netdev".into(),
+    pub fn qemu_args(&self) -> Result<Vec<String>, String> {
+        let netdev = match self.backend {
+            NetBackend::User => {
+                let (net, prefix) = self.subnet()?;
+                let guest = self.ipv4_cidr.split('/').next().unwrap_or_default();
                 format!(
-                    "user,id=net0,ipv6=off,net={GUEST_NET},host={GUEST_GATEWAY},dhcpstart={GUEST_ADDR}"
-                ),
-                "-device".into(),
-                format!("virtio-net-pci,id=net0dev,netdev=net0,mac={}", self.mac),
-            ],
-            NetBackend::Tap { .. } => vec![
-                "-netdev".into(),
-                format!("tap,id=net0,ifname={TAP},script=no,downscript=no"),
-                "-device".into(),
-                format!("virtio-net-pci,id=net0dev,netdev=net0,mac={}", self.mac),
-            ],
-        }
+                    "user,id=net0,ipv6=off,net={net}/{prefix},host={},dhcpstart={guest}",
+                    self.ipv4_gateway
+                )
+            }
+            NetBackend::Tap { .. } => format!("tap,id=net0,ifname={TAP},script=no,downscript=no"),
+        };
+        Ok(vec![
+            "-netdev".into(),
+            netdev,
+            "-device".into(),
+            format!("virtio-net-pci,id=net0dev,netdev=net0,mac={}", self.mac),
+        ])
     }
 
     /// Static addressing for `Wake.network`; DNS is explicit config, never the host's
@@ -224,7 +238,8 @@ fn transit(i: u32) -> (String, String) {
     )
 }
 
-fn build_namespace(netns: &str, index: u32) -> Result<(), String> {
+/// `gateway` is the TAP's address, e.g. `10.0.2.2/24`.
+fn build_namespace(netns: &str, index: u32, gateway: &str) -> Result<(), String> {
     let host_if = format!("orbd{index}");
     let (host_addr, ns_addr) = transit(index);
     let path = Path::new("/run/netns").join(netns);
@@ -260,7 +275,7 @@ fn build_namespace(netns: &str, index: u32) -> Result<(), String> {
     ])?;
     ip(&["link", "set", &host_if, "up"])?;
     for args in [
-        vec!["addr", "replace", "10.0.2.2/24", "dev", TAP],
+        vec!["addr", "replace", gateway, "dev", TAP],
         vec!["link", "set", TAP, "up"],
         vec!["link", "set", "lo", "up"],
         vec!["addr", "replace", &format!("{ns_addr}/30"), "dev", "eth0"],
@@ -375,4 +390,30 @@ fn nft(script: &str) -> Result<(), String> {
 fn stable_mac(orb: OrbId) -> String {
     let h = Sha256::digest(orb.0.as_bytes());
     format!("52:54:00:{:02x}:{:02x}:{:02x}", h[0], h[1], h[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_follows_the_guest_network() {
+        let orb = OrbId(uuid::Uuid::nil());
+        // Orbs created with the default network keep the arguments their checkpoints
+        // were saved with.
+        let default = NetAttachment::user(orb, GuestNetwork::default());
+        assert_eq!(
+            default.qemu_args().unwrap()[1],
+            "user,id=net0,ipv6=off,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15"
+        );
+
+        let att = NetAttachment::user(orb, "192.168.240.0/20".parse().unwrap());
+        assert_eq!(
+            att.qemu_args().unwrap()[1],
+            "user,id=net0,ipv6=off,net=192.168.240.0/20,host=192.168.240.2,dhcpstart=192.168.240.15"
+        );
+        let cfg = att.guest_config(&[]);
+        assert_eq!(cfg.ipv4_cidr, "192.168.240.15/20");
+        assert_eq!(cfg.ipv4_gateway, "192.168.240.2");
+    }
 }

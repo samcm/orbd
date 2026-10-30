@@ -5,7 +5,7 @@
 
 use super::{ConfigError, load_yaml};
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -111,10 +111,95 @@ pub struct AgentSection {
     /// DNS servers written into orbs. Never the host's resolvers: a local stub such as
     /// Tailscale's 100.100.100.100 is unreachable from orbs.
     pub dns_servers: Vec<String>,
+    /// The network VM orbs see.
+    pub guest_network: GuestNetwork,
     pub metrics_listen: Option<SocketAddr>,
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
+
+/// The private IPv4 network a VM orb sees (every VM has its own): the guest is host `.15`
+/// and its gateway host `.2`, as with QEMU's user networking. Fixed per orb when it is
+/// created, so changing it affects only new orbs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestNetwork {
+    network: Ipv4Addr,
+    prefix: u8,
+}
+
+impl GuestNetwork {
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
+    pub fn gateway(&self) -> Ipv4Addr {
+        self.host(2)
+    }
+
+    pub fn guest(&self) -> Ipv4Addr {
+        self.host(15)
+    }
+
+    fn host(&self, n: u32) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network) + n)
+    }
+
+    fn mask(prefix: u8) -> u32 {
+        u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
+    }
+
+    fn overlaps(&self, other: Ipv4Addr, other_prefix: u8) -> bool {
+        let mask = Self::mask(self.prefix.min(other_prefix));
+        u32::from(self.network) & mask == u32::from(other) & mask
+    }
+}
+
+impl Default for GuestNetwork {
+    fn default() -> Self {
+        Self {
+            network: Ipv4Addr::new(10, 0, 2, 0),
+            prefix: 24,
+        }
+    }
+}
+
+impl std::fmt::Display for GuestNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
+impl std::str::FromStr for GuestNetwork {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (addr, prefix) = s
+            .split_once('/')
+            .ok_or_else(|| format!("{s}: expected a network such as 10.0.2.0/24"))?;
+        let network: Ipv4Addr = addr.parse().map_err(|e| format!("{s}: {e}"))?;
+        let prefix: u8 = prefix.parse().map_err(|e| format!("{s}: {e}"))?;
+        // `.15` must be a host address, not the broadcast address.
+        if prefix > 27 {
+            return Err(format!("{s}: the prefix must be /27 or shorter"));
+        }
+        if u32::from(network) & !Self::mask(prefix) != 0 {
+            return Err(format!("{s}: host bits are set"));
+        }
+        let net = Self { network, prefix };
+        // Link-local carries orbd's own transit addresses (and cloud metadata).
+        for (reserved, len) in [
+            (Ipv4Addr::new(0, 0, 0, 0), 8),
+            (Ipv4Addr::new(127, 0, 0, 0), 8),
+            (Ipv4Addr::new(169, 254, 0, 0), 16),
+            (Ipv4Addr::new(224, 0, 0, 0), 3),
+        ] {
+            if net.overlaps(reserved, len) {
+                return Err(format!("{s}: overlaps reserved {reserved}/{len}"));
+            }
+        }
+        Ok(net)
+    }
+}
 
 impl AgentSection {
     pub fn new(state_dir: PathBuf) -> Self {
@@ -124,6 +209,7 @@ impl AgentSection {
             state_dir,
             capacity: CapacityOverrides::default(),
             dns_servers: DEFAULT_DNS.map(String::from).to_vec(),
+            guest_network: GuestNetwork::default(),
             metrics_listen: None,
         }
     }
@@ -171,6 +257,9 @@ pub struct QemuRuntimeConfig {
     /// DNS servers delivered to guests (from `agent.dns_servers`).
     #[serde(skip)]
     pub dns_servers: Vec<String>,
+    /// Network for new orbs (from `agent.guest_network`).
+    #[serde(skip)]
+    pub guest_network: GuestNetwork,
 }
 
 impl Default for QemuRuntimeConfig {
@@ -181,6 +270,7 @@ impl Default for QemuRuntimeConfig {
             kernel: default_kernel(),
             cgroup_parent: None,
             dns_servers: Vec::new(),
+            guest_network: GuestNetwork::default(),
         }
     }
 }
@@ -208,6 +298,9 @@ pub struct FirecrackerRuntimeConfig {
     /// DNS servers delivered to guests (from `agent.dns_servers`).
     #[serde(skip)]
     pub dns_servers: Vec<String>,
+    /// Network for new orbs (from `agent.guest_network`).
+    #[serde(skip)]
+    pub guest_network: GuestNetwork,
 }
 
 impl Default for FirecrackerRuntimeConfig {
@@ -217,6 +310,7 @@ impl Default for FirecrackerRuntimeConfig {
             kernel: default_kernel(),
             cgroup_parent: None,
             dns_servers: Vec::new(),
+            guest_network: GuestNetwork::default(),
         }
     }
 }
@@ -290,5 +384,31 @@ impl AgentConfig {
 
     pub fn db_path(&self) -> PathBuf {
         self.agent.state_dir.join("agent.sqlite")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuestNetwork;
+
+    #[test]
+    fn guest_network_parsing() {
+        let n: GuestNetwork = "172.31.0.0/16".parse().unwrap();
+        assert_eq!(n.to_string(), "172.31.0.0/16");
+        assert_eq!(n.gateway().to_string(), "172.31.0.2");
+        assert_eq!(n.guest().to_string(), "172.31.0.15");
+        assert_eq!(GuestNetwork::default().to_string(), "10.0.2.0/24");
+        for bad in [
+            "10.0.2.0",       // no prefix
+            "10.0.2.1/24",    // host bits
+            "10.0.2.0/28",    // .15 would be broadcast
+            "169.254.8.0/24", // orbd's transit network
+            "160.0.0.0/4",    // contains link-local
+            "127.1.0.0/16",   // loopback
+            "10.0.2.0/33",
+        ] {
+            assert!(bad.parse::<GuestNetwork>().is_err(), "{bad}");
+        }
+        assert!("10.0.2.0/27".parse::<GuestNetwork>().is_ok());
     }
 }

@@ -102,6 +102,10 @@ struct AgentArgs {
     /// DNS servers for orbs, comma-separated.
     #[arg(long, env = "ORBD_DNS", value_delimiter = ',', default_values_t = orbd::config::agent::DEFAULT_DNS.map(String::from))]
     dns: Vec<String>,
+    /// Private IPv4 network VM orbs see (guest `.15`, gateway `.2`); pick one that the
+    /// orbs' own workloads (e.g. Docker networks) do not use. Applies to new orbs.
+    #[arg(long, env = "ORBD_GUEST_NETWORK", default_value_t = Default::default())]
+    guest_network: orbd::config::agent::GuestNetwork,
     /// Overrides the detected vCPU ceiling.
     #[arg(long, env = "ORBD_CAPACITY_VCPUS")]
     capacity_vcpus: Option<u32>,
@@ -216,6 +220,7 @@ fn main() -> anyhow::Result<()> {
             };
             let mut s = orbd::config::agent::AgentSection::new(a.state_dir);
             s.dns_servers = a.dns;
+            s.guest_network = a.guest_network;
             s.capacity = orbd::config::agent::CapacityOverrides {
                 vcpus: a.capacity_vcpus,
                 memory_mib: a.capacity_memory_mib,
