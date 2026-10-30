@@ -140,6 +140,15 @@ is built on it and nothing has used it for 72 hours (the current image of a prew
 reference is kept), and image layers no build has used for as long. It checks at
 startup, hourly and after each orb delete.
 
+The coordinator keeps the Amp CLI current with `amp update` (every
+`amp_cli_update_interval_secs`, 6 h by default) and puts each new version on probation.
+The first spawn it runs that succeeds makes it the known-good CLI, kept as a copy in
+`<state>/bin/amp-good`. If jobs on two different orbs fail in a way that blames the CLI
+first (orbd could not read the job, the coordinator found it invalid, or the guest got
+no usable bootstrap environment), the providers go back to the known-good copy and that
+version is never run again; the next release gets its own probation. A broken release
+therefore costs a couple of failed spawns, which Amp retries, instead of an outage.
+
 Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
 `/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores
 them when it starts again,

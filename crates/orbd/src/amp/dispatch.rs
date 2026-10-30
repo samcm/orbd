@@ -31,6 +31,13 @@ pub mod exit {
 pub const ENV_OFFERING_ID: &str = "ORBD_OFFERING_ID";
 pub const ENV_DISPATCH_SOCKET: &str = "ORBD_DISPATCH_SOCKET";
 
+/// Marker for the coordinator's Amp CLI probation (`provider.rs`): after a result,
+/// `orbd dispatch: cli-check <good|bad> <amp orb id>` says whether this job showed the
+/// CLI that ran it keeps orbd's dispatch contract. Only spawns count as good; a job
+/// orbd could not parse, a request the coordinator found invalid, or a guest that got
+/// no usable bootstrap env counts as bad.
+pub const CLI_CHECK: &str = "cli-check";
+
 /// How long to keep trying before declaring the coordinator unreachable when no
 /// connection has ever been established.
 const INITIAL_CONNECT_WINDOW: Duration = Duration::from_secs(10);
@@ -238,6 +245,13 @@ async fn attempt(job: &mut Job, deadline: Instant, prog: &mut Progress) -> Attem
             }
             Some(Event::Result(r)) => {
                 let code = result_exit(&r);
+                let spawn = matches!(
+                    job.request.action,
+                    Some(pb::dispatch_request::Action::Spawn(_))
+                );
+                if let Some(good) = cli_verdict(&r, spawn) {
+                    cli_check(good, &job.request.amp_orb_id);
+                }
                 say(format!(
                     "result {:?}{}: {}",
                     pb::DispatchStatus::try_from(r.status).unwrap_or_default(),
@@ -253,6 +267,34 @@ async fn attempt(job: &mut Job, deadline: Instant, prog: &mut Progress) -> Attem
             None => {}
         }
     }
+}
+
+/// What a result says about the Amp CLI that ran the job; None when it says nothing
+/// (capacity, an unavailable host, a failure inside the orb).
+fn cli_verdict(r: &pb::DispatchResult, spawn: bool) -> Option<bool> {
+    use pb::DispatchStatus as S;
+    use pb::command_outcome::Result as R;
+    match S::try_from(r.status).unwrap_or(S::Unspecified) {
+        S::Succeeded => spawn.then_some(true),
+        S::Invalid => Some(false),
+        S::Failed => {
+            let code = match r.outcome.as_ref().and_then(|o| o.result.as_ref()) {
+                Some(R::Failure(f)) => pb::FailureCode::try_from(f.code).ok(),
+                _ => None,
+            };
+            matches!(
+                code,
+                Some(pb::FailureCode::GuestBootstrapFailed | pb::FailureCode::SecretUnavailable)
+            )
+            .then_some(false)
+        }
+        _ => None,
+    }
+}
+
+fn cli_check(good: bool, amp_orb_id: &str) {
+    let verdict = if good { "good" } else { "bad" };
+    say(format!("{CLI_CHECK} {verdict} {amp_orb_id}"));
 }
 
 fn handle_status(s: tonic::Status) -> Attempt {
@@ -288,6 +330,7 @@ pub async fn run_from_env() -> i32 {
         Ok(j) => j,
         Err(e) => {
             say(format!("invalid job: {e}"));
+            cli_check(false, &var("ORB_ID").unwrap_or_default());
             return exit::INVALID;
         }
     };
@@ -349,5 +392,38 @@ mod tests {
         assert_eq!(names, ["AMP_URL", "ORB_TOKEN"]);
         assert!(collect_guest_env("AMP_ORB_PROVIDER_TOKEN", get).is_err());
         assert!(collect_guest_env("bad-name", |_| Some("x".into())).is_err());
+    }
+
+    #[test]
+    fn cli_verdicts_blame_the_cli_only_for_contract_failures() {
+        use pb::DispatchStatus as S;
+        let failed = |code: pb::FailureCode| pb::DispatchResult {
+            status: S::Failed as i32,
+            outcome: Some(pb::CommandOutcome {
+                result: Some(pb::command_outcome::Result::Failure(pb::CommandFailure {
+                    code: code as i32,
+                    message: String::new(),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let status = |s: S| pb::DispatchResult {
+            status: s as i32,
+            ..Default::default()
+        };
+        assert_eq!(cli_verdict(&status(S::Succeeded), true), Some(true));
+        // A paused orb proves nothing about the spawn env.
+        assert_eq!(cli_verdict(&status(S::Succeeded), false), None);
+        assert_eq!(cli_verdict(&status(S::Invalid), false), Some(false));
+        assert_eq!(
+            cli_verdict(&failed(pb::FailureCode::GuestBootstrapFailed), true),
+            Some(false)
+        );
+        assert_eq!(
+            cli_verdict(&failed(pb::FailureCode::InsufficientMemory), true),
+            None
+        );
+        assert_eq!(cli_verdict(&status(S::Unavailable), true), None);
     }
 }
