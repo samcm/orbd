@@ -713,8 +713,8 @@ impl FirecrackerRuntime {
             );
         }
         // The network index is claimed (durably, by this orb) before anything is built.
-        let (id, state) = (orb.id, self.state_dir.clone());
-        let net = tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state))
+        let (id, state, network) = (orb.id, self.state_dir.clone(), self.config.guest_network);
+        let net = tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state, network))
             .await
             .map_err(|e| RuntimeError::Other(e.to_string()))?
             .map_err(|e| RuntimeError::Other(format!("network: {e}")))?;

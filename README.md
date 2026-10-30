@@ -104,10 +104,14 @@ Threads you create on that provider in Amp then run on your hosts.
 The coordinator creates its CA and keys in its volume on first start; keep that volume.
 Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
 `ORBD_CAPACITY_MEMORY_MIB`, `ORBD_CAPACITY_DISK_GIB`); orbs use DNS `1.1.1.1` and `9.9.9.9`
-(`ORBD_DNS`). `orbd agent list` and `orbd agent remove <id>` manage agents; a removed
-agent's orbs stay on it, unavailable. `orbd agent list` shows each agent's orbs, its
-reservations against its capacity, and its disk: free, allocated by orbd, reserved and
-limit (also exported as `orbd_agent_disk_*_bytes` and `orbd_reserved_disk_bytes`).
+(`ORBD_DNS`). Each VM orb has its own private network, `10.0.2.0/24` (the orb is `.15`,
+its gateway `.2`); if workloads in orbs use that subnet, e.g. Docker Compose networks,
+set another with `ORBD_GUEST_NETWORK` (e.g. `10.200.0.0/24`). It applies to orbs created
+afterwards; existing orbs keep theirs. `orbd agent list` and `orbd agent remove <id>`
+manage agents; a removed agent's orbs stay on it, unavailable. `orbd agent list` shows
+each agent's orbs, its reservations against its capacity, and its disk: free, allocated
+by orbd, reserved and limit (also exported as `orbd_agent_disk_*_bytes` and
+`orbd_reserved_disk_bytes`).
 
 Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An offering's
 `disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
