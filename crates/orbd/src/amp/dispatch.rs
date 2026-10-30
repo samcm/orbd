@@ -36,6 +36,10 @@ pub const ENV_DISPATCH_SOCKET: &str = "ORBD_DISPATCH_SOCKET";
 const INITIAL_CONNECT_WINDOW: Duration = Duration::from_secs(10);
 const MAX_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
+/// Variables every spawn forwards into the guest when set, whether or not `ORB_ENVS`
+/// names them: the ones Amp CLIs listed in `ORB_ENVS` before they stopped setting it.
+const GUEST_ENV: &str = "AMP_URL ORB_TOKEN AMP_THREAD_ID AMP_SANDBOX_ID";
+
 /// Names that must never be forwarded into a guest, whatever `ORB_ENVS` says.
 fn forbidden_guest_env(name: &str) -> bool {
     name == "AMP_ORB_PROVIDER_TOKEN" || name.starts_with("ORBD_")
@@ -92,7 +96,10 @@ fn build_job() -> Result<Job, String> {
     let action = match operation.as_str() {
         "spawn" => {
             let image_ref = require("ORB_IMAGE")?;
-            let guest_env = collect_guest_env(&var("ORB_ENVS").unwrap_or_default(), var)?;
+            // Amp's dispatch contract passes ORB_TOKEN and AMP_URL for the guest; older
+            // CLIs also listed them in ORB_ENVS, newer ones (2026-10-29) do not.
+            let names = format!("{} {GUEST_ENV}", var("ORB_ENVS").unwrap_or_default());
+            let guest_env = collect_guest_env(&names, var)?;
             use secrecy::ExposeSecret;
             pb::dispatch_request::Action::Spawn(pb::SpawnRequest {
                 image_ref,
@@ -336,6 +343,10 @@ mod tests {
         let env = collect_guest_env("ORB_TOKEN MISSING", get).unwrap();
         let names: Vec<_> = env.0.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["ORB_TOKEN"]);
+        // Newer Amp CLIs set no ORB_ENVS; the token must still reach the guest.
+        let env = collect_guest_env(&format!("{GUEST_ENV} "), get).unwrap();
+        let names: Vec<_> = env.0.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["AMP_URL", "ORB_TOKEN"]);
         assert!(collect_guest_env("AMP_ORB_PROVIDER_TOKEN", get).is_err());
         assert!(collect_guest_env("bad-name", |_| Some("x".into())).is_err());
     }
