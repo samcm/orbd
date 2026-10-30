@@ -64,6 +64,8 @@ zeroize = { version = "1", features = ["derive"] }
 # Registry client for image preparation; TLS via rustls with the ring provider that
 # tonic already uses (one crypto provider).
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
+# Boat API client; the same build of reqwest that oci-client uses.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tar = { version = "0.4", default-features = false }
 nix = { version = "0.31", features = ["fs", "process", "signal", "user", "socket"] }

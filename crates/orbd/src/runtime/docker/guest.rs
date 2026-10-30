@@ -5,16 +5,14 @@
 use super::{DockerRuntime, Interrupted, bounded, container_name, log};
 use crate::model::{OrbDefinition, OrbId};
 use crate::runtime::{BootstrapRequest, GuestControl, GuestError, OpContext, RuntimeObservation};
-use crate::secrets::PermittedGuestEnv;
+use crate::secrets::{PermittedGuestEnv, env_file, redact};
 use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use futures::StreamExt;
-use secrecy::ExposeSecret;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use zeroize::Zeroizing;
 
 /// Runs `amp orb bootstrap` for the life of the orb; restarts only on failure.
 const BOOTSTRAP_UNIT: &str = "amp-headless-bootstrap.service";
@@ -431,73 +429,5 @@ impl GuestControl for DockerRuntime {
             state.active, state.sub, state.restarts
         );
         Err(self.bootstrap_failed(orb.id, unit, env, &what, ctx).await)
-    }
-}
-
-/// The bootstrap unit's EnvironmentFile body: `NAME="value"` lines with systemd's
-/// double-quote escapes. Control characters (newlines) would let a value inject other
-/// variables, so they are rejected.
-fn env_file(env: &PermittedGuestEnv) -> Result<Zeroizing<Vec<u8>>, String> {
-    env.validate()?;
-    if env.get("ORB_TOKEN").is_none() {
-        return Err("guest env has no ORB_TOKEN".into());
-    }
-    let mut out = Zeroizing::new(Vec::new());
-    for (name, value) in &env.0 {
-        let value = value.expose_secret();
-        if value.chars().any(char::is_control) {
-            return Err(format!("guest env {name} contains control characters"));
-        }
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(b"=\"");
-        for c in value.chars() {
-            if matches!(c, '"' | '\\' | '`' | '$') {
-                out.push(b'\\');
-            }
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-        out.extend_from_slice(b"\"\n");
-    }
-    Ok(out)
-}
-
-/// Replaces guest env values in text surfaced from the guest (journal, stderr).
-fn redact(text: &str, env: &PermittedGuestEnv) -> String {
-    let mut text = text.to_owned();
-    for (name, value) in &env.0 {
-        let v = value.expose_secret();
-        if v.len() >= 4 {
-            text = text.replace(v, &format!("[{name} redacted]"));
-        }
-    }
-    text
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use secrecy::SecretString;
-
-    fn env(vars: &[(&str, &str)]) -> PermittedGuestEnv {
-        PermittedGuestEnv(
-            vars.iter()
-                .map(|(n, v)| (n.to_string(), SecretString::from(*v)))
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn env_file_quotes_values_and_rejects_line_injection() {
-        let body = env_file(&env(&[
-            ("ORB_TOKEN", r#"a"b$c\d`e'f"#),
-            ("AMP_URL", "https://ampcode.com"),
-        ]))
-        .unwrap();
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            "ORB_TOKEN=\"a\\\"b\\$c\\\\d\\`e'f\"\nAMP_URL=\"https://ampcode.com\"\n"
-        );
-        assert!(env_file(&env(&[("ORB_TOKEN", "tok\nAMP_URL=https://evil")])).is_err());
     }
 }

@@ -114,19 +114,28 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
     )
     .await
     .context("starting agent fleet")?;
-    let BackendHandle {
+    let mut handles = vec![handle];
+    if let Some(boat) = &config.boat {
+        let handle = crate::backend::boat::BoatBackend::start(boat, &state_dir, key.clone())
+            .await
+            .context("starting the boat backend")?;
+        handles.push(handle);
+    }
+    for BackendHandle {
         backend,
         mut events,
-    } = handle;
-    backends.insert(backend.id().clone(), backend);
-    let tx = core_tx.clone();
-    tokio::spawn(async move {
-        while let Some(ev) = events.next().await {
-            if tx.send(core::Msg::Backend(ev)).await.is_err() {
-                break;
+    } in handles
+    {
+        backends.insert(backend.id().clone(), backend);
+        let tx = core_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = events.next().await {
+                if tx.send(core::Msg::Backend(ev)).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
 
     // Every offering must be satisfiable by its backend's capabilities.
     for (id, offering) in &offerings {
@@ -161,6 +170,13 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         idle_orb_ttl_days = config.idle_orb_ttl_days,
         "placement policy"
     );
+    if config.boat.is_some() && !(1..14).contains(&config.idle_orb_ttl_days) {
+        tracing::warn!(
+            idle_orb_ttl_days = config.idle_orb_ttl_days,
+            "Boat deletes the disk of a sandbox stopped for 14 days; set idle_orb_ttl_days \
+             below 14 so orbd deletes idle Boat orbs first"
+        );
+    }
     let db_for_admin = db.clone();
     let mut core = core::Core::new(
         db,
