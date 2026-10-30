@@ -176,6 +176,11 @@ pub struct OfferingConfig {
     /// For `runtime: boat`, the vCPUs and memory of a Boat size (see
     /// [`crate::backend::boat::SIZES`]).
     pub resources: ResourcesConfig,
+    /// Offerings that take a new orb, in order, when no host of this one can. Each must
+    /// be like-for-like: `/dev/kvm` in the orb on both or neither, and at least these
+    /// vCPUs and memory. Spill targets' own spill_to lists are not followed.
+    #[serde(default)]
+    pub spill_to: Vec<OfferingId>,
 }
 
 impl OfferingConfig {
@@ -221,6 +226,7 @@ impl OfferingConfig {
             id: self.id.clone(),
             amp_endpoint: AmpEndpointId::new(AMP_ENDPOINT),
             backend_id: BackendId::new(backend),
+            spill_to: self.spill_to.clone(),
             spec: SpecTemplate {
                 target,
                 resources: self.resources.to_resources()?,
@@ -232,6 +238,31 @@ impl OfferingConfig {
                 pause_policy,
             },
         })
+    }
+}
+
+/// Why an orb of `from` cannot run as `to`, or None if `to` is like-for-like: `/dev/kvm`
+/// in the orb on both or neither, and at least as much compute. Sleep may differ: an
+/// orb spilled to Boat keeps its disk across a pause but not its processes.
+fn unlike(from: &SpecTemplate, to: &SpecTemplate) -> Option<String> {
+    let kvm = |s: &SpecTemplate| s.requirements.nested_kvm != NestedKvmRequirement::NotRequired;
+    let (a, b) = (from.resources, to.resources);
+    if kvm(from) != kvm(to) {
+        Some(format!(
+            "one gives orbs /dev/kvm and the other does not ({} vs {})",
+            if kvm(from) { "kvm" } else { "no kvm" },
+            if kvm(to) { "kvm" } else { "no kvm" }
+        ))
+    } else if b.vcpus < a.vcpus || b.memory_bytes < a.memory_bytes {
+        Some(format!(
+            "it is smaller ({} vCPUs / {} MiB vs {} / {})",
+            b.vcpus,
+            b.memory_bytes / crate::model::MIB,
+            a.vcpus,
+            a.memory_bytes / crate::model::MIB
+        ))
+    } else {
+        None
     }
 }
 
@@ -268,6 +299,26 @@ impl CoordinatorConfig {
                 ));
             }
         }
+        for o in &self.offerings {
+            let from = o.to_offering()?;
+            for (i, id) in o.spill_to.iter().enumerate() {
+                if o.spill_to[..i].contains(id) {
+                    return inv(format!("offering {}: spill_to lists {id} twice", o.id));
+                }
+                let Some(t) = self.offering(id.as_str()) else {
+                    return inv(format!(
+                        "offering {}: spill_to {id} is not an offering",
+                        o.id
+                    ));
+                };
+                if t.id == o.id {
+                    return inv(format!("offering {}: spill_to names itself", o.id));
+                }
+                if let Some(why) = unlike(&from.spec, &t.to_offering()?.spec) {
+                    return inv(format!("offering {}: cannot spill to {id}: {why}", o.id));
+                }
+            }
+        }
         if let Some(b) = &self.boat
             && (b.capacity.vcpus == 0 || b.capacity.memory_mib == 0)
         {
@@ -292,5 +343,46 @@ impl CoordinatorConfig {
     /// Local socket for `orbd join-token` and `orbd agent list/remove`.
     pub fn admin_socket(&self) -> PathBuf {
         self.state_dir.join("admin.sock")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offering(id: &str, runtime: OfferingRuntime, vcpus: u32, memory_mib: u64) -> Offering {
+        OfferingConfig {
+            id: OfferingId::new(id),
+            provider_token_file: None,
+            runtime,
+            resources: ResourcesConfig {
+                vcpus,
+                memory_mib,
+                disk_gib: 20,
+            },
+            spill_to: vec![],
+        }
+        .to_offering()
+        .unwrap()
+    }
+
+    #[test]
+    fn spill_targets_must_be_like_for_like() {
+        use OfferingRuntime::*;
+        let fc = offering("fc", Firecracker, 1, 2048);
+        let qemu = offering("qemu", Qemu, 2, 4096);
+        let boat = offering("boat", Boat, 2, 4096);
+        // No /dev/kvm on either side, and Boat is at least as big.
+        assert_eq!(unlike(&fc.spec, &boat.spec), None);
+        // QEMU orbs have /dev/kvm; Boat sandboxes do not.
+        let why = unlike(&qemu.spec, &boat.spec).unwrap();
+        assert!(why.contains("/dev/kvm"), "{why}");
+        // Smaller is never a spill target.
+        let big_fc = offering("fc-big", Firecracker, 4, 8192);
+        assert!(
+            unlike(&big_fc.spec, &boat.spec)
+                .unwrap()
+                .contains("smaller")
+        );
     }
 }

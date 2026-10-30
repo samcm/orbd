@@ -133,6 +133,10 @@ pub struct Offering {
     pub amp_endpoint: AmpEndpointId,
     pub backend_id: BackendId,
     pub spec: SpecTemplate,
+    /// Offerings that take a new orb, in order, when this offering's hosts cannot.
+    /// An orb lives where it was placed: a spilled orb resumes on the spill target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spill_to: Vec<OfferingId>,
 }
 
 /// How a new orb's disk is created. Resolved once, before first execution.
