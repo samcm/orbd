@@ -84,12 +84,21 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
 
+  # The amd64 image for the kvm jobs, and separately the multi-arch build, so the kvm
+  # jobs do not wait for arm64.
   image:
     needs: [build]
     uses: ./.github/workflows/image.yml
     with:
       push: false
       artifact: true
+      multiarch: false
+
+  image-multiarch:
+    needs: [build]
+    uses: ./.github/workflows/image.yml
+    with:
+      push: false
 
   # Real VMs on GitHub-hosted runners: ephemeral VMs with /dev/kvm and no secrets, so
   # pull requests run here too. Every suite runs inside the image built above, so they
@@ -99,14 +108,21 @@ jobs:
   # - container: tests/container-e2e.sh, the coordinator and agent containers as deployed,
   #   with a QEMU and a Firecracker orb on one agent.
   kvm:
-    name: kvm (${{ matrix.suite }})
+    name: kvm (${{ matrix.suite }}${{ matrix.part && format(', {0}', matrix.part) || '' }})
     needs: [build, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        suite: [qemu, firecracker, container]
+        # The crash-boundary gate takes about as long as the other gates together, so each
+        # VM runtime runs it on a runner of its own.
+        include:
+          - { suite: qemu, part: crash, gates: agent_crash_at_publication_boundaries }
+          - { suite: qemu, part: rest, gates: --skip agent_crash_at_publication_boundaries }
+          - { suite: firecracker, part: crash, gates: agent_crash_at_publication_boundaries }
+          - { suite: firecracker, part: rest, gates: --skip agent_crash_at_publication_boundaries }
+          - { suite: container }
     env:
       # Not under target/: the rust cache restores target/ over it.
       ROOTFS: kvm-guest/rootfs.ext4
@@ -180,13 +196,16 @@ jobs:
       - if: matrix.suite != 'container'
         name: Run the gates in the image
         # procps provides the `kill` the test harness runs; QEMU is the image's own.
+        # GATES is a libtest name filter, split into words on purpose.
+        env:
+          GATES: ${{ matrix.gates }}
         run: |
           docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD/crates/orbd" \
             -e ORBD_KVM_KERNEL=/usr/share/orbd/bzImage -e "ORBD_KVM_ROOTFS=$PWD/$ROOTFS" -e ORBD_KVM_NESTED \
             -e ORBD_KVM_RUNTIME=${{ matrix.suite }} \
             --entrypoint sh orbd:smoke -c \
-            'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture' \
-            "$(cat gates.txt)"
+            'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture "$@"' \
+            "$(cat gates.txt)" $GATES
 
       - if: matrix.suite == 'container'
         run: crates/orbd/tests/container-e2e.sh orbd:smoke "$ROOTFS"
@@ -194,11 +213,11 @@ jobs:
   # Single required status check for branch rules and auto-merge.
   ci-ok:
     if: always()
-    needs: [fmt, deny, clippy, test, build, image, kvm]
+    needs: [fmt, deny, clippy, test, build, image, image-multiarch, kvm]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All CI jobs succeeded
         run: test "$RESULTS" = "success"
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success' && 'success' || 'failure' }}
+          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success success' && 'success' || 'failure' }}

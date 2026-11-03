@@ -39,7 +39,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo zigbuild --locked --release -p orbd --target ${{ matrix.target }}
+      # Pull requests build the workspace crates with 16 codegen units: at the release
+      # profile's 1, the orbd crate alone compiles for ~3.5 min on one core. Dependencies keep
+      # the release profile, so the cache from main still matches. main and tags build as shipped.
+      - run: cargo zigbuild --locked --release -p orbd --target ${{ matrix.target }} $PR_PROFILE
+        env:
+          PR_PROFILE: ${{ github.event_name == 'pull_request' && '--config profile.release.package.orbd.codegen-units=16 --config profile.release.package.orbd-proto.codegen-units=16' || '' }}
       - name: Check binary is static and runs
         run: |
           bin=target/${{ matrix.target }}/release/orbd
