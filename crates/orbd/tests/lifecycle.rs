@@ -149,10 +149,10 @@ fn orb_delete_takes_only_orbs_asleep_long_enough() {
     assert!(running[0].bootstraps.iter().all(|b| b.cold_boot));
 }
 
-/// One provider whose orb types are offerings: a spawn runs on the offering its
-/// ORB_TYPE names (the first orb type when it has none), a pause or delete, which has
-/// no ORB_TYPE, acts on the orb as created, and an orb type orbd does not serve fails
-/// without blaming the Amp CLI.
+/// One provider whose orb types are offerings: a spawn of a new orb runs on the
+/// offering its ORB_TYPE names (the first orb type when it has none), every later job
+/// acts on the orb as created, and an orb type orbd does not serve fails without
+/// blaming the Amp CLI.
 #[test]
 fn provider_orb_types_choose_the_offering() {
     let mut c = Cluster::new(&["agent-a"], 4);
@@ -191,8 +191,21 @@ fn provider_orb_types_choose_the_offering() {
         )
     );
 
-    // The default orb type is the other offering; the orb's own must be found.
+    // The default orb type is the other offering; the orb's own must be found. An orb
+    // keeps the offering it was created as, even when a spawn names another (a thread
+    // whose orb type changed, or a retired provider's job with no orb type).
     assert_ok(&c.dispatch("pause", "amp-big", &[]), "pause big");
+    assert_ok(
+        &c.dispatch("spawn", "amp-big", &[]),
+        "wake big, no ORB_TYPE",
+    );
+    assert!(
+        c.admin(&["orb", "list"])
+            .stdout
+            .starts_with("amp-big\trunning for 0m\tagent-a\tfake-4vcpu-4gb\n"),
+        "big keeps its offering"
+    );
+    assert_ok(&c.dispatch("pause", "amp-big", &[]), "pause big again");
     assert_ok(&c.dispatch("spawn", "amp-big", &big), "wake big");
     assert_ok(&c.dispatch("delete", "amp-big", &[]), "delete big");
     assert_ok(&c.dispatch("delete", "amp-default", &[]), "delete default");

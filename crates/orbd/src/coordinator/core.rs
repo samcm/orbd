@@ -33,10 +33,8 @@ const BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// A validated dispatch request (see `service`).
 pub struct ValidatedRequest {
     pub invocation_id: InvocationId,
+    /// The offering a new orb is placed as. An existing orb keeps its own.
     pub offering_id: OfferingId,
-    /// A pause or delete from a provider with orb types: those types. The request is
-    /// for the one its orb was created as, else `offering_id`.
-    pub orb_types: Vec<OfferingId>,
     pub amp_endpoint: AmpEndpointId,
     pub amp_orb_id: AmpOrbId,
     pub action: ReqAction,
@@ -222,23 +220,12 @@ impl Core {
         if let Some(existing) = self.db.call(move |c| store::get_request(c, inv)).await? {
             return self.reattach(existing, resume_after_log_seq, tx).await;
         }
-        let mut offering_id = v.offering_id.clone();
-        if !v.orb_types.is_empty() {
-            let (ep, aid) = (v.amp_endpoint.clone(), v.amp_orb_id.clone());
-            let orb = self
-                .db
-                .call(move |c| store::get_orb_by_identity(c, ep.as_str(), aid.as_str()))
-                .await?;
-            if let Some(o) = orb.filter(|o| v.orb_types.contains(&o.offering_id)) {
-                offering_id = o.offering_id;
-            }
-        }
         let now = unix_ms_now();
         let used = DISPATCH_BUDGET_MS.saturating_sub(v.remaining_budget_ms.min(DISPATCH_BUDGET_MS));
         let start = now.saturating_sub(used);
         let mut req = Req {
             invocation_id: inv,
-            offering_id,
+            offering_id: v.offering_id.clone(),
             amp_endpoint: v.amp_endpoint.clone(),
             amp_orb_id: v.amp_orb_id.clone(),
             action: v.action.clone(),
@@ -533,25 +520,6 @@ impl Core {
                 Ok((orb, tomb))
             })
             .await?;
-        let Some(offering) = self.offerings.get(&head.offering_id).cloned() else {
-            return self
-                .finish_plain(head, Status::Invalid, "unknown offering")
-                .await;
-        };
-        if let Some(o) = &orb
-            && o.offering_id != head.offering_id
-        {
-            return self
-                .finish_refused(
-                    head,
-                    orb.as_ref(),
-                    refuse(
-                        FailureCode::SpecMismatch,
-                        "orb exists under a different offering",
-                    ),
-                )
-                .await;
-        }
         let state = orb.as_ref().map(|o| &o.observation.state);
         let stopped = |s: &OrbState| {
             matches!(
@@ -615,7 +583,26 @@ impl Core {
             }
         }
 
-        let plan = match self.plan(head, &offering, orb.as_ref()).await? {
+        // An existing orb keeps the offering it was created as, whatever the job names
+        // (a pause has no orb type; a thread's orb type or provider may have changed).
+        // Only a new orb needs the job's offering.
+        let offering = match &orb {
+            Some(o) => {
+                if o.offering_id != head.offering_id {
+                    tracing::debug!(orb = %o.id, offering = %o.offering_id, requested = %head.offering_id, "orb keeps its offering");
+                }
+                None
+            }
+            None => match self.offerings.get(&head.offering_id).cloned() {
+                Some(o) => Some(o),
+                None => {
+                    return self
+                        .finish_plain(head, Status::Invalid, "unknown offering")
+                        .await;
+                }
+            },
+        };
+        let plan = match self.plan(head, offering.as_ref(), orb.as_ref()).await? {
             Ok(p) => p,
             Err(r) => return self.finish_refused(head, orb.as_ref(), r).await,
         };
@@ -684,7 +671,7 @@ impl Core {
     async fn plan(
         &mut self,
         head: &Req,
-        offering: &Offering,
+        offering: Option<&Offering>,
         orb: Option<&OrbRecord>,
     ) -> Result<std::result::Result<CreatePlan, Refusal>> {
         let op = OperationId::generate();
@@ -803,6 +790,7 @@ impl Core {
                         "orb does not exist",
                     )));
                 };
+                let offering = offering.expect("a new orb's offering was looked up");
                 let snap_key = snapshot_id
                     .as_deref()
                     .map(ProjectSnapshotKey::from_external);
@@ -1544,9 +1532,7 @@ impl Core {
             .retain(|_, t| t.elapsed() < Duration::from_secs(3600));
         let idle = self.db.call(move |c| store::idle_orbs(c, cutoff)).await?;
         for orb in idle {
-            if self.last_reclaim.contains_key(&orb.id)
-                || !self.offerings.contains_key(&orb.offering_id)
-            {
+            if self.last_reclaim.contains_key(&orb.id) {
                 continue;
             }
             self.last_reclaim.insert(orb.id, Instant::now());
@@ -1617,12 +1603,6 @@ impl Core {
                 state_label(&o.observation.state),
                 now.saturating_sub(o.observation.observed_at_unix_ms) / 60_000
             ))),
-            [o] if !self.offerings.contains_key(&o.offering_id) => {
-                Some(GrpcStatus::failed_precondition(format!(
-                    "{amp_orb_id}'s offering {} is no longer configured",
-                    o.offering_id
-                )))
-            }
             [_] => None,
         };
         if let Some(status) = refusal {

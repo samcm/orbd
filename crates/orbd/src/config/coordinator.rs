@@ -1,18 +1,20 @@
 //! Coordinator configuration (`orbd coordinator`, default `/etc/orbd/orbd.yaml`).
 //!
-//! Only `public_url` and `offerings` are required; `providers` serve them to Amp:
+//! `config_version: v2` describes what orbs need; orbd picks where they run:
 //!
 //! ```yaml
+//! config_version: v2
 //! public_url: https://coordinator.example:7443
-//! offerings:
-//!   - id: qemu-4vcpu-8gb
-//!     runtime: qemu
-//!     resources: { vcpus: 4, memory_mib: 8192, disk_gib: 40 }
-//! providers:
-//!   - id: homelab
-//!     token_file: /etc/orbd/tokens/homelab
-//!     orb_types: [qemu-4vcpu-8gb]
+//! provider: { token_file: /etc/orbd/tokens/provider }
+//! orb_types:                      # named as orb types in Amp; the first is the default
+//!   - { id: 2vcpu-4gb, vcpus: 2, memory_mib: 4096, disk_gib: 40 }
+//!   - { id: kvm-4vcpu-8gb, vcpus: 4, memory_mib: 8192, disk_gib: 40, kvm: true }
 //! ```
+//!
+//! Without `config_version` (v1) the file lists `offerings`, each pinned to a runtime,
+//! and `providers` or per-offering provider tokens. A v2 file is turned into v1
+//! offerings at load (see [`CoordinatorConfig::normalize`]), so everything after loading
+//! sees one form.
 //!
 //! The coordinator serves one Amp endpoint, one agent fleet and optionally Boat
 //! (`boat:`, offerings with `runtime: boat`); pause policy and capability requirements
@@ -39,6 +41,9 @@ pub const BOAT_BACKEND: &str = "boat";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoordinatorConfig {
+    /// `v2` for `provider` and `orb_types`; absent or `v1` for `offerings` and `providers`.
+    #[serde(default)]
+    pub config_version: ConfigVersion,
     /// URL agents dial, e.g. `https://coordinator.example:7443`. Join tokens carry it, and
     /// its host is the name on the coordinator's certificate.
     pub public_url: String,
@@ -76,12 +81,69 @@ pub struct CoordinatorConfig {
     /// image: its files and processes are gone and Amp runs setup again.
     #[serde(default = "default_idle_orb_ttl_days")]
     pub idle_orb_ttl_days: u64,
-    /// Boat (boat.dev) sandboxes for offerings with `runtime: boat`.
+    /// Boat (boat.dev) sandboxes: offerings with `runtime: boat` (v1), or orb types of a
+    /// Boat size that `prefer` allows on Boat (v2).
     pub boat: Option<BoatConfig>,
+    /// v1: each offering is one runtime and size. v2: generated from `orb_types`.
+    #[serde(default)]
     pub offerings: Vec<OfferingConfig>,
-    /// Amp orb providers whose orb types are offerings: one token serves them all.
+    /// v1: Amp orb providers whose orb types are offerings. v2: generated from `provider`.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// v2: the Amp orb provider serving every orb type.
+    pub provider: Option<ProviderV2Config>,
+    /// v2: where new orbs go, in order; default `[local, boat]`. Boat takes an orb type
+    /// only without `kvm` and in a Boat size; local runs it on the agents, in QEMU with
+    /// `kvm`, else in Firecracker. An orb stays where it was first placed.
+    pub prefer: Option<Vec<Prefer>>,
+    /// v2: what threads can ask for, named as orb types in Amp; the first is used when a
+    /// spawn has none.
+    #[serde(default)]
+    pub orb_types: Vec<OrbTypeConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigVersion {
+    #[default]
+    V1,
+    V2,
+}
+
+/// v2 `provider:`: one Amp orb provider with orb types.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderV2Config {
+    /// `AMP_ORB_PROVIDER_TOKEN` of the provider.
+    pub token_file: PathBuf,
+    /// Tokens of providers being retired, e.g. v1's per-offering ones. They are still
+    /// served so their threads keep their orbs; a spawn of a new orb from one gets the
+    /// default orb type. Drop them once those threads are gone.
+    #[serde(default)]
+    pub retired_token_files: Vec<PathBuf>,
+}
+
+/// v2: where new orbs may go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Prefer {
+    /// The agents.
+    Local,
+    /// Boat (needs `boat:`).
+    Boat,
+}
+
+/// v2: one orb type: what an orb gets, not where it runs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrbTypeConfig {
+    pub id: OfferingId,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
+    /// `/dev/kvm` in the orb: runs only in QEMU on the agents.
+    #[serde(default)]
+    pub kvm: bool,
 }
 
 /// One Amp orb provider with orb types. Each orb type in Amp is named after the
@@ -142,6 +204,16 @@ pub enum OfferingRuntime {
 }
 
 impl OfferingRuntime {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fake => "fake",
+            Self::Docker => "docker",
+            Self::Qemu => "qemu",
+            Self::Firecracker => "firecracker",
+            Self::Boat => "boat",
+        }
+    }
+
     fn fleet(self) -> Option<RuntimeKind> {
         match self {
             Self::Fake => Some(RuntimeKind::Fake),
@@ -288,9 +360,106 @@ fn unlike(from: &SpecTemplate, to: &SpecTemplate) -> Option<String> {
 
 impl CoordinatorConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let cfg: Self = load_yaml(path)?;
+        let mut cfg: Self = load_yaml(path)?;
+        cfg.normalize()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Turns a v2 file into v1 offerings and providers. Each orb type becomes an
+    /// offering with its id on the first place `prefer` allows, spilling to the others
+    /// (hidden offerings `<id>@<runtime>`). An orb records the orb type it was created
+    /// as, wherever it was placed. The provider and each retired token serve every orb
+    /// type.
+    pub fn normalize(&mut self) -> Result<(), ConfigError> {
+        let inv = |m: &str| Err(ConfigError::Invalid(m.into()));
+        if self.config_version == ConfigVersion::V1 {
+            if self.provider.is_some() || self.prefer.is_some() || !self.orb_types.is_empty() {
+                return inv("provider, prefer and orb_types need config_version: v2");
+            }
+            return Ok(());
+        }
+        if !self.offerings.is_empty() || !self.providers.is_empty() {
+            return inv(
+                "config_version v2 has orb_types and provider instead of offerings and providers",
+            );
+        }
+        let Some(provider) = &self.provider else {
+            return inv("config_version v2 needs a provider");
+        };
+        if self.orb_types.is_empty() {
+            return inv("orb_types is empty");
+        }
+        let prefer = match self.prefer.clone() {
+            Some(p) => {
+                if p.is_empty() || p.iter().enumerate().any(|(i, x)| p[..i].contains(x)) {
+                    return inv("prefer lists local and boat, each at most once");
+                }
+                if p.contains(&Prefer::Boat) && self.boat.is_none() {
+                    return inv("prefer: boat needs a `boat:` section");
+                }
+                p
+            }
+            None => vec![Prefer::Local, Prefer::Boat],
+        };
+        for t in &self.orb_types {
+            let boat = !t.kvm
+                && self.boat.is_some()
+                && crate::backend::boat::size_for(t.vcpus, t.memory_mib).is_some();
+            let runtimes: Vec<OfferingRuntime> = prefer
+                .iter()
+                .filter_map(|p| match p {
+                    Prefer::Local if t.kvm => Some(OfferingRuntime::Qemu),
+                    Prefer::Local => Some(OfferingRuntime::Firecracker),
+                    Prefer::Boat => boat.then_some(OfferingRuntime::Boat),
+                })
+                .collect();
+            if runtimes.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "orb type {}: nowhere in prefer can run it (Boat runs no kvm and only {})",
+                    t.id,
+                    crate::backend::boat::describe_sizes()
+                )));
+            }
+            let id = |i: usize, r: OfferingRuntime| match i {
+                0 => t.id.clone(),
+                _ => OfferingId::new(format!("{}@{}", t.id, r.as_str())),
+            };
+            for (i, &runtime) in runtimes.iter().enumerate() {
+                self.offerings.push(OfferingConfig {
+                    id: id(i, runtime),
+                    provider_token_file: None,
+                    runtime,
+                    resources: ResourcesConfig {
+                        vcpus: t.vcpus,
+                        memory_mib: t.memory_mib,
+                        disk_gib: t.disk_gib,
+                    },
+                    spill_to: match i {
+                        0 => runtimes
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .map(|(j, &r)| id(j, r))
+                            .collect(),
+                        _ => vec![],
+                    },
+                });
+            }
+        }
+        let types: Vec<OfferingId> = self.orb_types.iter().map(|t| t.id.clone()).collect();
+        let tokens = std::iter::once(&provider.token_file).chain(&provider.retired_token_files);
+        for (i, token_file) in tokens.enumerate() {
+            self.providers.push(ProviderConfig {
+                id: match i {
+                    0 => "provider".into(),
+                    _ => format!("retired-{i}"),
+                },
+                token_file: token_file.clone(),
+                orb_types: types.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Structural validation. Capability validation against the backend happens when
@@ -301,6 +470,9 @@ impl CoordinatorConfig {
             .map_err(|e| ConfigError::Invalid(format!("public_url: {e}")))?;
         if self.heartbeat_interval_ms == 0 {
             return inv("heartbeat_interval_ms must be > 0".into());
+        }
+        if self.offerings.is_empty() {
+            return inv("no offerings (or orb_types, with config_version: v2)".into());
         }
         let mut offerings = HashSet::new();
         for o in &self.offerings {
@@ -449,6 +621,110 @@ mod tests {
         );
         let shared = "  - { id: homelab, token_file: /t/qemu, orb_types: [qemu-4vcpu-8gb] }\n";
         assert!(check(shared).unwrap().contains("/t/qemu is used twice"));
+    }
+
+    fn load_str(yaml: &str) -> Result<CoordinatorConfig, String> {
+        let mut c: CoordinatorConfig = serde_saphyr::from_str(yaml).map_err(|e| e.to_string())?;
+        c.normalize().map_err(|e| e.to_string())?;
+        c.validate().map_err(|e| e.to_string())?;
+        Ok(c)
+    }
+
+    const V2: &str = "config_version: v2\npublic_url: https://c.example:7443\n\
+        boat: { api_key_file: /t/boat, capacity: { vcpus: 8, memory_mib: 16384 } }\n\
+        provider: { token_file: /t/p, retired_token_files: [/t/old-a, /t/old-b] }\n";
+
+    /// Each orb type is an offering named after it, placed where `prefer` says first and
+    /// spilling to the rest; kvm runs only in QEMU, Boat only takes its own sizes.
+    #[test]
+    fn v2_orb_types_become_offerings_in_prefer_order() {
+        let yaml = format!(
+            "{V2}prefer: [boat, local]\norb_types:\n\
+             \x20 - {{ id: small, vcpus: 2, memory_mib: 4096, disk_gib: 20 }}\n\
+             \x20 - {{ id: odd, vcpus: 1, memory_mib: 2048, disk_gib: 20 }}\n\
+             \x20 - {{ id: kvm, vcpus: 4, memory_mib: 8192, disk_gib: 30, kvm: true }}\n"
+        );
+        let c = load_str(&yaml).unwrap();
+        let got: Vec<_> = c
+            .offerings
+            .iter()
+            .map(|o| {
+                (
+                    o.id.as_str(),
+                    o.runtime,
+                    o.spill_to.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        use OfferingRuntime::*;
+        assert_eq!(
+            got,
+            vec![
+                ("small", Boat, vec!["small@firecracker"]),
+                ("small@firecracker", Firecracker, vec![]),
+                ("odd", Firecracker, vec![]),
+                ("kvm", Qemu, vec![]),
+            ]
+        );
+        assert_eq!(c.offering("kvm").unwrap().resources.disk_gib, 30);
+        let providers: Vec<_> = c
+            .providers
+            .iter()
+            .map(|p| (p.id.as_str(), p.token_file.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            providers,
+            vec![
+                ("provider", "/t/p"),
+                ("retired-1", "/t/old-a"),
+                ("retired-2", "/t/old-b")
+            ]
+        );
+        for p in &c.providers {
+            let types: Vec<_> = p.orb_types.iter().map(|t| t.as_str()).collect();
+            assert_eq!(types, ["small", "odd", "kvm"], "{}", p.id);
+        }
+
+        // Default prefer: the agents first, Boat as overflow.
+        let yaml = format!(
+            "{V2}orb_types:\n  - {{ id: small, vcpus: 2, memory_mib: 4096, disk_gib: 20 }}\n"
+        );
+        let c = load_str(&yaml).unwrap();
+        assert_eq!(c.offerings[0].runtime, Firecracker);
+        assert_eq!(c.offerings[0].spill_to, [OfferingId::new("small@boat")]);
+    }
+
+    #[test]
+    fn v2_refuses_what_it_cannot_place_and_v1_fields() {
+        let only_boat = format!(
+            "{V2}prefer: [boat]\norb_types:\n  - {{ id: kvm, vcpus: 4, memory_mib: 8192, disk_gib: 20, kvm: true }}\n"
+        );
+        assert!(
+            load_str(&only_boat)
+                .unwrap_err()
+                .contains("orb type kvm: nowhere")
+        );
+        let mixed = format!(
+            "{V2}orb_types:\n  - {{ id: a, vcpus: 2, memory_mib: 4096, disk_gib: 20 }}\n\
+             offerings:\n  - {{ id: b, runtime: qemu, resources: {{ vcpus: 2, memory_mib: 4096, disk_gib: 20 }} }}\n"
+        );
+        assert!(
+            load_str(&mixed)
+                .unwrap_err()
+                .contains("instead of offerings")
+        );
+        let v1 = "public_url: https://c.example:7443\nprovider: { token_file: /t/p }\n\
+                  offerings:\n  - { id: b, runtime: qemu, resources: { vcpus: 2, memory_mib: 4096, disk_gib: 20 } }\n";
+        assert!(
+            load_str(v1)
+                .unwrap_err()
+                .contains("need config_version: v2")
+        );
+        // A retired token must not be the provider's own.
+        let shared = "config_version: v2\npublic_url: https://c.example:7443\n\
+                      provider: { token_file: /t/p, retired_token_files: [/t/p] }\n\
+                      orb_types:\n  - { id: a, vcpus: 2, memory_mib: 4096, disk_gib: 20 }\n";
+        assert!(load_str(shared).unwrap_err().contains("/t/p is used twice"));
     }
 
     #[test]

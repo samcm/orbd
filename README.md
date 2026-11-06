@@ -23,8 +23,9 @@ hosts, and hosted [Boat](#boat) sandboxes.
 
 ## How it works
 
-A coordinator runs `amp orb provider` for an Amp orb provider whose orb types are its
-offerings (e.g. `qemu-4vcpu-8gb`) and places each orb on an agent. Agents run on your
+A coordinator runs `amp orb provider` for an Amp orb provider whose orb types say what
+an orb gets (e.g. `4vcpu-8gb`, `kvm-4vcpu-8gb`) and places each orb on an agent or
+Boat. Agents run on your
 own x86_64 hosts, dial the coordinator over mutual-TLS gRPC, and run orbs in QEMU,
 Firecracker or Docker. Coordinator and agent are the same static `orbd` binary; the
 coordinator also runs on aarch64.
@@ -70,32 +71,34 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 ## Setup
 
 1. **Provider token.** In Amp's workspace settings, create an orb provider, e.g.
-   `homelab`, and save its token as `tokens/homelab`. Under the provider's
+   `homelab`, and save its token as `tokens/provider`. Under the provider's
    [orb types](https://ampcode.com/docs/orbs/self-hosted#orb-types), add one per
-   offering, named exactly as the offering's `id`, and pick the default.
+   entry of `orb_types` below, named exactly as its `id`, and pick the default.
 2. **Coordinator** (x86_64 or arm64), with `orbd.yaml`:
 
    ```yaml
+   config_version: v2
    public_url: https://coordinator.example:7443   # agents dial this
-   offerings:
-     - id: qemu-4vcpu-8gb
-       runtime: qemu
-       resources: { vcpus: 4, memory_mib: 8192, disk_gib: 40 }
-     - id: firecracker-2vcpu-4gb
-       runtime: firecracker            # vCPUs: 1 or an even number
-       resources: { vcpus: 2, memory_mib: 4096, disk_gib: 40 }
-   providers:
-     - id: homelab
-       token_file: /etc/orbd/tokens/homelab
-       orb_types: [qemu-4vcpu-8gb, firecracker-2vcpu-4gb]
+   provider: { token_file: /etc/orbd/tokens/provider }
+   orb_types:                                     # the first is the default
+     - { id: 2vcpu-4gb, vcpus: 2, memory_mib: 4096, disk_gib: 40 }
+     - { id: kvm-4vcpu-8gb, vcpus: 4, memory_mib: 8192, disk_gib: 40, kvm: true }
    ```
 
-   A spawn runs on the offering its orb type names; an orb type not in `orb_types`
-   fails the spawn. If the provider has no orb types in Amp, spawns use the first one.
-   An offering can instead have a provider of its own: give it
-   `provider_token_file: /etc/orbd/tokens/<offering>` with that provider's token. Both
-   can serve the same offering, e.g. while threads started on per-offering providers
-   finish; every provider needs its own token.
+   An orb type says what an orb gets; orbd decides where it runs. On the agents an orb
+   type with `kvm: true` runs in QEMU and has `/dev/kvm`, any other in Firecracker
+   (vCPUs: 1 or an even number). A spawn of a new orb uses the orb type the thread
+   picked, or the first one if it has none; an orb type not listed fails the spawn. An
+   orb keeps its orb type and place for life, whatever later jobs name.
+   `retired_token_files` under `provider` lists tokens of providers you are moving
+   away from, e.g. per-offering ones: they are still served, so their threads keep their
+   orbs, and new orbs from them get the default orb type.
+
+   Files without `config_version` are v1: `offerings`, each with a `runtime` (`qemu`,
+   `firecracker`, `docker`, `boat`) and `resources`, served by `providers` (`id`,
+   `token_file`, `orb_types` naming offerings) or by a per-offering
+   `provider_token_file`, and spilling by `spill_to`. A v2 file is turned into the same
+   offerings when it is loaded.
 
    ```sh
    docker run -d --name orbd -p 7443:7443 -v orbd:/var/lib/orbd \
@@ -125,7 +128,7 @@ each agent's orbs, its reservations against its capacity, and its disk: free, al
 by orbd, reserved and limit (also exported as `orbd_agent_disk_*_bytes` and
 `orbd_reserved_disk_bytes`).
 
-Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An offering's
+Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An orb type's
 `disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
 admitted by what the host actually has: a new or waking orb needs free space for its
 headroom (up to `running_orb_disk_headroom_gib`, default 10, of growth plus its memory
@@ -156,12 +159,13 @@ is built on it and nothing has used it for 72 hours (the current image of a prew
 reference is kept), and image layers no build has used for as long. It checks at
 startup, hourly and after each orb delete.
 
-An offering can list `spill_to` offerings: when none of its hosts can take a new orb
-(all full, down or unreported), the first listed offering that can takes it instead,
-e.g. a Firecracker offering spilling to a Boat size when the homelab is full. Targets
-must be like-for-like: `/dev/kvm` in the orb on both or neither, and at least as many
-vCPUs and as much memory. An orb lives where it was placed, so a spilled orb wakes on
-its spill target for the rest of its life. Resumes never spill.
+`prefer` sets where new orbs go, in order: `[local, boat]` (the default) runs them on
+the agents and sends them to Boat when no agent can take them (all full, down or
+unreported); `[boat, local]` uses Boat until its `capacity` is held, then the agents.
+Boat only takes orb types without `kvm` in one of its sizes. An orb lives where it was
+placed, so an orb placed on Boat wakes there for the rest of its life. Resumes never
+move. (In v1, an offering's `spill_to` lists like-for-like offerings to the same
+effect.)
 
 The coordinator keeps the Amp CLI current with `amp update` (every
 `amp_cli_update_interval_secs`, 6 h by default) and puts each new version on probation.
@@ -190,9 +194,9 @@ or superseded.
 ## Boat
 
 The coordinator can also run orbs as [Boat](https://boat.dev) sandboxes, with no agent:
-it drives Boat's API itself. Add a `boat:` section and offerings with `runtime: boat`
-whose vCPUs and memory are a Boat size (`small` 2/4096, `default` 4/8192, `large`
-8/16384, `xlarge` 16/32768; the free trial has only the first two):
+it drives Boat's API itself. Add a `boat:` section; orb types without `kvm` whose vCPUs
+and memory are a Boat size (`small` 2/4096, `default` 4/8192, `large` 8/16384, `xlarge`
+16/32768; the free trial has only the first two) then run on Boat as `prefer` says:
 
 ```yaml
 idle_orb_ttl_days: 7                       # below Boat's 14 days, see below
@@ -200,15 +204,10 @@ boat:
   api_key_file: /etc/orbd/tokens/boat      # a boat_... API key
   capacity: { vcpus: 4, memory_mib: 8192 } # what running Boat orbs may hold together
   auto_stop_secs: 86400                    # optional; Boat stops a forgotten orb (0: never)
-offerings:
-  - id: boat-2vcpu-4gb
-    runtime: boat
-    resources: { vcpus: 2, memory_mib: 4096, disk_gib: 51 }
-providers:
-  - id: homelab
-    token_file: /etc/orbd/tokens/homelab
-    orb_types: [boat-2vcpu-4gb]
+prefer: [boat, local]                      # Boat first, the agents once it is full
 ```
+
+Boat sizes the disk itself; `disk_gib` does not apply there.
 
 Orbs run on Boat's Ubuntu machine, not Amp's orb image; the first spawn installs the
 Amp CLI. Sandboxes get none of the Boat account's secrets (`noEnv`). A pause stops the

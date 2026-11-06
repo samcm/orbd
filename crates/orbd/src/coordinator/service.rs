@@ -42,13 +42,13 @@ fn short(name: &str, v: &str) -> Result<(), String> {
 }
 
 impl DispatchService {
-    /// The offering a request is for. A provider's spawn names it as `ORB_TYPE`; its
-    /// pause or delete does not, so it gets the provider's orb types, for the core to
-    /// pick the one its orb was created as.
-    fn offering(&self, r: &pb::DispatchRequest) -> Result<(&Offering, Vec<OfferingId>), Rejection> {
+    /// The offering a new orb of this request is placed as (an existing orb keeps its
+    /// own). A provider's spawn names it as `ORB_TYPE`; without one, and for a pause or
+    /// delete, it is the provider's first orb type.
+    fn offering(&self, r: &pb::DispatchRequest) -> Result<&Offering, Rejection> {
         let get = |id: &OfferingId| self.offerings.get(id).ok_or("unknown offering");
         if r.provider_id.is_empty() {
-            return Ok((get(&OfferingId::new(r.offering_id.as_str()))?, vec![]));
+            return Ok(get(&OfferingId::new(r.offering_id.as_str()))?);
         }
         if !r.offering_id.is_empty() {
             return Err("a job names a provider or an offering, not both".into());
@@ -57,14 +57,12 @@ impl DispatchService {
             .providers
             .get(&r.provider_id)
             .ok_or("unknown provider")?;
-        if !matches!(r.action, Some(pb::dispatch_request::Action::Spawn(_))) {
-            return Ok((get(&types[0])?, types.clone()));
-        }
-        if r.orb_type.is_empty() {
-            return Ok((get(&types[0])?, vec![]));
+        let spawn = matches!(r.action, Some(pb::dispatch_request::Action::Spawn(_)));
+        if !spawn || r.orb_type.is_empty() {
+            return Ok(get(&types[0])?);
         }
         match types.iter().find(|t| t.as_str() == r.orb_type) {
-            Some(t) => Ok((get(t)?, vec![])),
+            Some(t) => Ok(get(t)?),
             None => Err(Rejection(
                 Status::Failed,
                 format!(
@@ -84,7 +82,7 @@ impl DispatchService {
     fn validate(&self, r: pb::DispatchRequest) -> Result<(ValidatedRequest, u64), Rejection> {
         let invocation_id =
             InvocationId::parse(&r.invocation_id).map_err(|_| "invalid invocation_id")?;
-        let (offering, orb_types) = self.offering(&r)?;
+        let offering = self.offering(&r)?;
         let amp_orb_id =
             AmpOrbId::parse(&r.amp_orb_id).map_err(|_| "invalid ORB_ID".to_string())?;
         let mut env = PermittedGuestEnv::default();
@@ -154,7 +152,6 @@ impl DispatchService {
             ValidatedRequest {
                 invocation_id,
                 offering_id: offering.id.clone(),
-                orb_types,
                 amp_endpoint: offering.amp_endpoint.clone(),
                 amp_orb_id,
                 action,
