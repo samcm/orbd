@@ -202,6 +202,13 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
                 service::DispatchService {
                     core: core_tx,
                     offerings: offerings_arc,
+                    providers: Arc::new(
+                        config
+                            .providers
+                            .iter()
+                            .map(|p| (p.id.clone(), p.orb_types.clone()))
+                            .collect(),
+                    ),
                     key,
                 },
             ),

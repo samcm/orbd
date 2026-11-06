@@ -23,10 +23,11 @@ hosts, and hosted [Boat](#boat) sandboxes.
 
 ## How it works
 
-A coordinator runs one `amp orb provider` per offering (e.g. `qemu-4vcpu-8gb`) and places
-each orb on an agent. Agents run on your own x86_64 hosts, dial the coordinator over
-mutual-TLS gRPC, and run orbs in QEMU, Firecracker or Docker. Coordinator and agent are
-the same static `orbd` binary; the coordinator also runs on aarch64.
+A coordinator runs `amp orb provider` for an Amp orb provider whose orb types are its
+offerings (e.g. `qemu-4vcpu-8gb`) and places each orb on an agent. Agents run on your
+own x86_64 hosts, dial the coordinator over mutual-TLS gRPC, and run orbs in QEMU,
+Firecracker or Docker. Coordinator and agent are the same static `orbd` binary; the
+coordinator also runs on aarch64.
 
 > **Early.** Configuration and on-disk formats may still change.
 
@@ -35,7 +36,7 @@ the same static `orbd` binary; the coordinator also runs on aarch64.
                   ▲  pulls lifecycle jobs
 ┌─────────────────┴──────────────────┐
 │ orbd coordinator                   │
-│  amp orb provider (per offering)   │
+│  amp orb provider (per provider)   │
 │  placement, command journal        │
 └─────────────────▲──────────────────┘
                   │  mTLS gRPC (agents dial in)
@@ -68,8 +69,10 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 
 ## Setup
 
-1. **Provider tokens.** In Amp's workspace settings, create an orb provider per offering
-   and save each token as `tokens/<offering>`.
+1. **Provider token.** In Amp's workspace settings, create an orb provider, e.g.
+   `homelab`, and save its token as `tokens/homelab`. Under the provider's
+   [orb types](https://ampcode.com/docs/orbs/self-hosted#orb-types), add one per
+   offering, named exactly as the offering's `id`, and pick the default.
 2. **Coordinator** (x86_64 or arm64), with `orbd.yaml`:
 
    ```yaml
@@ -78,12 +81,21 @@ Static binaries for x86_64 and aarch64 are attached to each release.
      - id: qemu-4vcpu-8gb
        runtime: qemu
        resources: { vcpus: 4, memory_mib: 8192, disk_gib: 40 }
-       provider_token_file: /etc/orbd/tokens/qemu-4vcpu-8gb
      - id: firecracker-2vcpu-4gb
        runtime: firecracker            # vCPUs: 1 or an even number
        resources: { vcpus: 2, memory_mib: 4096, disk_gib: 40 }
-       provider_token_file: /etc/orbd/tokens/firecracker-2vcpu-4gb
+   providers:
+     - id: homelab
+       token_file: /etc/orbd/tokens/homelab
+       orb_types: [qemu-4vcpu-8gb, firecracker-2vcpu-4gb]
    ```
+
+   A spawn runs on the offering its orb type names; an orb type not in `orb_types`
+   fails the spawn. If the provider has no orb types in Amp, spawns use the first one.
+   An offering can instead have a provider of its own: give it
+   `provider_token_file: /etc/orbd/tokens/<offering>` with that provider's token. Both
+   can serve the same offering, e.g. while threads started on per-offering providers
+   finish; every provider needs its own token.
 
    ```sh
    docker run -d --name orbd -p 7443:7443 -v orbd:/var/lib/orbd \
@@ -192,7 +204,10 @@ offerings:
   - id: boat-2vcpu-4gb
     runtime: boat
     resources: { vcpus: 2, memory_mib: 4096, disk_gib: 51 }
-    provider_token_file: /etc/orbd/tokens/boat-2vcpu-4gb
+providers:
+  - id: homelab
+    token_file: /etc/orbd/tokens/homelab
+    orb_types: [boat-2vcpu-4gb]
 ```
 
 Orbs run on Boat's Ubuntu machine, not Amp's orb image; the first spawn installs the

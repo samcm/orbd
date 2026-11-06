@@ -34,6 +34,9 @@ const BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ValidatedRequest {
     pub invocation_id: InvocationId,
     pub offering_id: OfferingId,
+    /// A pause or delete from a provider with orb types: those types. The request is
+    /// for the one its orb was created as, else `offering_id`.
+    pub orb_types: Vec<OfferingId>,
     pub amp_endpoint: AmpEndpointId,
     pub amp_orb_id: AmpOrbId,
     pub action: ReqAction,
@@ -219,12 +222,23 @@ impl Core {
         if let Some(existing) = self.db.call(move |c| store::get_request(c, inv)).await? {
             return self.reattach(existing, resume_after_log_seq, tx).await;
         }
+        let mut offering_id = v.offering_id.clone();
+        if !v.orb_types.is_empty() {
+            let (ep, aid) = (v.amp_endpoint.clone(), v.amp_orb_id.clone());
+            let orb = self
+                .db
+                .call(move |c| store::get_orb_by_identity(c, ep.as_str(), aid.as_str()))
+                .await?;
+            if let Some(o) = orb.filter(|o| v.orb_types.contains(&o.offering_id)) {
+                offering_id = o.offering_id;
+            }
+        }
         let now = unix_ms_now();
         let used = DISPATCH_BUDGET_MS.saturating_sub(v.remaining_budget_ms.min(DISPATCH_BUDGET_MS));
         let start = now.saturating_sub(used);
         let mut req = Req {
             invocation_id: inv,
-            offering_id: v.offering_id.clone(),
+            offering_id,
             amp_endpoint: v.amp_endpoint.clone(),
             amp_orb_id: v.amp_orb_id.clone(),
             action: v.action.clone(),

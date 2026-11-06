@@ -1,6 +1,7 @@
-//! Supervises one `amp orb provider` child per offering that has a provider token.
-//! Each child gets only its own token, `ORBD_OFFERING_ID` and `ORBD_DISPATCH_SOCKET`,
-//! and runs the generated `orbd-dispatch` wrapper for every job.
+//! Supervises one `amp orb provider` child per offering that has a provider token, and
+//! one per provider with orb types. Each child gets only its own token,
+//! `ORBD_OFFERING_ID` (or `ORBD_PROVIDER_ID`) and `ORBD_DISPATCH_SOCKET`, and runs the
+//! generated `orbd-dispatch` wrapper for every job.
 //!
 //! Update checks: the Amp CLI self-updates by default. Children run with
 //! `AMP_SKIP_UPDATE_CHECK=1` (documented override that disables all update checks) and
@@ -17,7 +18,7 @@
 //! back to the known-good copy and that version is never run again; the next release
 //! gets its own probation. State lives in `<state>/amp-cli.json`.
 
-use super::dispatch::{CLI_CHECK, ENV_DISPATCH_SOCKET, ENV_OFFERING_ID};
+use super::dispatch::{CLI_CHECK, ENV_DISPATCH_SOCKET, ENV_OFFERING_ID, ENV_PROVIDER_ID};
 use crate::config::coordinator::CoordinatorConfig;
 use anyhow::{Context, anyhow};
 use secrecy::{ExposeSecret, SecretString};
@@ -63,7 +64,10 @@ const ENV_ALLOW: &[&str] = &[
 ];
 
 struct ChildSpec {
+    /// The offering id, or the provider id for a provider with orb types (`id_env`
+    /// says which). Logs and metrics label it `offering` either way.
     offering: String,
+    id_env: &'static str,
     /// The CLI `amp update` maintains; children run [`Active::path`].
     amp_cli: PathBuf,
     amp_url: String,
@@ -175,7 +179,8 @@ fn write_atomic(path: &Path, content: &str, mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Starts supervising provider children for every offering with `provider_token_file`.
+/// Starts supervising provider children for every offering with `provider_token_file`
+/// and every provider with orb types.
 /// Call only after recovery and backend reconciliation, so no job arrives early.
 /// The returned task ends after `shutdown` once all children have exited.
 pub fn spawn_all(
@@ -183,12 +188,21 @@ pub fn spawn_all(
     dispatch_socket: &Path,
     shutdown: CancellationToken,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let offerings: Vec<_> = config
+    let children: Vec<_> = config
         .offerings
         .iter()
-        .filter(|o| o.provider_token_file.is_some())
+        .filter_map(|o| {
+            let token = o.provider_token_file.as_ref()?;
+            Some((o.id.as_str(), ENV_OFFERING_ID, token))
+        })
+        .chain(
+            config
+                .providers
+                .iter()
+                .map(|p| (p.id.as_str(), ENV_PROVIDER_ID, &p.token_file)),
+        )
         .collect();
-    if offerings.is_empty() {
+    if children.is_empty() {
         return Ok(tokio::spawn(async move { shutdown.cancelled().await }));
     }
     let bin_dir = config.state_dir.join("bin");
@@ -215,12 +229,13 @@ pub fn spawn_all(
 
     let (verdict_tx, verdict_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut specs = Vec::new();
-    for o in offerings {
+    for (id, id_env, token_file) in children {
         specs.push(ChildSpec {
-            offering: o.id.as_str().to_owned(),
+            offering: id.to_owned(),
+            id_env,
             amp_cli: config.amp_cli.clone(),
             amp_url: config.amp_url.clone(),
-            token_file: o.provider_token_file.clone().expect("filtered"),
+            token_file: token_file.clone(),
             wrapper: wrapper.clone(),
             settings: settings.clone(),
             socket: dispatch_socket.to_owned(),
@@ -407,6 +422,7 @@ impl ChildSpec {
     fn clone_for_cli(&self) -> ChildSpec {
         ChildSpec {
             offering: String::new(),
+            id_env: ENV_OFFERING_ID,
             amp_cli: self.amp_cli.clone(),
             amp_url: self.amp_url.clone(),
             token_file: PathBuf::new(),
@@ -623,7 +639,7 @@ async fn run_once(
     let token = read_token(&spec.token_file)?;
     let mut cmd = base_command_at(&active.path, spec);
     cmd.env("AMP_ORB_PROVIDER_TOKEN", token.expose_secret())
-        .env(ENV_OFFERING_ID, &spec.offering)
+        .env(spec.id_env, &spec.offering)
         .env(ENV_DISPATCH_SOCKET, &spec.socket)
         .arg("orb")
         .arg("provider")

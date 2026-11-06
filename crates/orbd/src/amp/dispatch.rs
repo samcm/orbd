@@ -27,8 +27,10 @@ pub mod exit {
     pub const DEADLINE: i32 = 124;
 }
 
-/// Environment set by the coordinator for its `amp orb provider` children.
+/// Environment set by the coordinator for its `amp orb provider` children: the
+/// offering, or for a provider with orb types the provider.
 pub const ENV_OFFERING_ID: &str = "ORBD_OFFERING_ID";
+pub const ENV_PROVIDER_ID: &str = "ORBD_PROVIDER_ID";
 pub const ENV_DISPATCH_SOCKET: &str = "ORBD_DISPATCH_SOCKET";
 
 /// Marker for the coordinator's Amp CLI probation (`provider.rs`): after a result,
@@ -97,7 +99,12 @@ fn collect_guest_env(
 
 fn build_job() -> Result<Job, String> {
     let socket = PathBuf::from(require(ENV_DISPATCH_SOCKET)?);
-    let offering_id = require(ENV_OFFERING_ID)?;
+    let provider_id = var(ENV_PROVIDER_ID).unwrap_or_default();
+    let offering_id = if provider_id.is_empty() {
+        require(ENV_OFFERING_ID)?
+    } else {
+        String::new()
+    };
     let operation = require("ORB_OPERATION")?;
     let amp_orb_id = require("ORB_ID")?;
     let action = match operation.as_str() {
@@ -140,6 +147,8 @@ fn build_job() -> Result<Job, String> {
             amp_sandbox_id: var("AMP_SANDBOX_ID").unwrap_or_default(),
             orb_sandbox_id: var("ORB_SANDBOX_ID").unwrap_or_default(),
             action: Some(action),
+            provider_id,
+            orb_type: var("ORB_TYPE").unwrap_or_default(),
         },
     })
 }

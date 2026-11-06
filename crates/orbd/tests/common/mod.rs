@@ -40,6 +40,8 @@ pub struct Cluster {
     agent_orbs: u64,
     /// The offering jobs are dispatched to.
     pub offering: String,
+    /// When set, jobs come from this provider with orb types instead of `offering`.
+    pub provider: Option<String>,
     /// Extra agent environment, applied last (e.g. `ORBD_CAPACITY_DISK_GIB`).
     pub agent_env: Vec<(String, String)>,
 }
@@ -109,6 +111,7 @@ offerings:
             tokens: BTreeMap::new(),
             agent_orbs,
             offering,
+            provider: None,
             // Real runtimes use the host's disk: keep little of it in reserve.
             agent_env: if runtime == "fake" {
                 vec![]
@@ -354,7 +357,6 @@ offerings:
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("ORBD_DISPATCH_SOCKET", self.dispatch_socket())
-            .env("ORBD_OFFERING_ID", &self.offering)
             .env("ORB_OPERATION", op)
             .env("ORB_ID", orb)
             .env("ORB_SANDBOX_ID", format!("sandbox-{orb}"))
@@ -364,6 +366,10 @@ offerings:
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        match &self.provider {
+            Some(p) => c.env("ORBD_PROVIDER_ID", p),
+            None => c.env("ORBD_OFFERING_ID", &self.offering),
+        };
         if op == "spawn" {
             c.env("ORB_IMAGE", "example.invalid/amp-orb:latest")
                 .env("ORB_TOKEN", TOKEN)

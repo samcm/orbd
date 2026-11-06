@@ -1,6 +1,6 @@
 //! Coordinator configuration (`orbd coordinator`, default `/etc/orbd/orbd.yaml`).
 //!
-//! Only `public_url` and `offerings` are required:
+//! Only `public_url` and `offerings` are required; `providers` serve them to Amp:
 //!
 //! ```yaml
 //! public_url: https://coordinator.example:7443
@@ -8,7 +8,10 @@
 //!   - id: qemu-4vcpu-8gb
 //!     runtime: qemu
 //!     resources: { vcpus: 4, memory_mib: 8192, disk_gib: 40 }
-//!     provider_token_file: /etc/orbd/tokens/qemu-4vcpu-8gb
+//! providers:
+//!   - id: homelab
+//!     token_file: /etc/orbd/tokens/homelab
+//!     orb_types: [qemu-4vcpu-8gb]
 //! ```
 //!
 //! The coordinator serves one Amp endpoint, one agent fleet and optionally Boat
@@ -76,6 +79,23 @@ pub struct CoordinatorConfig {
     /// Boat (boat.dev) sandboxes for offerings with `runtime: boat`.
     pub boat: Option<BoatConfig>,
     pub offerings: Vec<OfferingConfig>,
+    /// Amp orb providers whose orb types are offerings: one token serves them all.
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+}
+
+/// One Amp orb provider with orb types. Each orb type in Amp is named after the
+/// offering it runs on; Amp passes the thread's type to every spawn as `ORB_TYPE`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    /// Names the provider in logs and metrics; distinct from every offering id.
+    pub id: String,
+    /// `AMP_ORB_PROVIDER_TOKEN` for this provider's `amp orb provider` child.
+    pub token_file: PathBuf,
+    /// The offerings, named as orb types in Amp. The first is used when a spawn has no
+    /// `ORB_TYPE` (the provider has no orb types in Amp).
+    pub orb_types: Vec<OfferingId>,
 }
 
 /// `boat:`: runs orbs as Boat sandboxes, driven by the coordinator over Boat's API.
@@ -324,6 +344,43 @@ impl CoordinatorConfig {
         {
             return inv("boat.capacity must be non-zero".into());
         }
+        let mut providers = HashSet::new();
+        for p in &self.providers {
+            if offerings.contains(p.id.as_str()) || !providers.insert(p.id.as_str()) {
+                return inv(format!(
+                    "provider {}: the id is already an offering or provider",
+                    p.id
+                ));
+            }
+            if p.orb_types.is_empty() {
+                return inv(format!("provider {}: orb_types is empty", p.id));
+            }
+            for (i, t) in p.orb_types.iter().enumerate() {
+                if p.orb_types[..i].contains(t) {
+                    return inv(format!("provider {}: orb_types lists {t} twice", p.id));
+                }
+                if self.offering(t.as_str()).is_none() {
+                    return inv(format!(
+                        "provider {}: orb type {t} is not an offering",
+                        p.id
+                    ));
+                }
+            }
+        }
+        // Amp splits one token's jobs between all the providers polling with it.
+        let mut tokens = HashSet::new();
+        let token_files = self
+            .offerings
+            .iter()
+            .filter_map(|o| o.provider_token_file.as_ref());
+        for t in token_files.chain(self.providers.iter().map(|p| &p.token_file)) {
+            if !tokens.insert(t) {
+                return inv(format!(
+                    "provider token file {} is used twice; each provider needs its own token",
+                    t.display()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -364,6 +421,34 @@ mod tests {
         }
         .to_offering()
         .unwrap()
+    }
+
+    #[test]
+    fn provider_orb_types_must_be_offerings_with_their_own_token() {
+        let check = |providers: &str| {
+            let yaml = format!(
+                "public_url: https://c.example:7443\n\
+                 offerings:\n  - id: qemu-4vcpu-8gb\n    runtime: qemu\n    \
+                 resources: {{ vcpus: 4, memory_mib: 8192, disk_gib: 40 }}\n    \
+                 provider_token_file: /t/qemu\n\
+                 providers:\n{providers}"
+            );
+            serde_saphyr::from_str::<CoordinatorConfig>(&yaml)
+                .unwrap()
+                .validate()
+                .err()
+                .map(|e| e.to_string())
+        };
+        let ok = "  - { id: homelab, token_file: /t/homelab, orb_types: [qemu-4vcpu-8gb] }\n";
+        assert_eq!(check(ok), None);
+        let unknown = "  - { id: homelab, token_file: /t/homelab, orb_types: [gpu] }\n";
+        assert!(
+            check(unknown)
+                .unwrap()
+                .contains("orb type gpu is not an offering")
+        );
+        let shared = "  - { id: homelab, token_file: /t/qemu, orb_types: [qemu-4vcpu-8gb] }\n";
+        assert!(check(shared).unwrap().contains("/t/qemu is used twice"));
     }
 
     #[test]

@@ -17,7 +17,19 @@ use tonic::{Request, Response};
 pub struct DispatchService {
     pub core: mpsc::Sender<Msg>,
     pub offerings: Arc<HashMap<OfferingId, Offering>>,
+    /// Each provider with orb types: its orb types (offerings), the default first.
+    pub providers: Arc<HashMap<String, Vec<OfferingId>>>,
     pub key: Arc<SecretKey>,
+}
+
+/// Why a request was not handed to the core: `Invalid` (the default) blames the job,
+/// so the Amp CLI that ran it; `Failed` blames orbd's configuration.
+struct Rejection(Status, String);
+
+impl<S: Into<String>> From<S> for Rejection {
+    fn from(msg: S) -> Self {
+        Self(Status::Invalid, msg.into())
+    }
 }
 
 const MAX_FIELD: usize = 512;
@@ -30,13 +42,49 @@ fn short(name: &str, v: &str) -> Result<(), String> {
 }
 
 impl DispatchService {
-    fn validate(&self, r: pb::DispatchRequest) -> Result<(ValidatedRequest, u64), String> {
+    /// The offering a request is for. A provider's spawn names it as `ORB_TYPE`; its
+    /// pause or delete does not, so it gets the provider's orb types, for the core to
+    /// pick the one its orb was created as.
+    fn offering(&self, r: &pb::DispatchRequest) -> Result<(&Offering, Vec<OfferingId>), Rejection> {
+        let get = |id: &OfferingId| self.offerings.get(id).ok_or("unknown offering");
+        if r.provider_id.is_empty() {
+            return Ok((get(&OfferingId::new(r.offering_id.as_str()))?, vec![]));
+        }
+        if !r.offering_id.is_empty() {
+            return Err("a job names a provider or an offering, not both".into());
+        }
+        let types = self
+            .providers
+            .get(&r.provider_id)
+            .ok_or("unknown provider")?;
+        if !matches!(r.action, Some(pb::dispatch_request::Action::Spawn(_))) {
+            return Ok((get(&types[0])?, types.clone()));
+        }
+        if r.orb_type.is_empty() {
+            return Ok((get(&types[0])?, vec![]));
+        }
+        match types.iter().find(|t| t.as_str() == r.orb_type) {
+            Some(t) => Ok((get(t)?, vec![])),
+            None => Err(Rejection(
+                Status::Failed,
+                format!(
+                    "orb type {:?} is not one of provider {}'s orb_types ({}); name each orb type in Amp after one",
+                    r.orb_type,
+                    r.provider_id,
+                    types
+                        .iter()
+                        .map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+
+    fn validate(&self, r: pb::DispatchRequest) -> Result<(ValidatedRequest, u64), Rejection> {
         let invocation_id =
             InvocationId::parse(&r.invocation_id).map_err(|_| "invalid invocation_id")?;
-        let offering = self
-            .offerings
-            .get(&OfferingId::new(r.offering_id.as_str()))
-            .ok_or_else(|| "unknown offering".to_string())?;
+        let (offering, orb_types) = self.offering(&r)?;
         let amp_orb_id =
             AmpOrbId::parse(&r.amp_orb_id).map_err(|_| "invalid ORB_ID".to_string())?;
         let mut env = PermittedGuestEnv::default();
@@ -106,6 +154,7 @@ impl DispatchService {
             ValidatedRequest {
                 invocation_id,
                 offering_id: offering.id.clone(),
+                orb_types,
                 amp_endpoint: offering.amp_endpoint.clone(),
                 amp_orb_id,
                 action,
@@ -128,10 +177,10 @@ impl Dispatch for DispatchService {
     ) -> Result<Response<Self::ExecuteStream>, tonic::Status> {
         let (tx, rx) = mpsc::channel(256);
         match self.validate(request.into_inner()) {
-            Err(msg) => {
-                metrics::counter!("orbd_dispatch_requests_total", "action" => "unknown", "status" => "invalid")
+            Err(Rejection(status, msg)) => {
+                metrics::counter!("orbd_dispatch_requests_total", "action" => "unknown", "status" => status.label())
                     .increment(1);
-                let res = StoredResult::plain(Status::Invalid, msg);
+                let res = StoredResult::plain(status, msg);
                 let _ = tx
                     .send(Ok(pb::DispatchEvent {
                         event: Some(pb::dispatch_event::Event::Result(res.to_pb())),

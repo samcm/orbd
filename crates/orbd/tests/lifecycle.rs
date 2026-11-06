@@ -149,6 +149,66 @@ fn orb_delete_takes_only_orbs_asleep_long_enough() {
     assert!(running[0].bootstraps.iter().all(|b| b.cold_boot));
 }
 
+/// One provider whose orb types are offerings: a spawn runs on the offering its
+/// ORB_TYPE names (the first orb type when it has none), a pause or delete, which has
+/// no ORB_TYPE, acts on the orb as created, and an orb type orbd does not serve fails
+/// without blaming the Amp CLI.
+#[test]
+fn provider_orb_types_choose_the_offering() {
+    let mut c = Cluster::new(&["agent-a"], 4);
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let token = c.root().join("homelab-token");
+    std::fs::write(&token, "aop_test\n").unwrap();
+    // The provider child itself is not under test: give it a CLI that cannot run.
+    std::fs::write(
+        &path,
+        format!(
+            "amp_cli: /nonexistent/amp\namp_cli_update_interval_secs: 0\n{yaml}\
+             \x20 - id: fake-4vcpu-4gb\n    runtime: fake\n    \
+             resources: {{ vcpus: 4, memory_mib: 4096, disk_gib: 4 }}\n\
+             providers:\n  - id: homelab\n    token_file: {}\n    \
+             orb_types: [{OFFERING}, fake-4vcpu-4gb]\n",
+            token.display()
+        ),
+    )
+    .unwrap();
+    c.provider = Some("homelab".into());
+    c.start_all();
+
+    let big = [("ORB_TYPE", "fake-4vcpu-4gb")];
+    assert_ok(&c.dispatch("spawn", "amp-big", &big), "spawn big");
+    assert_ok(
+        &c.dispatch("spawn", "amp-default", &[]),
+        "spawn, no ORB_TYPE",
+    );
+    let list = c.admin(&["orb", "list"]);
+    assert_eq!(
+        list.stdout,
+        format!(
+            "amp-big\trunning for 0m\tagent-a\tfake-4vcpu-4gb\n\
+             amp-default\trunning for 0m\tagent-a\t{OFFERING}"
+        )
+    );
+
+    // The default orb type is the other offering; the orb's own must be found.
+    assert_ok(&c.dispatch("pause", "amp-big", &[]), "pause big");
+    assert_ok(&c.dispatch("spawn", "amp-big", &big), "wake big");
+    assert_ok(&c.dispatch("delete", "amp-big", &[]), "delete big");
+    assert_ok(&c.dispatch("delete", "amp-default", &[]), "delete default");
+    assert!(c.fake_orbs("agent-a").iter().all(|o| !o.disk));
+
+    let gpu = c.dispatch("spawn", "amp-gpu", &[("ORB_TYPE", "gpu")]);
+    assert_eq!(gpu.code, 1, "{}", gpu.stderr);
+    assert!(
+        gpu.stderr
+            .contains("orb type \"gpu\" is not one of provider homelab's"),
+        "{}",
+        gpu.stderr
+    );
+    assert!(!gpu.stderr.contains("cli-check bad"), "{}", gpu.stderr);
+}
+
 /// An orb stays on its recorded agent for life: while that agent is offline its jobs
 /// fail fast instead of being re-placed, and it resumes there once the agent is back.
 /// New orbs go to agents with room; with no room anywhere, spawns are refused.

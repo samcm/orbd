@@ -271,6 +271,7 @@ message DispatchRequest {
   // UUID chosen by the `orbd dispatch` process; reused when it reconnects.
   string invocation_id = 1;
   // Trusted offering id from ORBD_OFFERING_ID (set by the coordinator for its child).
+  // Empty when the job came from a provider with orb types (provider_id).
   string offering_id = 2;
   string amp_orb_id = 3;          // ORB_ID
   uint64 remaining_budget_ms = 4; // remaining dispatch budget when sent
@@ -287,6 +288,12 @@ message DispatchRequest {
     PauseRequest pause = 11;
     DeleteRequest delete = 12;
   }
+
+  // Trusted provider id from ORBD_PROVIDER_ID, for a provider whose orb types are
+  // offerings; the coordinator picks the offering.
+  string provider_id = 13;
+  // ORB_TYPE: the thread's orb type, set on spawn when the provider has orb types.
+  string orb_type = 14;
 }
 
 enum DispatchStatus {
