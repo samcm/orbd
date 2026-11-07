@@ -222,6 +222,49 @@ fn provider_orb_types_choose_the_offering() {
     assert!(!gpu.stderr.contains("cli-check bad"), "{}", gpu.stderr);
 }
 
+/// A host that dies without a drain (reboot, freeze) takes its VMs with it. When its
+/// agent reconnects, the coordinator learns the orb stopped: it frees the orb's compute
+/// for other orbs, and the next wake cold-boots it.
+#[test]
+fn orbs_whose_vm_died_with_the_host_are_stopped_when_it_returns() {
+    let mut c = Cluster::new(&["agent-a"], 1);
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");
+
+    // The host goes down hard: no drain, and the VM is gone when it comes back.
+    c.kill_agent("agent-a");
+    let fake = c.root().join("agents/agent-a/state/fake");
+    let file = std::fs::read_dir(&fake)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut st: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    st["running"] = false.into();
+    std::fs::write(&file, serde_json::to_vec(&st).unwrap()).unwrap();
+    c.start_agent("agent-a", "");
+    c.wait_connected(1);
+
+    wait_until(Duration::from_secs(20), "amp-1 recorded as stopped", || {
+        c.admin(&["orb", "list"]).stdout.contains("amp-1\tstopped")
+    });
+    // Its compute is free again: the agent has room for only one running orb.
+    assert_ok(
+        &c.dispatch("spawn", "amp-2", &[]),
+        "spawn 2 in amp-1's room",
+    );
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake 1");
+    let one = c
+        .fake_orbs("agent-a")
+        .into_iter()
+        .find(|o| o.running)
+        .unwrap();
+    assert_eq!(one.counters.boots, 2, "amp-1 cold-booted again");
+    assert!(one.bootstraps.last().unwrap().cold_boot);
+}
+
 /// An orb stays on its recorded agent for life: while that agent is offline its jobs
 /// fail fast instead of being re-placed, and it resumes there once the agent is back.
 /// New orbs go to agents with room; with no room anywhere, spawns are refused.

@@ -152,6 +152,85 @@ pub fn get_orb(c: &Connection, id: OrbId) -> Result<Option<OrbRecord>> {
     .optional()?)
 }
 
+/// Sizes an orb's reservation to the state it was observed in: a stopped orb holds no
+/// compute, an orb with no disk holds nothing; Running and Faulted keep everything.
+fn reserve_for(c: &Connection, orb: OrbId, state: &OrbState) -> Result<()> {
+    let orb_id = orb.to_string();
+    match state {
+        OrbState::Known {
+            state: StableOrbState::Uncreated | StableOrbState::Deleted,
+        } => {
+            c.execute(
+                "DELETE FROM reservations WHERE orb_id = ?1",
+                params![orb_id],
+            )?;
+        }
+        OrbState::Known {
+            state: StableOrbState::Sleeping { .. } | StableOrbState::DiskOnlyStopped { .. },
+        } => {
+            c.execute(
+                "UPDATE reservations SET vcpus = 0, memory_bytes = 0, disk_bytes = 0,
+                    kind = 'stopped'
+                 WHERE orb_id = ?1",
+                params![orb_id],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Applies what the orb's host reports outside any command: only that an orb recorded
+/// as running has stopped (its VM died with the host, or while the agent was down),
+/// only when no command is open for it and the report is not older than the record.
+/// Returns whether the record changed.
+pub fn observe_stopped(
+    c: &mut Connection,
+    orb: OrbId,
+    location: &Location,
+    generation: u64,
+    state: &OrbState,
+    now: u64,
+) -> Result<bool> {
+    let stopped = matches!(
+        state,
+        OrbState::Known {
+            state: StableOrbState::Sleeping { .. } | StableOrbState::DiskOnlyStopped { .. }
+        }
+    );
+    if !stopped {
+        return Ok(false);
+    }
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(rec) = get_orb(&tx, orb)? else {
+        return Ok(false);
+    };
+    if &rec.location != location
+        || generation < rec.observation.generation
+        || !matches!(
+            rec.observation.state,
+            OrbState::Known {
+                state: StableOrbState::Running
+            }
+        )
+        || open_command(&tx, orb)?.is_some()
+    {
+        return Ok(false);
+    }
+    let obs = VersionedObservation {
+        state: state.clone(),
+        generation: rec.observation.generation,
+        observed_at_unix_ms: now,
+    };
+    tx.execute(
+        "UPDATE orbs SET observation_json = ?2 WHERE id = ?1",
+        params![orb.to_string(), js(&obs)],
+    )?;
+    reserve_for(&tx, orb, state)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 pub fn get_command(c: &Connection, op: OperationId) -> Result<Option<CmdRow>> {
     Ok(c.query_row(
         &format!("SELECT {CMD_COLS} FROM commands WHERE operation_id = ?1"),
@@ -655,35 +734,13 @@ pub fn apply_completion(
             params![orb.id.to_string(), js(&obs), cmd.generation as i64],
         )?;
         orb.observation = obs;
-        let orb_id = orb.id.to_string();
-        let deleted = matches!(outcome.result, Ok(ActionResult::Deleted));
-        match &outcome.observed {
-            _ if deleted => {
-                tx.execute(
-                    "DELETE FROM reservations WHERE orb_id = ?1",
-                    params![orb_id],
-                )?;
-            }
-            OrbState::Known {
-                state: StableOrbState::Uncreated | StableOrbState::Deleted,
-            } => {
-                tx.execute(
-                    "DELETE FROM reservations WHERE orb_id = ?1",
-                    params![orb_id],
-                )?;
-            }
-            OrbState::Known {
-                state: StableOrbState::Sleeping { .. } | StableOrbState::DiskOnlyStopped { .. },
-            } => {
-                tx.execute(
-                    "UPDATE reservations SET vcpus = 0, memory_bytes = 0, disk_bytes = 0,
-                        kind = 'stopped'
-                     WHERE orb_id = ?1",
-                    params![orb_id],
-                )?;
-            }
-            // Running keeps everything; Faulted is conservative: keep.
-            _ => {}
+        if matches!(outcome.result, Ok(ActionResult::Deleted)) {
+            tx.execute(
+                "DELETE FROM reservations WHERE orb_id = ?1",
+                params![orb.id.to_string()],
+            )?;
+        } else {
+            reserve_for(&tx, orb.id, &outcome.observed)?;
         }
     }
     tx.execute(

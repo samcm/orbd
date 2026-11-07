@@ -56,6 +56,11 @@ pub enum Msg {
         key: CommandKey,
         status: OperationStatus,
     },
+    /// Orb states a host reported when it became available (see `reconcile_location`).
+    OrbsReported {
+        location: Location,
+        orbs: Vec<(OrbId, u64, OrbState)>,
+    },
     /// `orbd orb delete`: delete the orb if it has been asleep, with no job, for
     /// `min_asleep`. Refusals arrive on `tx` as an error, results as dispatch events.
     DeleteAsleep {
@@ -191,6 +196,11 @@ impl Core {
             Msg::Reconciled { key, status } => {
                 if let Err(err) = self.reconciled(key, status).await {
                     tracing::error!(error = %format!("{err:#}"), "applying reconcile result failed");
+                }
+            }
+            Msg::OrbsReported { location, orbs } => {
+                if let Err(err) = self.orbs_reported(location, orbs).await {
+                    tracing::error!(error = %format!("{err:#}"), "applying reported orb states failed");
                 }
             }
             Msg::DeleteAsleep {
@@ -1150,6 +1160,73 @@ impl Core {
         });
     }
 
+    /// Asks a host that just became available for every orb it holds. Its VMs may have
+    /// died while it was away (a host reboot or freeze); the core only hears of state
+    /// changes from commands, so without this such an orb stays "running", holding its
+    /// compute, until its next command.
+    fn reconcile_location(&self, location: Location) {
+        let Some(backend) = self.backends.get(location.backend_id()).cloned() else {
+            return;
+        };
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let mut page_token = None;
+            loop {
+                let query = ReconcileQuery {
+                    location: location.clone(),
+                    operations: vec![],
+                    orbs: vec![],
+                    page_token: page_token.take(),
+                };
+                let page =
+                    match tokio::time::timeout(Duration::from_secs(10), backend.reconcile(query))
+                        .await
+                    {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            tracing::debug!(?location, error = %e, "orb reconcile unavailable");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(?location, "orb reconcile timed out");
+                            return;
+                        }
+                    };
+                let next = page.next_page_token;
+                let msg = Msg::OrbsReported {
+                    location: location.clone(),
+                    orbs: page.orbs,
+                };
+                if tx.send(msg).await.is_err() {
+                    return;
+                }
+                match next {
+                    Some(t) if !t.is_empty() => page_token = Some(t),
+                    _ => return,
+                }
+            }
+        });
+    }
+
+    async fn orbs_reported(
+        &mut self,
+        location: Location,
+        orbs: Vec<(OrbId, u64, OrbState)>,
+    ) -> Result<()> {
+        for (orb, generation, state) in orbs {
+            let (loc, st, now) = (location.clone(), state.clone(), unix_ms_now());
+            let changed = self
+                .db
+                .call(move |c| store::observe_stopped(c, orb, &loc, generation, &st, now))
+                .await?;
+            if changed {
+                tracing::warn!(%orb, ?state, "orb recorded as running has stopped on its host");
+                metrics::counter!("orbd_orbs_found_stopped_total").increment(1);
+            }
+        }
+        Ok(())
+    }
+
     // ---- backend events ---------------------------------------------------------------
 
     async fn backend_event(&mut self, ev: BackendEvent) -> Result<()> {
@@ -1215,6 +1292,7 @@ impl Core {
                             self.submit_command(cmd.operation_id).await;
                         }
                     }
+                    self.reconcile_location(location);
                 }
             }
         }
