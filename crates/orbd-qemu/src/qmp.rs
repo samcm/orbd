@@ -8,12 +8,17 @@ use qapi::futures::{QapiEvents, QapiService, QmpStreamTokio};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+/// The greeting line [`open`] read, put back in front of the rest of the stream.
+type RawReader = tokio::io::Chain<std::io::Cursor<Vec<u8>>, BufReader<ReadHalf<UnixStream>>>;
 type Writer = QmpStreamTokio<WriteHalf<UnixStream>>;
-type Reader = QmpStreamTokio<ReadHalf<UnixStream>>;
+type Reader = QmpStreamTokio<RawReader>;
+
+/// Lines skipped before the greeting before giving up on a connection.
+const MAX_SKIPPED_LINES: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum QmpError {
@@ -264,7 +269,7 @@ impl Qmp {
     /// Connects and negotiates, bounded by `timeout`. Events are discarded.
     pub async fn connect(path: &Path, timeout: Duration) -> Result<Self, QmpError> {
         let fut = async {
-            let neg = QmpStreamTokio::open_uds(path).await?;
+            let neg = open(path).await?;
             let stream = neg.negotiate().await?;
             let (service, events) = stream.spawn_tokio();
             Ok::<_, std::io::Error>(Self { service, events })
@@ -282,7 +287,7 @@ impl Qmp {
         timeout: Duration,
     ) -> Result<(Self, mpsc::UnboundedReceiver<MigrationEvent>), QmpError> {
         let fut = async {
-            let neg = QmpStreamTokio::open_uds(path).await?;
+            let neg = open(path).await?;
             let (service, events) = neg.negotiate().await?.into_parts();
             let (tx, rx) = mpsc::unbounded_channel();
             let events = tokio::spawn(forward_events(events, tx));
@@ -505,6 +510,42 @@ impl Qmp {
 
 /// Reads the session's messages: responses complete their commands inside `qapi`;
 /// `MIGRATION` events are forwarded, even when nobody listens any more.
+/// Connects and reads up to QEMU's greeting itself, then hands the session to `qapi`.
+/// A line before the greeting is logged and skipped rather than failing the session:
+/// a drain once lost an orb's checkpoint to a 133-byte non-greeting first line
+/// (`missing field QMP`), and a fresh greeting may still follow it.
+async fn open(path: &Path) -> std::io::Result<qapi::futures::QmpStreamNegotiation<Reader, Writer>> {
+    let (read, write) = tokio::io::split(UnixStream::connect(path).await?);
+    let mut read = BufReader::new(read);
+    let mut skipped = 0;
+    let greeting = loop {
+        let mut line = Vec::new();
+        if read.read_until(b'\n', &mut line).await? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "QMP greeting expected",
+            ));
+        }
+        if serde_json::from_slice::<qapi::qmp::QapiCapabilities>(&line).is_ok() {
+            break line;
+        }
+        let text = String::from_utf8_lossy(&line);
+        tracing::warn!(
+            socket = %path.display(),
+            line = %text.trim_end().chars().take(512).collect::<String>(),
+            "QMP: skipping a line before the greeting"
+        );
+        skipped += 1;
+        if skipped >= MAX_SKIPPED_LINES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("no QMP greeting in the first {skipped} lines"),
+            ));
+        }
+    };
+    QmpStreamTokio::open_split(std::io::Cursor::new(greeting).chain(read), write).await
+}
+
 async fn forward_events(mut events: QapiEvents<Reader>, tx: mpsc::UnboundedSender<MigrationEvent>) {
     // Ends this stream when the service drops, as `spawn_tokio` does.
     if events.release().is_err() {
@@ -527,8 +568,17 @@ mod tests {
     /// A QMP server that answers every command with `{}` and sends a `MIGRATION` event
     /// before answering `blockdev-snapshot`; returns that command's arguments.
     async fn fake_qemu(listener: tokio::net::UnixListener) -> serde_json::Value {
+        fake_qemu_after(listener, b"").await
+    }
+
+    /// [`fake_qemu`], writing `before` ahead of its greeting.
+    async fn fake_qemu_after(
+        listener: tokio::net::UnixListener,
+        before: &[u8],
+    ) -> serde_json::Value {
         let (stream, _) = listener.accept().await.unwrap();
         let (r, mut w) = stream.into_split();
+        w.write_all(before).await.unwrap();
         w.write_all(
             br#"{"QMP":{"version":{"qemu":{"major":9,"minor":2,"micro":0},"package":""},"capabilities":[]}}
 "#,
@@ -571,6 +621,23 @@ mod tests {
             Some(MigrationEvent {
                 status: "completed".into()
             })
+        );
+    }
+
+    /// n100 lost an orb's checkpoint to a non-greeting first line (`missing field QMP
+    /// at line 1 column 133`): the client skips such a line and finds the greeting.
+    #[tokio::test]
+    async fn a_line_before_the_greeting_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        let stray = b"{\"timestamp\": {\"seconds\": 1793912345, \"microseconds\": 12345}, \"event\": \"SHUTDOWN\", \"data\": {\"guest\": false, \"reason\": \"host-signal\"}}\r\n";
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move { fake_qemu_after(listener, stray).await });
+        let qmp = Qmp::connect(&path, Duration::from_secs(5)).await.unwrap();
+        qmp.blockdev_snapshot("disk0", "snap1").await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            serde_json::json!({"node": "disk0", "overlay": "snap1"})
         );
     }
 }
