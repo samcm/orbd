@@ -186,18 +186,26 @@ impl ComputeBackend for BoatBackend {
         &self,
         request: PlacementRequest,
     ) -> Result<Vec<PlacementCandidate>, BackendError> {
-        let location = match request.existing {
-            Some(loc) if self.check_location(&loc).is_ok() => loc,
+        let (location, availability) = match request.existing {
+            // An existing orb can live nowhere else; its pause and delete need no start.
+            Some(loc) if self.check_location(&loc).is_ok() => (loc, Availability::Available),
             Some(_) => return Ok(Vec::new()),
-            None => Location::External {
-                backend_id: self.id.clone(),
-                scope: BackendScopeId::new(POOL),
-                allocation_id: AllocationId::generate(),
-            },
+            None => (
+                Location::External {
+                    backend_id: self.id.clone(),
+                    scope: BackendScopeId::new(POOL),
+                    allocation_id: AllocationId::generate(),
+                },
+                // While Boat refuses starts, new orbs spill to other offerings.
+                match self.executor.starts_refused() {
+                    Some(reason) => Availability::Unavailable { reason },
+                    None => Availability::Available,
+                },
+            ),
         };
         Ok(vec![PlacementCandidate {
             location,
-            availability: Availability::Available,
+            availability,
             capabilities: capabilities(),
             capacity_pool: POOL.into(),
             capacity_ceiling: self.ceiling,

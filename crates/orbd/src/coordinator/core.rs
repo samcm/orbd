@@ -906,19 +906,24 @@ impl Core {
                 },
             )
             .await;
-        let available: Vec<PlacementCandidate> = cands
+        let (available, unavailable): (Vec<PlacementCandidate>, Vec<PlacementCandidate>) = cands
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| {
-                c.availability == Availability::Available
-                    && c.capabilities.check(&offering.spec).is_empty()
-            })
-            .collect();
+            .filter(|c| c.capabilities.check(&offering.spec).is_empty())
+            .partition(|c| c.availability == Availability::Available);
         if available.is_empty() {
-            return Ok(Err(refuse(
-                FailureCode::BackendUnavailable,
-                "no available host can run this offering",
-            )));
+            let reasons: Vec<&str> = unavailable
+                .iter()
+                .filter_map(|c| match &c.availability {
+                    Availability::Unavailable { reason } => Some(reason.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let mut message = "no available host can run this offering".to_owned();
+            if !reasons.is_empty() {
+                message = format!("{message} ({})", reasons.join("; "));
+            }
+            return Ok(Err(refuse(FailureCode::BackendUnavailable, message)));
         }
         let demand = self.demand(&offering.spec);
         let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();

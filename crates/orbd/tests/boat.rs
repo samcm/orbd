@@ -30,6 +30,9 @@ struct FakeBoat {
     commands: Vec<(String, String, bool)>,
     /// Close the connection instead of answering the next create (it still happens).
     lose_next_create_response: bool,
+    /// Refuse every create and resume as over the start quota (429), as Boat does
+    /// once an account used its starts.
+    refuse_starts: bool,
 }
 
 fn respond(s: &mut TcpStream, status: u16, body: Value) {
@@ -44,6 +47,17 @@ fn respond(s: &mut TcpStream, status: u16, body: Value) {
 
 fn error(code: &str) -> Value {
     json!({ "ok": false, "code": code, "message": code })
+}
+
+/// Boat's answer to a start over its quota (<https://docs.boat.dev/limits>).
+fn rate_limited(conn: &mut TcpStream) {
+    respond(
+        conn,
+        429,
+        json!({ "ok": false, "code": "rate_limited", "window": "day", "limit": 200,
+                "cause": "plan", "retryAfterSeconds": 3600,
+                "message": "You used your 200 starts for the last 24 hours" }),
+    );
 }
 
 fn sandbox_json(id: &str, sb: &Sandbox) -> Value {
@@ -103,6 +117,8 @@ fn handle(fake: &Mutex<FakeBoat>, mut conn: TcpStream) {
     let mut f = fake.lock().unwrap();
     f.calls.push(format!("{method} {path}"));
     match (method.as_str(), seg.as_slice()) {
+        ("POST", ["sandboxes"]) if f.refuse_starts => rate_limited(&mut conn),
+        ("POST", ["sandboxes", _, "resume"]) if f.refuse_starts => rate_limited(&mut conn),
         ("POST", ["sandboxes"]) => {
             let key = headers.get("idempotency-key").cloned().unwrap_or_default();
             assert!(!key.is_empty(), "create without an idempotency key");
@@ -386,4 +402,69 @@ fn new_orbs_spill_to_boat_only_when_the_agents_are_full() {
         "delete the spilled orb",
     );
     assert!(fake.lock().unwrap().sandboxes.is_empty());
+}
+
+/// New orbs prefer Boat and spill to the agent. Once Boat refuses a start with 429, the
+/// orb that hit it fails saying so, and the next new orb goes to the agent without
+/// trying Boat.
+#[test]
+fn new_orbs_spill_to_the_agent_while_boat_refuses_starts() {
+    let (fake, url) = FakeBoat::start();
+    let mut c = Cluster::new(&["agent-a"], 2);
+    let key = c.root().join("boat-key");
+    std::fs::write(&key, format!("{API_KEY}\n")).unwrap();
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let agent_offering = c.offering.clone();
+    let head = yaml.split("offerings:").next().unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{head}boat:\n  api_key_file: {}\n  capacity: {{ vcpus: 4, memory_mib: 8192 }}\n  \
+             auto_stop_secs: 7200\n  api_url: {url}\n\
+             offerings:\n  - id: boat-2vcpu-4gb\n    runtime: boat\n    \
+             resources: {{ vcpus: 2, memory_mib: 4096, disk_gib: 51 }}\n    \
+             spill_to: [{agent_offering}]\n  - id: {agent_offering}\n    runtime: fake\n    \
+             resources: {{ vcpus: 2, memory_mib: 4096, disk_gib: 4 }}\n",
+            key.display()
+        ),
+    )
+    .unwrap();
+    c.offering = "boat-2vcpu-4gb".into();
+    c.start_all();
+    fake.lock().unwrap().refuse_starts = true;
+    let creates = |f: &FakeBoat| f.calls.iter().filter(|c| *c == "POST /sandboxes").count();
+
+    let first = c.dispatch("spawn", "amp-1", &[]);
+    assert_ne!(first.code, 0, "a spawn Boat refused succeeded");
+    let out = format!("{}{}", first.stdout, first.stderr);
+    assert!(
+        out.contains("Boat's sandbox start quota is full") && out.contains("about 1h"),
+        "the failure does not name Boat's start quota:\n{out}"
+    );
+    assert_eq!(creates(&fake.lock().unwrap()), 1);
+    assert!(c.fake_orbs("agent-a").is_empty());
+
+    let second = c.dispatch("spawn", "amp-2", &[]);
+    assert_ok(&second, "a new orb while Boat refuses starts");
+    assert_eq!(
+        c.fake_orbs("agent-a").len(),
+        1,
+        "the new orb did not spill to the agent"
+    );
+    assert_eq!(
+        creates(&fake.lock().unwrap()),
+        1,
+        "the new orb tried Boat again"
+    );
+
+    // The refused orb lives on Boat: its retry asks Boat again and fails the same way.
+    let retry = c.dispatch("spawn", "amp-1", &[]);
+    assert_ne!(retry.code, 0);
+    let out = format!("{}{}", retry.stdout, retry.stderr);
+    assert!(
+        out.contains("Boat's sandbox start quota is full"),
+        "the retry does not name Boat's start quota:\n{out}"
+    );
+    assert_eq!(creates(&fake.lock().unwrap()), 2);
 }

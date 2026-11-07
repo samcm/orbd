@@ -22,6 +22,9 @@ pub enum ApiError {
         /// `error.details.retryable` (502 `sandbox_direct_failed`): true when the call
         /// provably did not run.
         retryable: bool,
+        /// How long Boat says to wait (a 429 or 503): `retryAfterSeconds` or `retryAfter`
+        /// in the body, else the `Retry-After` header in seconds.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -29,6 +32,13 @@ impl ApiError {
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Http { status, .. } => Some(*status),
+            Self::Transport(_) => None,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
             Self::Transport(_) => None,
         }
     }
@@ -151,6 +161,11 @@ impl Client {
             .await
             .map_err(|e| ApiError::Transport(e.without_url().to_string()))?;
         let status = resp.status();
+        let retry_after_header = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
         let text = resp
             .text()
             .await
@@ -174,6 +189,17 @@ impl Client {
                 .pointer("/error/details/retryable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            retry_after: [
+                "/retryAfterSeconds",
+                "/retryAfter",
+                "/error/retryAfterSeconds",
+                "/error/retryAfter",
+                "/error/details/retryAfterSeconds",
+            ]
+            .iter()
+            .find_map(|p| value.pointer(p).and_then(Value::as_u64))
+            .or(retry_after_header)
+            .map(Duration::from_secs),
         })
     }
 

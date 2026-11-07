@@ -73,6 +73,12 @@ const POLL: Duration = Duration::from_secs(2);
 const BOOTSTRAP_SETTLE: Duration = Duration::from_secs(5);
 /// A stop Boat has not acted on is sent again after this long.
 const STOP_RESEND: Duration = Duration::from_secs(30);
+/// How long new orbs avoid Boat after it refused a start with 429 and named no wait.
+/// Boat counts starts over rolling windows and a refused start costs nothing, so the
+/// first start after this only probes the quota.
+const START_REFUSED_BACKOFF: Duration = Duration::from_secs(15 * 60);
+/// The longest wait orbd takes from Boat (its longest window is a day).
+const START_REFUSED_MAX: Duration = Duration::from_secs(24 * 3600);
 /// Acknowledged receipts and tombstones are kept this long.
 const RETAIN_MS: u64 = 3_600_000;
 
@@ -217,6 +223,23 @@ fn failed(code: FailureCode, message: impl Into<String>) -> Stop {
     })
 }
 
+/// "3h 12m", "4m", "30s".
+fn human(d: Duration) -> String {
+    let s = d.as_secs();
+    match (s / 3600, s % 3600 / 60) {
+        (0, 0) => format!("{s}s"),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// Set while Boat refuses sandbox starts (429): new orbs are placed elsewhere.
+struct StartsRefused {
+    until: Instant,
+    reason: String,
+}
+
 fn api_failure(what: &str, e: &ApiError) -> CommandFailure {
     let code = match e.status() {
         Some(402 | 403 | 429) => FailureCode::QuotaExceeded,
@@ -324,6 +347,7 @@ pub struct Executor {
     /// Operations being executed, with their cancellation.
     running: Mutex<HashMap<OperationId, CancellationToken>>,
     orb_locks: Mutex<HashMap<OrbId, Arc<tokio::sync::Mutex<()>>>>,
+    starts_refused: Mutex<Option<StartsRefused>>,
 }
 
 impl Executor {
@@ -342,7 +366,81 @@ impl Executor {
             events,
             running: Mutex::default(),
             orb_locks: Mutex::default(),
+            starts_refused: Mutex::default(),
         }))
+    }
+
+    /// Why Boat cannot start a sandbox now, while its start quota is full.
+    pub fn starts_refused(&self) -> Option<String> {
+        let mut g = self
+            .starts_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &*g {
+            Some(r) if r.until > Instant::now() => Some(format!(
+                "{} for about {} more",
+                r.reason,
+                human(r.until - Instant::now())
+            )),
+            Some(_) => {
+                *g = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Runs a call that starts a sandbox (create or resume). A 429 means the Boat
+    /// account may start no sandbox for a while: new orbs avoid Boat until then, and
+    /// the failure says so.
+    async fn start_call<T, F, Fut>(&self, ctx: &Ctx, what: &str, f: F) -> Result<T, Stop>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
+        let e = match self.retrying(ctx, f).await? {
+            Ok(v) => {
+                *self
+                    .starts_refused
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                return Ok(v);
+            }
+            Err(e) => e,
+        };
+        if e.status() != Some(429) {
+            return Err(Stop::Failed(api_failure(what, &e)));
+        }
+        let wait = e
+            .retry_after()
+            .unwrap_or(START_REFUSED_BACKOFF)
+            .clamp(Duration::from_secs(1), START_REFUSED_MAX);
+        let reason = match &e {
+            ApiError::Http { code, .. } if code == "rate_limited" => {
+                format!("Boat's sandbox start quota is full ({e})")
+            }
+            _ => format!("Boat refuses to start sandboxes ({e})"),
+        };
+        tracing::warn!(
+            wait_secs = wait.as_secs(),
+            "{reason}; new orbs avoid Boat meanwhile"
+        );
+        *self
+            .starts_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(StartsRefused {
+            until: Instant::now() + wait,
+            reason: reason.clone(),
+        });
+        Err(failed(
+            FailureCode::QuotaExceeded,
+            format!(
+                "{what}: {reason}. Boat starts sandboxes again in about {}; new orbs go \
+                 to other offerings until then, but this orb lives on Boat and can only \
+                 start there",
+                human(wait)
+            ),
+        ))
     }
 
     fn emit(&self, ev: BackendEvent) {
@@ -876,7 +974,7 @@ impl Executor {
                     auto_stop_secs: self.auto_stop_secs,
                 };
                 let sb = self
-                    .call(ctx, "creating the Boat sandbox", || {
+                    .start_call(ctx, "creating the Boat sandbox", || {
                         self.api.create(&idempotency_key, &request)
                     })
                     .await?;
@@ -921,7 +1019,7 @@ impl Executor {
                     }
                     self.record_start(op, &mut start, StartKind::ExistingDiskColdBoot)
                         .await?;
-                    self.call(ctx, "resuming the Boat sandbox", || {
+                    self.start_call(ctx, "resuming the Boat sandbox", || {
                         self.api.resume(&sb.id, self.auto_stop_secs)
                     })
                     .await?;
