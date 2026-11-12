@@ -8,7 +8,7 @@
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile <context>
 
-FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS fetch
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS fetch
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
 # Runs on the agent host only (x86_64); see crates/orbd/src/image/rootfs.rs.
@@ -32,7 +32,7 @@ RUN case "$TARGETARCH" in amd64) p=linux-x64 ;; arm64) p=linux-arm64 ;; *) exit 
     && echo "$(curl -fsSL "$url/$v/$p-amp.sha256")  /amp" | sha256sum -c \
     && chmod 0755 /amp
 
-FROM debian:13-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS base
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
