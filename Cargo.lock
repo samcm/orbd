@@ -1772,7 +1772,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orbd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "orbd-guest"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "orbd-proto",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "orbd-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "orbd-qemu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fail",
  "futures",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "orbd-vm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fail",
  "hex",
