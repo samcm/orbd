@@ -9,7 +9,7 @@
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-/// Files from `guest/rootfs/` (path inside the guest, mode, content).
+/// Files the layer adds, most from `guest/rootfs/` (path inside the guest, mode, content).
 const FILES: &[(&str, u32, &str)] = &[
     (
         "etc/systemd/system/orbd-guest.service",
@@ -38,6 +38,10 @@ const FILES: &[(&str, u32, &str)] = &[
     // Empty: systemd generates a machine id on each new orb's first boot instead of
     // every orb sharing the one baked into the image.
     ("etc/machine-id", 0o444, ""),
+    // Linger for Amp's `user`: logind starts its systemd user manager at boot. Amp runs
+    // its agent from a system unit, never a login session, so without this there is no
+    // user bus and `systemctl --user` / `systemd-run --user` fail.
+    ("var/lib/systemd/linger/user", 0o644, ""),
 ];
 
 const SYMLINKS: &[(&str, &str)] = &[
@@ -59,6 +63,12 @@ const SYMLINKS: &[(&str, &str)] = &[
 ];
 
 pub const GUEST_HELPER_PATH: &str = "usr/local/sbin/orbd-guest";
+
+/// Bump when a change to the guest integration (or to how an image becomes a disk) must
+/// reach orbs of existing projects: their project snapshots, which keep what they were
+/// built with, are then passed over once for the image (see [`super::lineage`]). Not
+/// the layer's digest, which changes with every orbd build.
+pub const GUEST_LINEAGE: u32 = 1;
 
 /// The integration layer (uncompressed tar) and its digest (`sha256:<hex>`).
 pub struct IntegrationLayer {

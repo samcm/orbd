@@ -111,6 +111,12 @@ async fn prepares_amp_image_with_guest_integration() {
         stat(fs, "/etc/machine-id").contains("Size: 0"),
         "machine id reset"
     );
+    // Linger for `user`: logind starts its systemd user manager at boot.
+    let linger = stat(fs, "/var/lib/systemd/linger/user");
+    assert!(
+        linger.contains("Type: regular") && linger.contains("User:     0"),
+        "{linger}"
+    );
     // Ownership from the image survives unpacking (root-owned setuid sudo, user's home).
     let sudo = stat(fs, "/usr/bin/sudo");
     assert!(

@@ -117,6 +117,9 @@ struct VmRecipe {
     memory_bytes: u64,
     disk_bytes: u64,
     base: BaseDisk,
+    /// The image lineage the disk descends from (see `vm::project_lineage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<String>,
     net: NetAttachment,
     created_unix_ms: u64,
 }
@@ -694,7 +697,8 @@ impl QemuRuntime {
     ) -> Result<(), RuntimeError> {
         // Until the published recipe names the base, garbage collection must not take it.
         let _bases = bounded(ctx, super::vm::BASES.read()).await?;
-        let (base_path, source) = match src {
+        let src = super::vm::initial_source(&*self.images, &self.state_dir, src, ctx).await;
+        let (base_path, source, lineage) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
                     .images
@@ -711,6 +715,7 @@ impl QemuRuntime {
                         key: img.key,
                         manifest_digest: img.manifest_digest,
                     },
+                    img.lineage,
                 )
             }
             InitialDiskSource::ProjectSnapshot { snapshot: r, .. } => {
@@ -722,7 +727,8 @@ impl QemuRuntime {
                     )));
                 }
                 super::vm::mark_used(&self.project_dir(&r.key));
-                (disk, BaseSource::ProjectSnapshot { key: r.key })
+                let lineage = super::vm::project_lineage(&self.state_dir, &r.key);
+                (disk, BaseSource::ProjectSnapshot { key: r.key }, lineage)
             }
         };
         let res = orb.spec.template.resources;
@@ -741,6 +747,7 @@ impl QemuRuntime {
             memory_bytes: res.memory_bytes,
             disk_bytes,
             base,
+            lineage,
             net: NetAttachment::user(orb.id, self.config.guest_network),
             created_unix_ms: unix_ms_now(),
         };
@@ -1319,23 +1326,31 @@ impl Runtime for QemuRuntime {
         }
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("converting disk into project snapshot {key}"));
-        publish_project(ctx, &self.state_dir, key, orb.id, |raw| async move {
-            run_tool(
-                ctx,
-                &self.config.qemu_img,
-                &[
-                    "convert".into(),
-                    "-q".into(),
-                    "-f".into(),
-                    "qcow2".into(),
-                    "-O".into(),
-                    "raw".into(),
-                    disk.display().to_string(),
-                    raw.display().to_string(),
-                ],
-            )
-            .await
-        })
+        let lineage = self.read_recipe(orb.id)?.lineage;
+        publish_project(
+            ctx,
+            &self.state_dir,
+            key,
+            orb.id,
+            lineage,
+            |raw| async move {
+                run_tool(
+                    ctx,
+                    &self.config.qemu_img,
+                    &[
+                        "convert".into(),
+                        "-q".into(),
+                        "-f".into(),
+                        "qcow2".into(),
+                        "-O".into(),
+                        "raw".into(),
+                        disk.display().to_string(),
+                        raw.display().to_string(),
+                    ],
+                )
+                .await
+            },
+        )
         .await?;
         crate::crash_point!("qemu::clone::after_publish");
         log(ctx, &format!("project snapshot {key} published"));

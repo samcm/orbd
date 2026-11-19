@@ -43,11 +43,13 @@ impl ImageProvider for StaticImages {
             format!("static:{image_ref}:{}", img.rootfs.display()).as_bytes(),
         ));
         Ok(PreparedImage {
-            key,
             image_ref: image_ref.to_owned(),
             manifest_digest: "static".into(),
             rootfs: img.rootfs.clone(),
             rootfs_bytes: meta.len(),
+            // A fixed file: snapshots of orbs built on it always descend from it.
+            lineage: Some(key.clone()),
+            key,
         })
     }
 }

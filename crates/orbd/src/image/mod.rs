@@ -60,6 +60,22 @@ pub struct PreparedImage {
     pub rootfs: PathBuf,
     /// Size of `rootfs` in bytes (the filesystem size; orb disks grow beyond it).
     pub rootfs_bytes: u64,
+    /// What a project snapshot must descend from to stand in for this image: see
+    /// [`lineage`]. None for images published before orbd recorded it.
+    pub lineage: Option<String>,
+}
+
+/// Identity of an image as far as project snapshots go: [`GUEST_LINEAGE`] and the
+/// image's distribution release (`os=` from its os-release, or `layer=` its bottom
+/// layer when it has none). Amp's routine rebuilds, a refreshed base image and orbd's
+/// own recipe changes keep it; a new Debian release or a bump of `GUEST_LINEAGE`
+/// changes it, and project snapshots of the previous lineage are then passed over for
+/// the image.
+///
+/// [`GUEST_LINEAGE`]: integration::GUEST_LINEAGE
+pub fn lineage(base: &str) -> String {
+    let guest = integration::GUEST_LINEAGE;
+    sha256_hex(format!("orbd-lineage\nguest={guest}\n{base}\n").as_bytes())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +97,9 @@ struct ImageMeta {
     guest_integration_digest: String,
     rootfs_bytes: u64,
     created_unix: u64,
+    /// See [`lineage`]; absent in images published by older orbd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<String>,
 }
 
 /// `images/refs/<sha256(ref)>.json`: what a reference last resolved to.
@@ -425,6 +444,7 @@ impl ImageStore {
         Some(PreparedImage {
             key,
             image_ref: image_ref.to_owned(),
+            lineage: meta.lineage,
             manifest_digest: meta.manifest_digest,
             rootfs: dir.join(ROOTFS_FILE),
             rootfs_bytes: meta.rootfs_bytes,
@@ -526,8 +546,12 @@ impl ImageStore {
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
         rootfs::write_layout(&layout, &self.inner.blobs, resolved)?;
         let file = out.join(ROOTFS_FILE);
-        let bytes =
+        let (bytes, os) =
             rootfs::build(tools, &layout, &self.inner.integration, work, &file, set).await?;
+        let base = os.map(|os| format!("os={os}")).or_else(|| {
+            let bottom = resolved.manifest.layers.first()?;
+            Some(format!("layer={}", bottom.digest))
+        });
         set("publishing");
         let f = std::fs::File::open(&file).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
@@ -543,6 +567,7 @@ impl ImageStore {
                 guest_integration_digest: self.inner.integration.digest.clone(),
                 rootfs_bytes: bytes,
                 created_unix: now_unix(),
+                lineage: base.map(|b| lineage(&b)),
             },
         )
         .map_err(|e| e.to_string())?;

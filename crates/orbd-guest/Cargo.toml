@@ -13,3 +13,6 @@ orbd-proto.workspace = true
 libc = "0.2"
 prost.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -6,8 +6,9 @@
 - `builder/`: the container macOS agents build orb images in.
 - `rootfs/`: files the image pipeline (`crates/orbd/src/image/`) adds to Amp's image as
   one extra layer, next to the static `orbd-guest` binary (`/usr/local/sbin/orbd-guest`),
-  an empty `/etc/machine-id` and a mask for `serial-getty@ttyS0.service` (without udev it
-  would hold boot for 90 s).
+  an empty `/etc/machine-id`, a mask for `serial-getty@ttyS0.service` (without udev it
+  would hold boot for 90 s) and linger for `user` (`/var/lib/systemd/linger/user`), so
+  its systemd user manager runs and `systemd-run --user` works.
 
 ## Host contract
 

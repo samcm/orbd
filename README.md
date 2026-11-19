@@ -235,12 +235,20 @@ first if it runs. Both queue behind any job Amp has for the orb; a forced delete
 the orb's files and processes even if its thread is in use.
 
 Amp never deletes project snapshots either: it reuses one for at most 72 hours, then
-names a new one. An agent deletes a project snapshot or prepared image once no orb on it
-is built on it and nothing has used it for 72 hours (the current image of a prewarmed
-reference is kept), and image layers no build has used for as long. Only QEMU orbs are
-built on their base, since their disks read through to it; a Firecracker orb's disk is a
-standalone copy and keeps nothing. It checks at startup, hourly and after each orb
-delete.
+names a new one. Amp takes each new snapshot from an orb that may itself have started
+from the previous one, so a VM agent records the image lineage a snapshot descends from:
+the image's distribution release (from its os-release) and the generation of orbd's
+guest integration. A new orb whose spawn image is of another lineage starts from that
+image instead, and snapshots taken from it carry the new lineage. Amp's routine image
+rebuilds keep the lineage; a new Debian release or a guest integration change that must
+reach existing projects changes it, which costs each project one start without its
+snapshot. Snapshots from orbd before 0.2.8 record no lineage, so every project starts
+once from its image after an upgrade. An agent deletes a project snapshot or prepared
+image once no orb on it is built on it and nothing has used it for 72 hours (the current
+image of a prewarmed reference is kept), and image layers no build has used for as long.
+Only QEMU orbs are built on their base, since their disks read through to it; a
+Firecracker orb's disk is a standalone copy and keeps nothing. It checks at startup,
+hourly and after each orb delete.
 
 `prefer` sets where new orbs go, in order: `[local, boat]` (the default) runs them on
 the agents and sends them to Boat when no agent can take them (all full, down or

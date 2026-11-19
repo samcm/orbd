@@ -1,0 +1,9 @@
+[Unit]
+Description=orbd test: a resolv.conf left by a dead tailscaled
+
+[Service]
+ExecStart=/usr/local/bin/orbd-test-dns
+StandardOutput=file:/dev/console
+
+[Install]
+WantedBy=multi-user.target

@@ -112,6 +112,9 @@ struct VmRecipe {
     disk_bytes: u64,
     /// Where the disk was copied from (provenance only; the disk is standalone).
     source: DiskSource,
+    /// The image lineage the disk descends from (see `vm::project_lineage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<String>,
     net: NetAttachment,
     created_unix_ms: u64,
 }
@@ -666,7 +669,8 @@ impl FirecrackerRuntime {
     ) -> Result<(), RuntimeError> {
         // Until the published recipe names the base, garbage collection must not take it.
         let _bases = bounded(ctx, super::vm::BASES.read()).await?;
-        let (base, source) = match src {
+        let src = super::vm::initial_source(&*self.images, &self.state_dir, src, ctx).await;
+        let (base, source, lineage) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
                     .images
@@ -683,6 +687,7 @@ impl FirecrackerRuntime {
                         key: img.key,
                         manifest_digest: img.manifest_digest,
                     },
+                    img.lineage,
                 )
             }
             InitialDiskSource::ProjectSnapshot { snapshot: r, .. } => {
@@ -698,7 +703,8 @@ impl FirecrackerRuntime {
                     )));
                 }
                 super::vm::mark_used(disk.parent().expect("in a directory"));
-                (disk, DiskSource::ProjectSnapshot { key: r.key })
+                let lineage = super::vm::project_lineage(&self.state_dir, &r.key);
+                (disk, DiskSource::ProjectSnapshot { key: r.key }, lineage)
             }
         };
         let res = orb.spec.template.resources;
@@ -723,6 +729,7 @@ impl FirecrackerRuntime {
             memory_bytes: res.memory_bytes,
             disk_bytes,
             source,
+            lineage,
             net,
             created_unix_ms: unix_ms_now(),
         };
@@ -1264,9 +1271,15 @@ impl Runtime for FirecrackerRuntime {
         }
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("copying disk into project snapshot {key}"));
-        publish_project(ctx, &self.state_dir, key, orb.id, |raw| async move {
-            copy_disk(ctx, &disk, &raw).await
-        })
+        let lineage = self.read_recipe(orb.id)?.lineage;
+        publish_project(
+            ctx,
+            &self.state_dir,
+            key,
+            orb.id,
+            lineage,
+            |raw| async move { copy_disk(ctx, &disk, &raw).await },
+        )
         .await?;
         crate::crash_point!("firecracker::clone::after_publish");
         log(ctx, &format!("project snapshot {key} published"));

@@ -12,7 +12,7 @@ pub use orbd_vm::fsutil::{self, create_private_dir};
 pub use orbd_vm::process;
 
 use super::{LogStream, OpContext, RuntimeError};
-use crate::model::{OrbId, ProjectSnapshotKey};
+use crate::model::{InitialDiskSource, OrbId, ProjectSnapshotKey};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -224,14 +224,81 @@ pub async fn reuse_project(
     Ok(true)
 }
 
+/// The image lineage ([`crate::image::lineage`]) project snapshot `key` descends from,
+/// as recorded at publication; None for snapshots published by older orbd.
+pub fn project_lineage(state_dir: &Path, key: &ProjectSnapshotKey) -> Option<String> {
+    let meta = std::fs::read(
+        state_dir
+            .join("projects")
+            .join(key.as_str())
+            .join("meta.json"),
+    );
+    let meta: serde_json::Value = serde_json::from_slice(&meta.ok()?).ok()?;
+    meta.get("lineage")?.as_str().map(str::to_owned)
+}
+
+/// Where a new disk really comes from: a project snapshot that descends from another
+/// lineage than the spawn image's current one (an older Debian or guest integration, or
+/// unknown) is passed over for that image. Project snapshots copy forward from orb to
+/// orb, so without this a project would keep its first image for good. The snapshot is
+/// used as before while the image is not prepared or its lineage is unknown.
+pub async fn initial_source(
+    images: &dyn images::ImageProvider,
+    state_dir: &Path,
+    src: InitialDiskSource,
+    ctx: &OpContext,
+) -> InitialDiskSource {
+    let InitialDiskSource::ProjectSnapshot {
+        snapshot,
+        image_ref,
+    } = src
+    else {
+        return src;
+    };
+    // A snapshot that is not here is the runtime's NotFound (and the executor's fallback).
+    let here = state_dir
+        .join("projects")
+        .join(snapshot.key.as_str())
+        .join("disk.raw");
+    let current = if here.is_file() {
+        images
+            .prepared(&image_ref)
+            .await
+            .ok()
+            .and_then(|i| i.lineage)
+    } else {
+        None
+    };
+    let built_on = project_lineage(state_dir, &snapshot.key);
+    let Some(current) = current.filter(|c| built_on.as_ref() != Some(c)) else {
+        return InitialDiskSource::ProjectSnapshot {
+            snapshot,
+            image_ref,
+        };
+    };
+    let why = format!(
+        "project snapshot {} was built on another image lineage ({}); creating the disk from {image_ref}",
+        snapshot.key,
+        match built_on {
+            Some(_) => "another Debian release or guest integration",
+            None => "not recorded",
+        }
+    );
+    tracing::info!(current, "{why}");
+    log(ctx, &why);
+    InitialDiskSource::Image { image_ref }
+}
+
 /// Publishes the project snapshot `<state>/projects/<key>/{disk.raw, meta.json}`:
 /// `write_raw` fills a standalone raw disk in staging, which is shrunk to its used size,
 /// fsynced and renamed into place. The format is the same for every VM runtime.
+/// `lineage` is the source orb's (see [`project_lineage`]).
 pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     ctx: &OpContext,
     state_dir: &Path,
     key: &ProjectSnapshotKey,
     source_orb: OrbId,
+    lineage: Option<String>,
     write_raw: impl FnOnce(PathBuf) -> F,
 ) -> Result<(), RuntimeError> {
     use fsutil::{fsync_dir, remove_via_trash, rename_durable, write_json_atomic};
@@ -250,6 +317,7 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
         let meta = serde_json::json!({
             "key": key,
             "source_orb": source_orb,
+            "lineage": lineage,
             "created_unix_ms": crate::model::unix_ms_now(),
             "bytes": std::fs::metadata(&raw).map(|m| m.len()).unwrap_or(0),
         });
@@ -279,4 +347,103 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
 pub fn file_digest(path: &Path, what: &str) -> Result<String, RuntimeError> {
     fsutil::sha256_file(path)
         .map_err(|e| RuntimeError::Other(format!("{what} {}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{ImageError, PreparedImage};
+    use crate::model::ProjectSnapshotRef;
+
+    /// Serves one image of the given lineage, or nothing (`None`: not prepared).
+    struct Fake(Option<Option<&'static str>>);
+
+    #[async_trait::async_trait]
+    impl images::ImageProvider for Fake {
+        async fn prepared(&self, image_ref: &str) -> Result<PreparedImage, ImageError> {
+            let lineage = self
+                .0
+                .ok_or_else(|| ImageError::NotReady("preparing".into()))?;
+            Ok(PreparedImage {
+                key: "k".into(),
+                image_ref: image_ref.into(),
+                manifest_digest: "sha256:m".into(),
+                rootfs: "/nonexistent".into(),
+                rootfs_bytes: 0,
+                lineage: lineage.map(str::to_owned),
+            })
+        }
+    }
+
+    /// A project snapshot of another (or an unrecorded) lineage than the spawn image's
+    /// gives way to the image; one of the same lineage is used, and so is any snapshot
+    /// while the image's lineage cannot be known.
+    #[tokio::test]
+    async fn a_snapshot_of_another_lineage_gives_way_to_the_image() {
+        let state = tempfile::tempdir().unwrap();
+        let key = ProjectSnapshotKey::from_external("project-1");
+        let dir = state.path().join("projects").join(key.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("disk.raw"), b"").unwrap();
+        let (log, _rx) = tokio::sync::mpsc::channel(16);
+        let now = std::time::Instant::now();
+        let ctx = OpContext {
+            operation_id: crate::model::OperationId::generate(),
+            generation: 1,
+            work_deadline: now,
+            cleanup_deadline: now,
+            cancel: Default::default(),
+            log,
+        };
+        let snapshot = || InitialDiskSource::ProjectSnapshot {
+            snapshot: ProjectSnapshotRef { key: key.clone() },
+            image_ref: "amp-orb:latest".into(),
+        };
+        let uses_snapshot = |images: Fake, meta: serde_json::Value| {
+            std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+            let (state, ctx) = (state.path().to_owned(), ctx.clone());
+            async move {
+                match initial_source(&images, &state, snapshot(), &ctx).await {
+                    InitialDiskSource::ProjectSnapshot { .. } => true,
+                    InitialDiskSource::Image { image_ref } => {
+                        assert_eq!(image_ref, "amp-orb:latest");
+                        false
+                    }
+                }
+            }
+        };
+        let same = serde_json::json!({ "lineage": "trixie" });
+        let older = serde_json::json!({ "lineage": "bookworm" });
+        let unrecorded = serde_json::json!({ "source_orb": "x" });
+        assert!(uses_snapshot(Fake(Some(Some("trixie"))), same.clone()).await);
+        assert!(!uses_snapshot(Fake(Some(Some("trixie"))), older.clone()).await);
+        assert!(!uses_snapshot(Fake(Some(Some("trixie"))), unrecorded).await);
+        assert!(
+            uses_snapshot(Fake(None), older.clone()).await,
+            "image not prepared"
+        );
+        assert!(
+            uses_snapshot(Fake(Some(None)), older.clone()).await,
+            "lineage unknown"
+        );
+        // Not on this host: left to the runtime (NotFound) and the executor's fallback.
+        std::fs::remove_file(dir.join("disk.raw")).unwrap();
+        assert!(
+            uses_snapshot(Fake(Some(Some("trixie"))), older).await,
+            "missing"
+        );
+        let image = InitialDiskSource::Image {
+            image_ref: "amp-orb:latest".into(),
+        };
+        assert_eq!(
+            initial_source(
+                &Fake(Some(Some("trixie"))),
+                state.path(),
+                image.clone(),
+                &ctx
+            )
+            .await,
+            image
+        );
+    }
 }
