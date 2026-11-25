@@ -185,3 +185,101 @@ fn forced_delete_finishes_an_orb_whose_delete_failed() {
     let s = c.only_orb("agent-a");
     assert!(!s.running && !s.disk, "deleted");
 }
+
+/// An orb whose first spawn failed for no reason of its host's (here the start itself
+/// failed, nothing created) is retried on that host while the host can take it: no new
+/// incarnation. A host that is gone is waited for (it may be restarting); once it is
+/// removed, nothing ties the orb there and its next spawn places it anew.
+#[test]
+fn an_orb_that_never_started_moves_only_when_its_host_cannot_take_it() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-a", "fake::start=2*return(boom)");
+    c.wait_connected(1);
+    for orb in ["amp-1", "amp-2"] {
+        let failed = c.dispatch("spawn", orb, &[]);
+        assert_ne!(failed.code, 0, "{orb}: {}", failed.stdout);
+    }
+    assert!(c.fake_orbs("agent-a").iter().all(|o| !o.disk));
+    c.start_agent("agent-b", "");
+    c.wait_connected(2);
+
+    // agent-a can take amp-1 now: it is retried there.
+    let first = c.orb_id("amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 on agent-a");
+    assert_eq!(c.orb_id("amp-1"), first);
+    assert!(c.fake_orb("agent-a", "amp-1").running);
+
+    // agent-a is gone, maybe restarting: amp-2 waits for it.
+    c.terminate_agent("agent-a", Duration::from_secs(30));
+    c.wait_connected(1);
+    let waiting = c.dispatch("spawn", "amp-2", &[]);
+    assert_eq!(waiting.code, 75, "{}", waiting.stderr);
+    assert!(c.fake_orbs("agent-b").is_empty());
+    // Removed for good: amp-2, never started, is placed on agent-b.
+    assert_ok(&c.admin(&["agent", "remove", "agent-a"]), "agent remove");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2 placed anew");
+    assert!(c.fake_orb("agent-b", "amp-2").running);
+    assert_eq!(
+        c.logs()
+            .matches("spawn of an orb that never started: placing it anew")
+            .count(),
+        1
+    );
+}
+
+/// An agent's refusal for want of room may pass (room admitted lately frees up): while
+/// the coordinator finds room there, the orb is retried on that agent, not moved.
+#[test]
+fn a_passing_refusal_for_room_retries_the_orb_where_it_is() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-b", "");
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-0", &[]), "amp-0 on agent-b");
+    c.start_agent_with(
+        "agent-a",
+        "agent::admit=1*return",
+        &[
+            ("ORBD_CAPACITY_VCPUS", "16"),
+            ("ORBD_CAPACITY_MEMORY_MIB", "16384"),
+        ],
+    );
+    c.wait_connected(2);
+    // agent-a has more room: amp-1 goes there, refused once for want of memory.
+    let refused = c.dispatch("spawn", "amp-1", &[]);
+    assert_ne!(refused.code, 0);
+    assert!(
+        refused.stderr.contains("InsufficientMemory"),
+        "{}",
+        refused.stderr
+    );
+    let first = c.orb_id("amp-1");
+    assert_ok(
+        &c.dispatch("spawn", "amp-1", &[]),
+        "amp-1 retried on agent-a",
+    );
+    assert_eq!(c.orb_id("amp-1"), first, "the same incarnation");
+    assert!(c.fake_orb("agent-a", "amp-1").running);
+}
+
+/// A spawn sent to an agent that is then removed for good ends (failed: the agent will
+/// never answer), and the orb, never started, is placed anew on its next spawn.
+#[test]
+fn a_removed_agents_commands_end_and_its_unstarted_orbs_move() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-a", "fake::start::delay=return(600000)");
+    c.wait_connected(1);
+    let job = c.dispatch_bg("spawn", "amp-1", &[]);
+    c.wait_open_command("amp-1");
+    c.kill_agent("agent-a");
+    c.start_agent("agent-b", "");
+    c.wait_connected(1);
+    assert_ok(&c.admin(&["agent", "remove", "agent-a"]), "agent remove");
+    let ended = job.join().unwrap();
+    assert_ne!(ended.code, 0, "{}", ended.stdout);
+    assert!(ended.stderr.contains("removed"), "{}", ended.stderr);
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 placed anew");
+    assert!(c.fake_orb("agent-b", "amp-1").running);
+}

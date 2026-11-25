@@ -795,6 +795,11 @@ pub struct FakeRuntimeConfig {
     /// orb types with `egress`. Off by default.
     #[serde(default)]
     pub egress_policy: bool,
+    /// Keep a restored checkpoint's blocks allocated until the orb's next sleep, as
+    /// Firecracker does, instead of freeing them at the wake, as QEMU does. Off by
+    /// default.
+    #[serde(default)]
+    pub restore_keeps_checkpoint: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

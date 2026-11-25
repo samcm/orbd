@@ -35,7 +35,8 @@ CREATE TABLE orbs (
     observation_json TEXT NOT NULL,
     observation_generation INTEGER NOT NULL,
     created_ms INTEGER NOT NULL,
-    -- Set when a deleted orb is replaced by a new incarnation with the same Amp id.
+    -- Set when a deleted orb, or one that never started, is replaced by a new
+    -- incarnation with the same Amp id.
     retired_ms INTEGER
 );
 CREATE UNIQUE INDEX orbs_identity ON orbs (amp_endpoint, amp_orb_id) WHERE retired_ms IS NULL;

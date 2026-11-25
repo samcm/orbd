@@ -194,6 +194,11 @@ pub enum BackendEvent {
         location: Location,
         availability: Availability,
     },
+    /// The location's host was removed for good (an agent revoked): it will never run,
+    /// or answer for, anything sent to it.
+    Removed {
+        location: Location,
+    },
     /// Orb states observed outside any command (a VM that exited on its own).
     OrbsObserved {
         location: Location,
@@ -209,6 +214,16 @@ pub struct OrbDiskUse {
     pub checkpoint_bytes: u64,
     /// The disk is archived (compressed until the orb's next wake).
     pub archived: bool,
+}
+
+/// What waking one orb would free on its location's disk now, as the location last
+/// reported it: a sleep held in RAM frees the checkpoint room its agent committed, a
+/// checkpoint on disk frees its blocks where a restore reads it into memory. Only for a
+/// wake from `checkpoint_generation`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WakeRelease {
+    pub checkpoint_generation: u64,
+    pub bytes: u64,
 }
 
 #[async_trait]
@@ -250,5 +265,21 @@ pub trait ComputeBackend: Send + Sync {
         _location: &Location,
     ) -> Option<std::collections::HashMap<crate::model::OrbId, OrbDiskUse>> {
         None
+    }
+
+    /// How long `location`'s host has been gone: removed (forever, [`Duration::MAX`]),
+    /// or disconnected since its last heartbeat this coordinator saw. None while it is
+    /// connected (draining included) or when it cannot tell.
+    fn host_absence(&self, _location: &Location) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// What waking each orb at `location` would free on its disk, by orb id, as the
+    /// location last reported it ([`WakeRelease`]). Empty when it reports none.
+    fn wake_releases(
+        &self,
+        _location: &Location,
+    ) -> std::collections::HashMap<crate::model::OrbId, WakeRelease> {
+        Default::default()
     }
 }

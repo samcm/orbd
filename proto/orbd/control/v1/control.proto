@@ -465,6 +465,22 @@ message Heartbeat {
   // Project snapshots the agent deleted since its previous heartbeat: it no longer
   // holds them (Hello lists the ones it holds when a session starts).
   repeated string deleted_project_snapshot_keys = 12;
+  // Orbs asleep here whose wake would free disk now, which admission credits against
+  // the room their next memory checkpoint takes. Only what the agent knows: a sleep
+  // held in RAM frees the checkpoint room it committed (the orb's memory size); a
+  // checkpoint on disk frees its blocks only where a restore reads it into memory
+  // (QEMU), not where the restored VMM keeps it mapped until its next sleep is written
+  // (Firecracker). Held sleeps are current as of this heartbeat; checkpoints on disk
+  // as of the last measurement. An orb not listed frees nothing known.
+  repeated WakeRelease wake_releases = 13;
+}
+
+message WakeRelease {
+  string orb_id = 1;
+  // The checkpoint generation the orb sleeps on: a release counts only for a wake from
+  // it.
+  uint64 checkpoint_generation = 2;
+  uint64 bytes = 3;
 }
 
 message OrbDiskUsage {

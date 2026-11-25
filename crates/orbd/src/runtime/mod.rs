@@ -260,6 +260,16 @@ pub trait Runtime: Send + Sync {
         false
     }
 
+    /// Whether a start from a memory checkpoint on disk frees that checkpoint's blocks
+    /// when `discard_checkpoint` removes it right after: the restore read it into the
+    /// guest's memory (QEMU). Not where the restored VMM maps the file for the life of
+    /// the VM (Firecracker): its blocks stay allocated until that VMM exits, after the
+    /// orb's next checkpoint is written. The coordinator credits a wake with what it
+    /// frees (see the heartbeat's `wake_releases`).
+    fn restore_frees_checkpoint(&self) -> bool {
+        false
+    }
+
     /// Writes a held sleep's checkpoint exactly as an unheld sleep would, then stops the
     /// VMM, freeing its memory. A failed write leaves the orb held.
     async fn flush_held(

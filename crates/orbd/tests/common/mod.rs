@@ -318,6 +318,19 @@ offerings:
         self.agents.insert(id.to_string(), Some(child));
     }
 
+    /// Starts agent `id` (minting its token) with `failpoints` and extra environment on
+    /// top of `agent_env`.
+    pub fn start_agent_with(&mut self, id: &str, failpoints: &str, env: &[(&str, &str)]) {
+        let token = self.join_token(id);
+        self.tokens.insert(id.to_string(), token.clone());
+        let child = self
+            .agent_command(id, &token, failpoints)
+            .envs(env.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+            .spawn()
+            .unwrap();
+        self.agents.insert(id.to_string(), Some(child));
+    }
+
     /// Starts an agent that is not part of the initial cluster, with a given token.
     pub fn start_agent_with_token(&mut self, id: &str, token: &str) {
         self.tokens.insert(id.to_string(), token.to_string());

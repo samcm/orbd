@@ -65,6 +65,9 @@ pub struct FakeOrbState {
     /// VM's guest does not answer PrepareSleep); tests set it.
     #[serde(default)]
     pub checkpoints_unsynced: Vec<u64>,
+    /// What each checkpoint generation would take on disk: the orb's memory size.
+    #[serde(default)]
+    pub checkpoint_bytes: std::collections::BTreeMap<u64, u64>,
     /// Project snapshot keys cloned from this orb.
     pub snapshots: Vec<String>,
     pub counters: FakeCounters,
@@ -117,6 +120,7 @@ pub struct FakeRuntime {
     memory_preserving: bool,
     arch: crate::model::Arch,
     egress_policy: bool,
+    restore_keeps_checkpoint: bool,
     /// Serializes read-modify-write of state files (held only for sync file IO).
     lock: Mutex<()>,
 }
@@ -129,6 +133,7 @@ impl FakeRuntime {
             memory_preserving: config.memory_preserving_sleep,
             arch: config.arch,
             egress_policy: config.egress_policy,
+            restore_keeps_checkpoint: config.restore_keeps_checkpoint,
             lock: Mutex::new(()),
         }
     }
@@ -195,6 +200,11 @@ fn injected(arg: Option<String>) -> String {
 
 #[async_trait]
 impl Runtime for FakeRuntime {
+    /// Like QEMU's unless configured like Firecracker's (`restore_keeps_checkpoint`).
+    fn restore_frees_checkpoint(&self) -> bool {
+        !self.restore_keeps_checkpoint
+    }
+
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities {
             kind: RuntimeKind::Fake,
@@ -304,6 +314,10 @@ impl Runtime for FakeRuntime {
             st.checkpoints.push(checkpoint_generation);
             st.checkpoint_saved_unix_ms
                 .insert(checkpoint_generation, crate::model::unix_ms_now());
+            st.checkpoint_bytes.insert(
+                checkpoint_generation,
+                orb.spec.template.resources.memory_bytes,
+            );
             st.counters.checkpoints += 1;
             Ok(())
         })?;
@@ -359,13 +373,14 @@ impl Runtime for FakeRuntime {
         if !st.checkpoints.contains(&g) || st.consumed.contains(&g) {
             return Ok(None);
         }
-        // The fake holds no files: a checkpoint is as big as nothing.
+        // The fake holds no files: a checkpoint is as big as the orb's memory was when
+        // saved, as a VM's would be (0 for one saved before that was recorded).
         Ok(st
             .checkpoint_saved_unix_ms
             .get(&g)
             .map(|&saved_unix_ms| CheckpointInfo {
                 saved_unix_ms,
-                bytes: 0,
+                bytes: st.checkpoint_bytes.get(&g).copied().unwrap_or(0),
                 synced: !st.checkpoints_unsynced.contains(&g),
             }))
     }

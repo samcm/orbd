@@ -282,6 +282,9 @@ impl Inner {
         let mut st = self.lock();
         if let Some(slot) = st.agents.get_mut(agent) {
             slot.removed = true;
+            self.emit(BackendEvent::Removed {
+                location: self.location(agent),
+            });
             if let Some(old) = slot.session.take() {
                 old.cancel.cancel();
                 slot.unavailable_reason = "agent removed".into();
@@ -767,6 +770,45 @@ impl ComputeBackend for FleetBackend {
                 })
                 .collect(),
         )
+    }
+
+    fn host_absence(&self, location: &Location) -> Option<std::time::Duration> {
+        let agent = self.inner.agent_of(location).ok()?;
+        let st = self.inner.lock();
+        let slot = st.agents.get(&agent)?;
+        if slot.removed {
+            return Some(std::time::Duration::MAX);
+        }
+        if slot.session.is_some() {
+            return None;
+        }
+        slot.heartbeat.as_ref().map(|(_, at)| at.elapsed())
+    }
+
+    fn wake_releases(
+        &self,
+        location: &Location,
+    ) -> HashMap<crate::model::OrbId, super::WakeRelease> {
+        let Ok(agent) = self.inner.agent_of(location) else {
+            return HashMap::new();
+        };
+        let st = self.inner.lock();
+        let Some((hb, _)) = st.agents.get(&agent).and_then(|a| a.heartbeat.as_ref()) else {
+            return HashMap::new();
+        };
+        hb.wake_releases
+            .iter()
+            .filter_map(|r| {
+                let id = crate::model::OrbId::parse(&r.orb_id).ok()?;
+                Some((
+                    id,
+                    super::WakeRelease {
+                        checkpoint_generation: r.checkpoint_generation,
+                        bytes: r.bytes,
+                    },
+                ))
+            })
+            .collect()
     }
 }
 

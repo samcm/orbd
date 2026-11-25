@@ -277,12 +277,44 @@ never move between agents. An agent started with
 when no other agent fits it, since an orb stays on the agent it was created on and cannot
 wake while that host is off. `orbd agent list` marks such agents `(overflow)`.
 
+Orbs asleep or stopped on an agent can wake only there, so a new orb, which can go
+anywhere, prefers an agent that still has room to wake the largest of the orbs that went
+to sleep or stopped there in the last 24 hours (their vCPUs, memory and disk headroom,
+each the most any of them needs; not archived, faulted or being deleted ones) once it
+takes the new orb, ranked by the room it has beyond that; only when no agent does is it
+placed without that room. This comes before the project snapshot (a new orb that misses
+its snapshot boots slower; one that fills an agent leaves that agent's sleeping orbs
+unable to wake).
+
+An orb whose first spawn was refused before anything was created (its agent said
+nothing of it exists there) is not tied to that agent. Its next spawn places it anew like
+a new orb (`orbd_unstarted_orbs_replaced_total`), and the old agent is told to delete what
+it recorded of it, when:
+
+- its agent refused it for a reason the coordinator cannot see (its image not in that
+  agent's `ORBD_IMAGE_ALLOW`), or for want of room three times in a row (once may pass:
+  memory admitted moments ago frees up); or
+- the coordinator finds that agent cannot take it now: no room, unable to run it, gone
+  for more than 30 minutes (longer than a restart or upgrade), or removed with
+  `orbd agent remove` (which also ends the commands it was sent and never answered).
+
+It goes to an agent of the same kind (always-on, or overflow) that has not refused it in
+the last 24 hours; when only agents that refused it fit, it stays where it is, as it does
+after four new placements in a day. Not when its agent asked it to wait (its image being
+prepared there).
+
 Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An orb type's
 `disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
 admitted by what the host actually has: a new or waking orb needs free space for its
 headroom (up to `running_orb_disk_headroom_gib`, default 10, of growth plus its memory
 checkpoint) after the headroom of the orbs already running and the agent's reserve
-(`ORBD_DISK_RESERVE_GIB`, default max(10 GiB, 5% of the filesystem)) are set aside.
+(`ORBD_DISK_RESERVE_GIB`, default max(10 GiB, 5% of the filesystem)) are set aside. A wake
+is credited the checkpoint room its agent reports the wake frees, which the orb's next
+checkpoint takes again: a sleep held in RAM frees what its agent committed for its
+checkpoint (unless that checkpoint is being written), and a QEMU checkpoint is read into
+memory and deleted at the wake. A
+Firecracker checkpoint on disk frees nothing at the wake (the restored VM maps it until
+its next checkpoint is written), so that wake needs room for both.
 `ORBD_CAPACITY_DISK_GIB` optionally limits what orbd allocates on the host (default: the
 whole filesystem). A refusal names each host's limiting resource with its numbers.
 
@@ -428,9 +460,10 @@ and tells the coordinator in its next heartbeat.
 The coordinator places a new orb that names a project snapshot on an agent holding
 it when one fits. `orbd_project_snapshot_placements_total{result}` counts these
 placements: `hit`, `elsewhere` (the agents holding it could not take the orb: full,
-down, overflow or of another architecture), `absent` (no agent of the backends tried
-holds it) and `unsupported` (placed where project snapshots are not kept, e.g. on
-Boat); each `elsewhere` and `absent` is logged. An agent counts orbs it creates from the
+down, overflow or of another architecture), `wake_room` (an agent holding it could, but
+only with the room it keeps to wake its own orbs, see above), `absent` (no agent of the
+backends tried holds it) and `unsupported` (placed where project snapshots are not kept,
+e.g. on Boat); each `elsewhere`, `wake_room` and `absent` is logged. An agent counts orbs it creates from the
 image although placed for a snapshot, once each, in
 `orbd_project_snapshot_fallbacks_total{reason}`: `missing` (deleted before the
 coordinator heard; a dead snapshot deleted early shows up here rather than under

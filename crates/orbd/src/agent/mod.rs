@@ -98,6 +98,9 @@ pub(crate) struct Shared {
     pub disk_allocated: AtomicU64,
     /// The same measurement per orb directory.
     pub orb_disk: Mutex<Vec<pb::OrbDiskUsage>>,
+    /// Orbs asleep on a checkpoint on disk whose wake would free it, as of the last
+    /// measurement (see [`disk_wake_releases`]); held sleeps are added per heartbeat.
+    pub disk_wake_releases: Mutex<Vec<pb::WakeRelease>>,
     /// Free disk to keep (see [`crate::model::disk_reserve`]).
     pub disk_reserve: u64,
     /// Host memory to keep available (see `executor::admit`).
@@ -342,6 +345,76 @@ fn measure(dir: &std::path::Path) -> DiskUse {
     }
 }
 
+/// What waking `def`, asleep on `checkpoint` on disk, frees: the checkpoint's bytes,
+/// if its runtime frees it at the wake ([`crate::runtime::Runtime::restore_frees_checkpoint`])
+/// and the orb is not held in RAM (held sleeps are reported per heartbeat).
+async fn disk_wake_release(
+    sh: &Arc<Shared>,
+    def: &crate::model::OrbDefinition,
+    checkpoint: &crate::model::SleepCheckpointRef,
+) -> Option<pb::WakeRelease> {
+    let rt = executor::runtime_for(sh, def)?;
+    if !rt.restore_frees_checkpoint() || rt.held().iter().any(|h| h.orb == def.id) {
+        return None;
+    }
+    match rt.checkpoint_info(def.id, checkpoint).await {
+        Ok(Some(info)) if info.bytes > 0 => Some(pb::WakeRelease {
+            orb_id: def.id.to_string(),
+            checkpoint_generation: checkpoint.generation,
+            bytes: info.bytes,
+        }),
+        _ => None,
+    }
+}
+
+/// [`disk_wake_release`] of every orb recorded asleep on a memory checkpoint, with no
+/// operation or restore under way.
+async fn disk_wake_releases(sh: &Arc<Shared>) -> Vec<pb::WakeRelease> {
+    let found = sh
+        .db
+        .call(|c| Ok((db::list_orb_definitions(c)?, db::list_orbs_claimed(c)?)))
+        .await;
+    let Ok((defs, rows)) = found else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (row, claimed) in rows {
+        let Some(crate::model::OrbState::Known {
+            state: crate::model::StableOrbState::Sleeping { checkpoint },
+        }) = &row.last_state
+        else {
+            continue;
+        };
+        if claimed {
+            continue;
+        }
+        let Some(def) = defs.iter().find(|d| d.id == row.orb_id) else {
+            continue;
+        };
+        out.extend(disk_wake_release(sh, def, checkpoint).await);
+    }
+    out
+}
+
+/// Updates what waking `def` frees once one of its operations ended in `observed`, so
+/// the next heartbeat tells the coordinator without waiting for the next measurement.
+pub(crate) async fn refresh_wake_release(
+    sh: &Arc<Shared>,
+    def: &crate::model::OrbDefinition,
+    observed: &crate::model::OrbState,
+) {
+    let release = match observed {
+        crate::model::OrbState::Known {
+            state: crate::model::StableOrbState::Sleeping { checkpoint },
+        } => disk_wake_release(sh, def, checkpoint).await,
+        _ => None,
+    };
+    let id = def.id.to_string();
+    let mut v = sh.disk_wake_releases.lock().unwrap();
+    v.retain(|r| r.orb_id != id);
+    v.extend(release);
+}
+
 /// Measures the state directory now and then every minute, for heartbeats.
 async fn measure_disk(sh: &Arc<Shared>) {
     let dir = sh.config.agent.state_dir.clone();
@@ -363,6 +436,8 @@ async fn measure_disk(sh: &Arc<Shared>) {
             },
         )
         .collect();
+    let releases = disk_wake_releases(sh).await;
+    *sh.disk_wake_releases.lock().unwrap() = releases;
 }
 
 fn acquire_lock(path: &std::path::Path) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
@@ -530,6 +605,7 @@ pub async fn run(
         archive_restore_max: AtomicU64::new(0),
         disk_allocated: AtomicU64::new(0),
         orb_disk: Mutex::default(),
+        disk_wake_releases: Mutex::default(),
         disk_reserve,
         memory_reserve,
         recent_admits: Mutex::default(),

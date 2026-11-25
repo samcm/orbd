@@ -4,7 +4,7 @@
 //! longer drives.
 
 use super::core::{
-    BACKEND_CALL_TIMEOUT, Msg, OperatorJob, Policy, demand, shortfalls, state_label,
+    BACKEND_CALL_TIMEOUT, Msg, OperatorJob, Policy, shortfalls, state_label, wake_demand,
 };
 use super::db::Db;
 use super::store::{self, CmdHistory};
@@ -384,6 +384,8 @@ impl OrbsService {
     /// would make it, for each orb that does not run.
     async fn infos(&self, snap: &Snapshot, orbs: &[Live]) -> Vec<pb::OrbInfo> {
         let mut disk: HashMap<Location, HashMap<OrbId, OrbDiskUse>> = HashMap::new();
+        let mut releases: HashMap<Location, HashMap<OrbId, crate::backend::WakeRelease>> =
+            HashMap::new();
         let mut hosts: HashMap<Location, Result<PlacementCandidate, pb::CommandFailure>> =
             HashMap::new();
         let mut out = Vec::with_capacity(orbs.len());
@@ -441,7 +443,22 @@ impl OrbsService {
                                 used.held.disk_bytes.saturating_sub(own.disk_bytes);
                             used.running = used.running.saturating_sub(1);
                         }
-                        let need = demand(&self.policy, &orb.spec.template);
+                        // Net of what its wake frees, as admission does.
+                        let release = releases
+                            .entry(orb.location.clone())
+                            .or_insert_with(|| {
+                                backend
+                                    .map(|b| b.wake_releases(&orb.location))
+                                    .unwrap_or_default()
+                            })
+                            .get(&orb.id)
+                            .copied();
+                        let need = wake_demand(
+                            &self.policy,
+                            &orb.spec.template,
+                            &orb.observation.state,
+                            release,
+                        );
                         wake_blockers.extend(
                             shortfalls(cand, &used, need)
                                 .into_iter()

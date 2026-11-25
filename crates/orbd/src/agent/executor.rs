@@ -643,6 +643,7 @@ async fn finalize(
         .call(move |c| db::complete(c, op, orb, &o2, unix_ms_now()))
         .await?;
     crate::crash_point!("agent::terminal_committed");
+    super::refresh_wake_release(sh, &receipt.orb, &outcome.observed).await;
     let result_label = match &outcome.result {
         Ok(_) => "ok".to_owned(),
         Err(f) => format!("{:?}", f.code).to_lowercase(),
@@ -808,6 +809,12 @@ impl Run {
     /// [`admit`](Self::admit) for an orb whose memory is in RAM already (a sleep held
     /// in RAM): the host's available memory does not need to hold it again.
     fn admit_as(&self, resident: bool) -> Result<(), Flow> {
+        // Feature `failpoints`: `agent::admit=return` refuses for want of memory, as a
+        // host short of it right now would.
+        fail::fail_point!("agent::admit", |_| Err(Flow::Failed(CommandFailure {
+            code: FailureCode::InsufficientMemory,
+            message: "agent capacity exceeded (memory: injected)".into(),
+        })));
         let need = self.orb().spec.template.resources;
         let mut reserved = self.sh.reserved.lock().unwrap_or_else(|e| e.into_inner());
         if reserved.contains_key(&self.orb().id) {
